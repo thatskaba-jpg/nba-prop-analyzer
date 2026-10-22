@@ -1156,7 +1156,7 @@ def primary_defender_note(opp_abbr, player_group, season):
 
 @st.cache_data(show_spinner=False, ttl=900)
 def cached_montecarlo(home, away, spread_home, total_line):
-    """10,000-sim Monte Carlo for one matchup, CACHED so it runs ONCE per
+    """2,000-sim Monte Carlo for one matchup, CACHED so it runs ONCE per
     matchup instead of on every Streamlit rerun (the sims were re-running on
     every click and slowing every tab). Keyed by matchup + lines."""
     try:
@@ -3506,7 +3506,7 @@ else:
                         _tl = g.get("total")
                         _sim = cached_montecarlo(home, away, _sp, _tl)
                         if _sim:
-                                _msg = (f"🎲 Simulated 10,000× — {home} wins "
+                                _msg = (f"🎲 Simulated 2,000× — {home} wins "
                                         f"{_sim['home_win_prob']*100:.0f}% / "
                                         f"{away} {_sim['away_win_prob']*100:.0f}%. "
                                         f"Likely margin {home} "
