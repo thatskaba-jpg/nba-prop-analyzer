@@ -120,83 +120,132 @@ from backtest.backtest import run_backtest  # noqa: E402
 
 st.set_page_config(page_title="NBA Prop Helper", page_icon="🏀", layout="wide")
 
-# --- Styling: a polished MONOCHROME sports-analytics look. ---
+# --- Styling: a modern SPORTSBOOK look — bold green accent on near-black,
+#     elevated cards, chunky pills, confident numbers. ---
 st.markdown("""
 <style>
-/* ---- Base typography + layout ---- */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+
+/* ---- Accent palette ---- */
+:root {
+    --accent: #22c55e;          /* electric green */
+    --accent-dim: #16a34a;
+    --accent-glow: rgba(34,197,94,.35);
+    --bg: #07090c;
+    --panel: #10141a;
+    --panel-2: #141922;
+    --line: #1e2530;
+    --text: #f3f5f7;
+    --muted: #8b95a3;
+    --red: #ef4444;
+}
+
+/* ---- Base ---- */
 html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont,
     'Segoe UI', Roboto, sans-serif; }
 .stApp { background:
-    radial-gradient(1200px 600px at 80% -10%, #1a1a1a 0%, transparent 60%),
-    radial-gradient(900px 500px at -10% 10%, #161616 0%, transparent 55%),
-    #0a0a0a; }
-.block-container { padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1180px; }
+    radial-gradient(1100px 520px at 85% -12%, rgba(34,197,94,.10) 0%, transparent 55%),
+    radial-gradient(800px 460px at -8% 6%, rgba(34,197,94,.05) 0%, transparent 55%),
+    var(--bg); color: var(--text); }
+.block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1200px; }
 
 /* ---- Headings ---- */
-h1, h2, h3 { letter-spacing: -0.02em; font-weight: 800; color: #fafafa; }
-h3 { border-bottom: 1px solid #262626; padding-bottom: 6px; margin-top: .4rem; }
+h1, h2, h3 { letter-spacing: -0.025em; font-weight: 900; color: var(--text); }
+h3 { border-bottom: 2px solid var(--line); padding-bottom: 8px; margin-top: .5rem;
+     position: relative; }
+h3::after { content:""; position:absolute; left:0; bottom:-2px; width:52px;
+     height:2px; background: var(--accent); }
 
-/* ---- Metric tiles: glassy card, white-edge hover ---- */
+/* ---- Metric tiles: dark card, green left-accent bar, lift on hover ---- */
 div[data-testid="stMetric"] {
-    background: linear-gradient(160deg, #1a1a1a 0%, #121212 100%);
-    border: 1px solid #2a2a2a;
+    background: linear-gradient(165deg, var(--panel-2) 0%, var(--panel) 100%);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
     border-radius: 14px;
     padding: 16px 18px;
-    box-shadow: 0 4px 16px rgba(0,0,0,.4);
-    transition: transform .12s ease, border-color .12s ease;
+    box-shadow: 0 6px 20px rgba(0,0,0,.45);
+    transition: transform .12s ease, box-shadow .12s ease;
 }
 div[data-testid="stMetric"]:hover { transform: translateY(-2px);
-    border-color: #e5e5e5; }
-div[data-testid="stMetric"] label { color: #9a9a9a !important; font-size: .78rem;
-    text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
-div[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 800;
-    color: #ffffff; }
+    box-shadow: 0 10px 28px rgba(0,0,0,.55), 0 0 0 1px var(--accent-glow); }
+div[data-testid="stMetric"] label { color: var(--muted) !important; font-size: .74rem;
+    text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+div[data-testid="stMetricValue"] { font-size: 1.8rem; font-weight: 900;
+    color: #fff; letter-spacing: -.02em; }
 
-/* ---- Buttons: light-on-dark, invert on hover ---- */
+/* ---- Buttons: bold green pills, invert feel on hover ---- */
 div.stButton > button {
-    background: #f5f5f5; color: #0a0a0a; border: 1px solid #f5f5f5;
-    border-radius: 10px; font-weight: 700; padding: .5rem 1.1rem;
-    letter-spacing: .01em; box-shadow: 0 2px 10px rgba(0,0,0,.4);
-    transition: transform .1s ease, background .1s ease, color .1s ease;
+    background: var(--accent); color: #04110a; border: none;
+    border-radius: 999px; font-weight: 800; padding: .55rem 1.3rem;
+    letter-spacing: .01em; box-shadow: 0 4px 16px var(--accent-glow);
+    transition: transform .1s ease, box-shadow .1s ease, background .1s ease;
 }
 div.stButton > button:hover { transform: translateY(-1px);
-    background: #0a0a0a; color: #f5f5f5; border-color: #f5f5f5; }
+    background: var(--accent-dim); box-shadow: 0 6px 22px var(--accent-glow); }
 div.stButton > button:active { transform: translateY(0); }
 
-/* ---- Tabs: pill-style, white active ---- */
-div[data-baseweb="tab-list"] { gap: 6px; background: #141414; padding: 5px;
-    border-radius: 12px; border: 1px solid #262626; }
-button[data-baseweb="tab"] { font-size: .98rem; font-weight: 700; border-radius: 9px;
-    padding: 8px 16px; color: #9a9a9a; }
+/* ---- Tabs: pill row, green active ---- */
+div[data-baseweb="tab-list"] { gap: 6px; background: var(--panel); padding: 6px;
+    border-radius: 14px; border: 1px solid var(--line); }
+button[data-baseweb="tab"] { font-size: .96rem; font-weight: 700; border-radius: 10px;
+    padding: 9px 16px; color: var(--muted); transition: color .1s ease; }
+button[data-baseweb="tab"]:hover { color: var(--text); }
 button[data-baseweb="tab"][aria-selected="true"] {
-    background: #f5f5f5 !important; color: #0a0a0a !important; }
+    background: var(--accent) !important; color: #04110a !important;
+    box-shadow: 0 3px 12px var(--accent-glow); }
 div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display:none; }
 
-/* ---- Inputs: dark, rounded, light focus ---- */
+/* ---- Inputs: dark, rounded, green focus ring ---- */
 div[data-baseweb="input"] input, div[data-baseweb="select"] > div,
 .stNumberInput input, .stTextInput input {
-    background: #141414 !important; border-radius: 9px !important;
-    border: 1px solid #2a2a2a !important; color: #ededed !important; }
-div[data-baseweb="input"]:focus-within, .stNumberInput div:focus-within {
-    border-color: #e5e5e5 !important; }
+    background: var(--panel) !important; border-radius: 10px !important;
+    border: 1px solid var(--line) !important; color: var(--text) !important; }
+div[data-baseweb="input"]:focus-within, .stNumberInput div:focus-within,
+div[data-baseweb="select"] > div:focus-within {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 3px var(--accent-glow) !important; }
 
-/* ---- Tables: rounded, subtle ---- */
+/* ---- Tables ---- */
 div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden;
-    border: 1px solid #262626; }
+    border: 1px solid var(--line); }
 
-/* ---- Sidebar: deep neutral panel ---- */
+/* ---- Sidebar ---- */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #101010 0%, #080808 100%);
-    border-right: 1px solid #262626; }
-section[data-testid="stSidebar"] h1 { font-size: 1.25rem; }
+    background: linear-gradient(180deg, #0c0f14 0%, #070a0e 100%);
+    border-right: 1px solid var(--line); }
+section[data-testid="stSidebar"] h1 { font-size: 1.2rem; }
 
-/* ---- Expanders ---- */
-div[data-testid="stExpander"] { border: 1px solid #262626; border-radius: 12px;
-    background: #141414; overflow: hidden; }
+/* ---- Expanders: card feel, green edge on hover ---- */
+div[data-testid="stExpander"] { border: 1px solid var(--line); border-radius: 14px;
+    background: var(--panel); overflow: hidden; transition: border-color .12s ease; }
+div[data-testid="stExpander"]:hover { border-color: var(--accent-glow); }
+
+/* ---- Alerts: tint the success/info/warn to the palette ---- */
+div[data-testid="stAlert"] { border-radius: 12px; border: 1px solid var(--line); }
 
 /* ---- Radio / slider accents ---- */
 div[role="radiogroup"] label { font-weight: 600; }
-.stSlider [data-baseweb="slider"] div[role="slider"] { background: #f5f5f5; }
+.stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--accent); }
+.stSlider [data-baseweb="slider"] div[data-testid="stTickBar"] ~ div { background: var(--accent) !important; }
+
+/* ---- Checkboxes ---- */
+.stCheckbox [data-baseweb="checkbox"] span[aria-checked="true"] {
+    background: var(--accent) !important; border-color: var(--accent) !important; }
+
+/* ---- App header banner ---- */
+.sb-hero {
+    background: linear-gradient(135deg, rgba(34,197,94,.16) 0%, rgba(34,197,94,.02) 55%, transparent 100%),
+               var(--panel);
+    border: 1px solid var(--line); border-left: 4px solid var(--accent);
+    border-radius: 18px; padding: 20px 24px; margin-bottom: 18px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.4);
+}
+.sb-hero h1 { margin: 0; font-size: 1.9rem; }
+.sb-hero p { margin: .35rem 0 0; color: var(--muted); font-size: .98rem;
+    max-width: 640px; }
+.sb-pill { display:inline-block; background: var(--accent); color:#04110a;
+    font-weight:800; font-size:.72rem; letter-spacing:.06em; text-transform:uppercase;
+    padding: 3px 10px; border-radius: 999px; margin-bottom: 8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -826,19 +875,12 @@ if chosen:
 # MAIN
 # --------------------------------------------------------------------------- #
 st.markdown("""
-<div style="position:relative; padding: 22px 26px; border-radius: 16px;
-            margin-bottom: 14px; overflow:hidden;
-            background: linear-gradient(120deg, #2a2a2a 0%, #171717 55%, #0e0e0e 100%);
-            border: 1px solid #333; box-shadow: 0 8px 30px rgba(0,0,0,.5);">
-  <div style="position:absolute; inset:0;
-       background: radial-gradient(400px 160px at 90% -30%, rgba(255,255,255,.10), transparent 70%);"></div>
-  <div style="position:relative;">
-    <div style="font-size: 1.85rem; font-weight: 900; color: #ffffff;
-                letter-spacing:-.02em;">🏀 NBA Player-Prop Analyzer</div>
-    <div style="color: #b5b5b5; font-size: 0.95rem; margin-top: 4px; font-weight:500;">
-      Projects a stat line, estimates the Over/Under chance, and — with your
-      odds — tells you if it's a good deal. A research tool, not a guarantee.</div>
-  </div>
+<div class="sb-hero">
+  <span class="sb-pill">🏀 NBA · Props</span>
+  <h1>Player-Prop Analyzer</h1>
+  <p>Project a stat line, estimate the Over/Under chance, and — with your odds —
+     see if it's a good deal. Shop lines across books for the real edge.
+     A research tool, not a guarantee.</p>
 </div>
 """, unsafe_allow_html=True)
 

@@ -5,6 +5,10 @@
 
 # Local database and cached data
 data/*.db
+data/*.db.zip
+data/*.zip
+data/bot.db*
+data/*copy*
 data/*.csv
 data/*.parquet
 data/raw/

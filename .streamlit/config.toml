@@ -1,10 +1,10 @@
 [theme]
-# Monochrome dark look: neutral grays with a near-white accent.
+# Modern sportsbook: near-black with an electric-green accent.
 base = "dark"
-primaryColor = "#e5e5e5"
-backgroundColor = "#0a0a0a"
-secondaryBackgroundColor = "#161616"
-textColor = "#ededed"
+primaryColor = "#22c55e"
+backgroundColor = "#07090c"
+secondaryBackgroundColor = "#10141a"
+textColor = "#f3f5f7"
 font = "sans serif"
 
 [server]
