@@ -2223,8 +2223,8 @@ else:
                     else:
                         fav = home if proj["exp_margin"] > 0 else away
                         quick = f"  —  lean {fav} (no edge)"
-                elif proj and not is_open:
-                    quick = "  —  started"
+                # (No extra text for live/final games — the FINAL/LIVE tag and,
+                #  for final games, the grade below already say the status.)
 
                 # ---- GRADE on FINAL games: did the model call it right? ----
                 sc = scores.get(matchup)
