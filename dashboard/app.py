@@ -118,7 +118,8 @@ except Exception:
         return None
 from backtest.backtest import run_backtest  # noqa: E402
 
-st.set_page_config(page_title="Bomb Vegas · Prop Analyzer", page_icon="💣", layout="wide")
+st.set_page_config(page_title="Bomb Vegas · Prop Analyzer", page_icon="💣",
+                   layout="wide", initial_sidebar_state="expanded")
 
 # --- Styling: MODERN MONOCHROME — near-black, layered greys, crisp white
 #     accent. Minimal, high-contrast, premium. No color, all contrast. ---
