@@ -233,6 +233,13 @@ div[role="radiogroup"] label { font-weight:600; }
 .stSlider [data-baseweb="slider"] div[role="slider"] { background:var(--accent); }
 .stCheckbox [data-baseweb="checkbox"] span[aria-checked="true"] {
     background:var(--accent) !important; border-color:var(--accent) !important; }
+/* dark checkmark so it shows on the white checked box (was white-on-white) */
+.stCheckbox [data-baseweb="checkbox"] span[aria-checked="true"] svg,
+.stCheckbox [data-baseweb="checkbox"] span[aria-checked="true"] svg * {
+    fill:#0c0c0d !important; stroke:#0c0c0d !important; color:#0c0c0d !important; }
+/* unchecked box: visible outline, not a white block */
+.stCheckbox [data-baseweb="checkbox"] span[aria-checked="false"] {
+    background:#0f0f10 !important; border:1px solid var(--line-2) !important; }
 
 /* ---- Monochrome hero: glass panel, thin top highlight ---- */
 .sb-hero {
@@ -826,10 +833,11 @@ def _apply_recommended():
             st.session_state[("i_" if simple_mode else "w_") + key] = rec[key]
 
 
-# On the very first load, pre-select the recommended factors.
-if "seeded_defaults" not in st.session_state:
+# On first load — and whenever the weighting mode changes — pre-load the
+# recommended set so the app always opens on a good, ready-to-use model.
+if st.session_state.get("seeded_mode") != simple_mode:
     _apply_recommended()
-    st.session_state["seeded_defaults"] = True
+    st.session_state["seeded_mode"] = simple_mode
 
 if st.sidebar.button("⭐ Use recommended factors"):
     _apply_recommended()
@@ -1736,8 +1744,41 @@ else:
                     tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
                 g = lines.get(home) or {}
                 proj = project_game(home, away, ratings)
-                with st.expander(f"🏀 {matchup}   ·   {tag}",
-                                 expanded=(is_open and len(open_games) <= 3)):
+
+                # ---- QUICK PICK for the collapsed title: who we'd back ----
+                # Only on OPEN games — a pick on a live/final game isn't
+                # bettable, so we don't flash a ✅ you can't act on.
+                quick = ""
+                if proj and is_open:
+                    ml_h = g.get("moneyline")
+                    ml_a = (lines.get(away) or {}).get("moneyline")
+                    sp_h = g.get("spread")
+                    picks = []
+                    if ml_h is not None and ml_a is not None:
+                        _ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
+                                            int(ml_h), int(ml_a),
+                                            edge_threshold=ev_bar / 100.0)
+                        if _ev.get("is_value"):
+                            picks.append((home if _ev["recommended_side"] == "over"
+                                          else away) + " to win")
+                    if sp_h is not None:
+                        _ph, _pa = cover_probability(proj["exp_margin"], sp_h)
+                        _evs = evaluate_prop(_ph, _pa, -110, -110,
+                                             edge_threshold=ev_bar / 100.0)
+                        if _evs.get("is_value"):
+                            picks.append(f"{home} {sp_h:+g}"
+                                         if _evs["recommended_side"] == "over"
+                                         else f"{away} {-sp_h:+g}")
+                    if picks:
+                        quick = "  —  ✅ Pick: " + "  +  ".join(picks)
+                    else:
+                        fav = home if proj["exp_margin"] > 0 else away
+                        quick = f"  —  lean {fav} (no edge)"
+                elif proj and not is_open:
+                    quick = "  —  started"
+
+                title = f"🏀  {matchup}    {tag}{quick}"
+                with st.expander(title, expanded=False):
                     if not is_open:
                         st.caption("This game has tipped off — the line below is "
                                    "the last PRE-GAME number, kept for reference. "
@@ -1895,11 +1936,10 @@ else:
 
             for g in shown:
                 bo, bu = g["best_over"], g["best_under"]
-                with st.expander(
-                        f"🛒 {g['player']} — {_pretty(g['prop_type'])}   ·   "
-                        f"gap {g['line_spread']:g} pts   ·   consensus "
-                        f"{g['consensus_line']:g}",
-                        expanded=False):
+                title = (f"🛒  {g['player']}  ·  {_pretty(g['prop_type'])}  "
+                         f"{g['consensus_line']:g}"
+                         f"    📊 {g['line_spread']:g} pt gap across books")
+                with st.expander(title, expanded=False):
                     c1, c2 = st.columns(2)
                     with c1:
                         st.markdown("**⬆️ Best spot to bet the OVER**")
