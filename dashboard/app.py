@@ -888,22 +888,16 @@ def cached_team_form():
                 continue
             recs.append((str(g.get("date"))[:10], ht, at, int(hs), int(vs)))
         if len(recs) < 10:
-            # Early season / thin window — fall back to the 2-season pull.
-            from models.game_ml_model import _reconstruct_games, _team_timeline
-            _cur = today.year if today.month >= 10 else today.year - 1
-            games = _reconstruct_games(seasons=[_cur, _cur - 1])
-            if games.empty:
-                return {}
-            tl = _team_timeline(games)
+            # Early season — rate teams from their CURRENT ROSTER (reflects
+            # offseason moves), not last season's team box scores.
+            teams = sorted({p.get("team") for p in (active_players() or [])
+                            if p.get("team")})
             out = {}
-            for team, grows in tl.items():
-                prior = [x for x in grows if x[0] < today.isoformat()]
-                if len(prior) < 5:
-                    continue
-                rec = prior[-10:]
-                out[team] = (float(_np.mean([x[1] for x in rec])),
-                             float(_np.mean([x[2] for x in rec])),
-                             float(_np.mean([x[3] for x in rec])), 2)
+            for team in teams:
+                rs = cached_roster_strength(team)
+                if rs:
+                    # (off, def, winrate, rest) — winrate ~0.5 unknown early.
+                    out[team] = (rs["off"], rs["deff"], 0.5, 2)
             return out
         # Build per-team timeline from the short window.
         tl = {}
@@ -938,30 +932,89 @@ def cached_roster_stats(team):
     try:
         import datetime as _d
         from concurrent.futures import ThreadPoolExecutor
+        from collect.local_store import get_or_refresh
         cur = _d.date.today().year
         cur = cur if _d.date.today().month >= 10 else cur - 1
-        ap = active_players()
+
+        # STABLE part (rosters + season averages) — stored on disk, refreshed
+        # at most once a day, so we don't re-pull it on every load.
+        def _build_stable():
+            ap = active_players()
+            cands = [p for p in ap if p.get("team") == team]
+            if not cands:
+                return []
+
+            def _fetch(p):
+                sa = season_average(p["id"], cur)
+                if not sa or not sa.get("games_played"):
+                    sa = season_average(p["id"], cur - 1)  # last-season rates
+                if sa and sa.get("games_played"):
+                    return {"pid": p["id"], "name": p["name"], "avg": sa}
+                return None
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                res = list(ex.map(_fetch, cands))
+            return [r for r in res if r]
+
+        stable = get_or_refresh(f"roster_stats_{team}_{cur}",
+                                _build_stable, max_age_hours=12) or []
+        # LIVE part (injuries) applied on top at read time — OUT dropped,
+        # Q/D flagged — because injury status DOES change intraday.
         im = cached_injury_map()
-        # Candidate players: on the team and not ruled OUT.
-        cands = [p for p in ap if p.get("team") == team
-                 and not (im.get(p["id"]) and im[p["id"]][0] == "Out")]
-
-        def _fetch(p):
-            sa = season_average(p["id"], cur)
-            if not sa or not sa.get("games_played"):
-                sa = season_average(p["id"], cur - 1)   # last-season fallback
-            if sa and sa.get("games_played"):
-                inj = im.get(p["id"])
-                # Flag questionable/doubtful so the sim can trim their minutes.
-                return (p["name"], dict(sa, _inj=(inj[0] if inj else None)))
-            return None
-
-        # Fetch all players' averages IN PARALLEL (each is one API call).
-        with ThreadPoolExecutor(max_workers=12) as ex:
-            results = list(ex.map(_fetch, cands))
-        return [r for r in results if r]
+        out = []
+        for r in stable:
+            inj = im.get(r["pid"])
+            if inj and inj[0] == "Out":
+                continue
+            out.append((r["name"], dict(r["avg"],
+                                        _inj=(inj[0] if inj else None))))
+        return out
     except Exception:
         return []
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_roster_strength(team):
+    """Estimate a team's offense/defense from its CURRENT roster's players
+    (early-season, when team box scores don't yet reflect roster moves like a
+    traded-in star). Offense = sum of the rotation's expected points; defense
+    is approximated from the roster's defensive stats vs league average.
+    Returns {'off': pts, 'deff': pts} or None."""
+    try:
+        import numpy as _np
+        roster = cached_roster_stats(team)
+        if not roster:
+            return None
+
+        def _minf(m):
+            if m is None:
+                return 0.0
+            try:
+                s = str(m)
+                if ":" in s:
+                    mm, ss = s.split(":", 1)
+                    return float(int(mm)) + float(int(ss)) / 60.0
+                return float(s)
+            except Exception:
+                return 0.0
+        # OFFENSE: a team plays ~240 player-minutes; take the rotation (players
+        # with real minutes) and scale their per-game points to a full team.
+        scored = sorted(
+            [(float(a.get("pts") or 0), _minf(a.get("min"))) for _, a in roster],
+            key=lambda x: x[1], reverse=True)
+        rotation = [s for s in scored if s[1] >= 10][:10]  # top ~10 by minutes
+        off = float(sum(p for p, _ in rotation))
+        # Keep it in a believable band.
+        off = max(95.0, min(128.0, off))
+        # DEFENSE: proxy from roster stocks (steals+blocks) + rebounding; more
+        # disruption/boards -> fewer points allowed. Centered on league ~113.
+        stk = _np.mean([float(a.get("stl") or 0) + float(a.get("blk") or 0)
+                        for _, a in roster]) if roster else 1.0
+        reb = _np.mean([float(a.get("reb") or 0) for _, a in roster]) if roster else 4.0
+        deff = 113.0 - (stk - 1.3) * 4.0 - (reb - 4.0) * 1.2
+        deff = max(104.0, min(120.0, deff))
+        return {"off": off, "deff": deff}
+    except Exception:
+        return None
+
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -992,18 +1045,21 @@ def cached_team_form_rich():
             pts_against.setdefault(ht, []).append(vs)
             pts_for.setdefault(at, []).append(vs)
             pts_against.setdefault(at, []).append(hs)
-        # Thin window early in the season -> widen to 2 seasons.
+        # Thin window early in the season -> team box scores don't yet reflect
+        # roster moves (a traded-in star). Build each team's strength from its
+        # CURRENT ROSTER's players instead, so e.g. a team that added two stars
+        # is rated as the new team, not last season's weaker version.
         if sum(len(v) for v in pts_for.values()) < 30:
-            from models.game_ml_model import _reconstruct_games, _team_timeline
-            _cur = today.year if today.month >= 10 else today.year - 1
-            games = _reconstruct_games(seasons=[_cur, _cur - 1])
-            if not games.empty:
-                tl = _team_timeline(games)
-                pts_for, pts_against = {}, {}
-                for team, grows in tl.items():
-                    rec = sorted(grows, key=lambda x: x[0])[-15:]
-                    pts_for[team] = [x[1] for x in rec]
-                    pts_against[team] = [x[2] for x in rec]
+            from collect.goat_data import active_players as _apf
+            teams = sorted({p.get("team") for p in (_apf() or [])
+                            if p.get("team")})
+            out = {}
+            for team in teams:
+                rs = cached_roster_strength(team)
+                if rs:
+                    out[team] = {"off": rs["off"], "deff": rs["deff"],
+                                 "std": 12.0, "pace": None}
+            return out
         out = {}
         for team, pf in pts_for.items():
             if len(pf) < 3:
@@ -1096,6 +1152,25 @@ def primary_defender_note(opp_abbr, player_group, season):
         if adv and adv.get("matchup_pts") is not None:
             return {"name": s["name"], "adv": adv}
     return None
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_montecarlo(home, away, spread_home, total_line):
+    """10,000-sim Monte Carlo for one matchup, CACHED so it runs ONCE per
+    matchup instead of on every Streamlit rerun (the sims were re-running on
+    every click and slowing every tab). Keyed by matchup + lines."""
+    try:
+        from models.game_sim import simulate_game
+        rf = cached_team_form_rich()
+        hr, ar = rf.get(home), rf.get(away)
+        if not hr or not ar:
+            return None
+        return simulate_game(
+            hr, ar, n_sims=2000,
+            spread_home=(float(spread_home) if spread_home is not None else None),
+            total_line=(float(total_line) if total_line is not None else None))
+    except Exception:
+        return None
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -3424,20 +3499,13 @@ else:
                              f"{away} {proj['p_away_win']*100:.0f}%.")
 
                     # ---- Monte Carlo: simulate the game 10,000 times ----
+                    # CACHED per matchup — it used to re-run 10k sims on every
+                    # rerun, which is what made every tab slow.
                     try:
-                        from models.game_sim import simulate_game
-                        _rf = cached_team_form_rich()
-                        _hr, _ar = _rf.get(home), _rf.get(away)
-                        if _hr and _ar:
-                            _sp = g.get("spread")
-                            _tl = g.get("total")
-                            _sim = simulate_game(
-                                _hr, _ar, n_sims=10000,
-                                spread_home=(float(_sp) if _sp is not None
-                                             else None),
-                                total_line=(float(_tl) if _tl is not None
-                                            else None))
-                            if _sim:
+                        _sp = g.get("spread")
+                        _tl = g.get("total")
+                        _sim = cached_montecarlo(home, away, _sp, _tl)
+                        if _sim:
                                 _msg = (f"🎲 Simulated 10,000× — {home} wins "
                                         f"{_sim['home_win_prob']*100:.0f}% / "
                                         f"{away} {_sim['away_win_prob']*100:.0f}%. "
