@@ -1659,22 +1659,33 @@ else:
         from database import nba_today as _nt
         _today_iso = _nt()
         _tdate = _da.date.fromisoformat(_today_iso)
-        # Window: TODAY + the next 6 days (no past dates — you can't bet them).
-        _week = [_tdate + _da.timedelta(days=i) for i in range(7)]
         _dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        if "analyze_date" not in st.session_state:
-            st.session_state["analyze_date"] = _today_iso
+
+        # Only show days that ACTUALLY have props posted — and only ever TODAY
+        # and TOMORROW (books don't post further out). Usually just today until
+        # tomorrow's lines go up near tip-off. Uses the 15-min cached prop-keys
+        # helper, so this is cheap after the first check.
+        _days_with_props = []
+        for _i in range(2):  # today + tomorrow only
+            _d_iso = (_tdate + _da.timedelta(days=_i)).isoformat()
+            if cached_prop_keys_for_date(_d_iso):
+                _days_with_props.append(_d_iso)
+        if not _days_with_props:
+            _days_with_props = [_today_iso]  # fall back to today
+        if st.session_state.get("analyze_date") not in _days_with_props:
+            st.session_state["analyze_date"] = _days_with_props[0]
 
         def _pick_date(_iso):
             # Callback: runs BEFORE the rerun, so Streamlit keeps the Analyze
             # tab active (st.rerun() would reset to the first tab).
             st.session_state["analyze_date"] = _iso
 
-        st.caption("📅 **Pick a day** — see its NBA games; if the books have "
-                   "posted props, the player list auto-filters to who's playing.")
-        _cols = st.columns(7)
-        for _i, _dt in enumerate(_week):
-            _iso = _dt.isoformat()
+        st.caption("📅 **Days with props posted** (today / tomorrow) — pick "
+                   "one; the player list auto-filters to who's playing that "
+                   "day. Tomorrow appears here once the books post its lines.")
+        _cols = st.columns(max(len(_days_with_props), 1))
+        for _i, _iso in enumerate(_days_with_props):
+            _dt = _da.date.fromisoformat(_iso)
             _day = "Today" if _iso == _today_iso else _dow[_dt.weekday()]
             _lbl = f"{_day}\n{_dt.month}/{_dt.day}"
             _is_sel = st.session_state["analyze_date"] == _iso
