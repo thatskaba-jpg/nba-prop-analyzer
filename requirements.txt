@@ -1,18 +1,22 @@
-# Core data + modeling
-pandas==2.2.2
-numpy==1.26.4
-scikit-learn==1.4.2
-scipy==1.13.1
+# Core data + modeling. Lower-bound pins (>=) so the installer can pick builds
+# that have prebuilt wheels for the deployed Python version — hard == pins to
+# old releases fail to BUILD on newer Python (e.g. 3.14), which broke the
+# Streamlit Cloud deploy. runtime.txt pins Python to a stable 3.11 so the whole
+# set resolves to known-good wheels.
+pandas>=2.2.2
+numpy>=1.26.4
+scikit-learn>=1.4.2
+scipy>=1.13.1
 
-# NBA data (free, unofficial NBA.com endpoints)
-nba_api==1.4.1
+# NBA data (unofficial NBA.com endpoints)
+nba_api>=1.4.1
 
-# Odds API client + secrets (used starting in Phase 6)
-requests==2.32.3
-python-dotenv==1.0.1
+# Odds API client + secrets
+requests>=2.32.3
+python-dotenv>=1.0.1
 
-# Dashboard (Phase 7)
-streamlit==1.36.0
+# Dashboard
+streamlit>=1.36.0
 
-# Charts for backtesting (Phase 8)
-matplotlib==3.9.0
+# Charts for backtesting
+matplotlib>=3.9.0
