@@ -551,6 +551,41 @@ def goat_team_ratings(season):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def blended_team_ratings(season):
+    """Team ratings BLENDED across this season and last — the right call early
+    in a season when this year's sample is tiny and unreliable on its own.
+
+    Weight on THIS season ramps up with how many games it has: ~0 games -> lean
+    almost entirely on last year; by ~20 games this season it's ~2/3 current.
+    Blends off/def/pace; keeps this season's row shape (ranks). Falls back to
+    whichever season actually has data."""
+    cur = goat_team_ratings(season) or {}
+    prev = goat_team_ratings(season - 1) or {}
+    if not prev:
+        return cur
+    if not cur:
+        return prev
+    out = {}
+    for abbr, c in cur.items():
+        p = prev.get(abbr)
+        if not p:
+            out[abbr] = c
+            continue
+        # Games played this season drives the weight (fall back to a small
+        # early-season assumption when the feed doesn't report it).
+        n = c.get("games") or 5
+        w = max(0.0, min(1.0, n / 30.0))   # full current weight by ~30 games
+        blended = dict(c)
+        for f in ("off", "def", "net", "pace"):
+            cv, pv = c.get(f), p.get(f)
+            if cv is not None and pv is not None:
+                blended[f] = round(w * cv + (1 - w) * pv, 2)
+        blended["_blend_w"] = round(w, 2)
+        out[abbr] = blended
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def goat_adv_avg(pid, season):
     """Player's season-average advanced stats (usage%, assist%, PIE, TS%),
     cached an hour. Real efficiency signals the box score alone doesn't show."""
@@ -623,6 +658,41 @@ def cached_out_teammates():
         from collect.teammate_injuries import build_out_teammates_map
         return build_out_teammates_map()
     return _with_deadline(_build, seconds=4, default={}) or {}
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_team_injuries():
+    """{team: [(name, status, ppg), ...]} of OUT/DOUBTFUL players per team, for
+    the game-model Star Tax. Cached 15 min, deadline-bounded like the rest."""
+    def _build():
+        from collect.teammate_injuries import out_players_by_team
+        return out_players_by_team()
+    return _with_deadline(_build, seconds=4, default={}) or {}
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_team_lineup(team_abbr):
+    """Confirmed starters/bench for a team's game TODAY, from the lineups feed
+    (posts near tip-off; empty before). Finds today's game id for the team,
+    then pulls that team's rows only. Cached 10 min, deadline-bounded."""
+    if not team_abbr:
+        return {"starters": [], "bench": []}
+    def _build():
+        from collect.goat_data import lineup_for_team
+        from odds.balldontlie_props import _todays_game_ids
+        from collect.schedule import upcoming_games
+        from database import nba_today
+        # Map team -> today's game id via the schedule's game list.
+        gids = _todays_game_ids()
+        # Match the team to one of today's games by checking each game's rows.
+        for gid in gids:
+            lu = lineup_for_team(gid, team_abbr)
+            if lu["starters"] or lu["bench"]:
+                return lu
+        return {"starters": [], "bench": []}
+    return _with_deadline(_build, seconds=4,
+                          default={"starters": [], "bench": []}) \
+        or {"starters": [], "bench": []}
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -1348,6 +1418,27 @@ else:
             default_site_idx = 0
             st.caption(f"{sel} — {my_team or '?'} · no scheduled game, pick below")
 
+        # ---- Confirmed lineup (CURRENT roster — post-trade accurate) ----
+        # Our team mapping comes from the player's last game log, which can be
+        # LAST season's roster after an offseason trade. The lineups feed has
+        # the real, current starters/bench, so we use it to (a) show tonight's
+        # confirmed five and (b) flag the player's starter/bench role.
+        lu = cached_team_lineup(my_team) if my_team else {"starters": [],
+                                                          "bench": []}
+        if lu.get("starters"):
+            in_starters = any(sel.split()[-1] in s for s in lu["starters"])
+            in_bench = any(sel.split()[-1] in b for b in lu["bench"])
+            role = ("🟢 confirmed STARTER" if in_starters
+                    else "🪑 off the bench" if in_bench
+                    else "⚠️ not in the posted lineup — may be out/traded")
+            st.caption(f"**Tonight's confirmed {my_team} lineup:** "
+                       + ", ".join(lu["starters"])
+                       + f"  ·  {sel}: {role}")
+            if not in_starters and not in_bench:
+                st.warning(f"{sel} isn't in {my_team}'s confirmed lineup. If he "
+                           "was traded or is out, our team/matchup data (built "
+                           "from last game logs) may be stale for him.")
+
         d1, d2 = st.columns([1, 1])
         opp = d1.selectbox(
             "Opponent", teams,
@@ -1733,6 +1824,43 @@ else:
                     if extra:
                         st.caption("Also: " + " · ".join(extra)
                                    + f"  (over {adv.get('games','?')} games).")
+
+                    # Matchup defense — what this player gives up on D.
+                    if adv.get("matchup_pts") is not None:
+                        mfg = adv.get("matchup_fg_pct")
+                        st.caption(
+                            f"🛡️ On defense: allows ~{adv['matchup_pts']:.1f} "
+                            f"pts to the man he guards"
+                            + (f", on {mfg*100:.0f}% shooting" if mfg
+                               else "") + ".")
+                    # Shot quality — how good his looks are.
+                    sq = []
+                    if adv.get("uncontested_fg_pct") is not None:
+                        sq.append(f"uncontested {adv['uncontested_fg_pct']*100:.0f}%")
+                    if adv.get("contested_fg_pct") is not None:
+                        sq.append(f"contested {adv['contested_fg_pct']*100:.0f}%")
+                    if adv.get("rim_fg_pct") is not None:
+                        sq.append(f"at the rim {adv['rim_fg_pct']*100:.0f}%")
+                    if sq:
+                        st.caption("🎯 Shot quality (FG%): " + " · ".join(sq))
+                    # Scoring profile — where his points come from.
+                    sp = []
+                    if adv.get("pct_pts_paint") is not None:
+                        sp.append(f"{adv['pct_pts_paint']*100:.0f}% in the paint")
+                    if adv.get("pct_pts_3pt") is not None:
+                        sp.append(f"{adv['pct_pts_3pt']*100:.0f}% from 3")
+                    if adv.get("pct_pts_ft") is not None:
+                        sp.append(f"{adv['pct_pts_ft']*100:.0f}% from the line")
+                    if sp:
+                        st.caption("📍 Scoring mix: " + " · ".join(sp))
+                    # Playmaking volume.
+                    pm = []
+                    if adv.get("passes") is not None:
+                        pm.append(f"~{adv['passes']:.0f} passes/game")
+                    if adv.get("secondary_ast") is not None:
+                        pm.append(f"{adv['secondary_ast']:.1f} secondary assists")
+                    if pm:
+                        st.caption("🏀 Playmaking: " + " · ".join(pm))
                 sm = goat_standings(cs)
                 if sm and opp in sm:
                     o = sm[opp]
@@ -2121,7 +2249,8 @@ else:
                  "compare it to the **real sportsbook line**, and flag where the "
                  "odds give you an edge. Same honest EV math as the prop tools.")
 
-        from models.game_model import project_game, cover_probability
+        from models.game_model import (project_game, cover_probability,
+                                        GAME_PROFILES, DEFAULT_PROFILE)
         import datetime as _d5
         from database import nba_today
 
@@ -2137,7 +2266,16 @@ else:
             cached_schedule.clear()
             st.rerun()
         lines = cached_game_lines(gl_date)
-        ratings = goat_team_ratings(2025)
+        # Blend THIS season with LAST season for the game model. Early in a new
+        # season this year's sample is tiny, so we lean on last year and shift
+        # toward current as games accrue (see blended_team_ratings).
+        try:
+            _gyr = int(gl_date[:4])
+            _season = _gyr if int(gl_date[5:7]) >= 10 else _gyr - 1
+        except Exception:
+            _season = 2025
+        ratings = blended_team_ratings(_season)
+        team_inj = cached_team_injuries()  # {team: [(name, status, ppg), ...]}
 
         if not lines:
             st.info("No game lines posted for this date yet. Sportsbook game "
@@ -2174,6 +2312,16 @@ else:
             ev_bar = st.slider("Min edge to flag ✅ (game bets)", 1, 10, 3,
                                help="How much better than the fair line our "
                                     "number must be before we call it value.")
+            prof_name = st.radio(
+                "Model profile", list(GAME_PROFILES.keys()),
+                index=list(GAME_PROFILES).index(DEFAULT_PROFILE),
+                horizontal=True,
+                help="Switch how the game model thinks. Balanced is the "
+                     "default; others trust the ratings more/less, add home "
+                     "court, or react harder to pace. The picks below update "
+                     "to match.")
+            gprofile = GAME_PROFILES[prof_name]
+            _mstd = gprofile["margin_std"]
 
             # Show open (bettable) games first, then live/final ones.
             ordered = open_games + live_games
@@ -2192,7 +2340,7 @@ else:
                 else:
                     tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
                 g = lines.get(home) or {}
-                proj = project_game(home, away, ratings)
+                proj = project_game(home, away, ratings, gprofile, team_inj)
 
                 # ---- QUICK PICK for the collapsed title: who we'd back ----
                 # Only on OPEN games — a pick on a live/final game isn't
@@ -2211,7 +2359,7 @@ else:
                             picks.append((home if _ev["recommended_side"] == "over"
                                           else away) + " to win")
                     if sp_h is not None:
-                        _ph, _pa = cover_probability(proj["exp_margin"], sp_h)
+                        _ph, _pa = cover_probability(proj["exp_margin"], sp_h, _mstd)
                         _evs = evaluate_prop(_ph, _pa, -110, -110,
                                              edge_threshold=ev_bar / 100.0)
                         if _evs.get("is_value"):
@@ -2303,6 +2451,42 @@ else:
                              f"{home} {proj['p_home_win']*100:.0f}% / "
                              f"{away} {proj['p_away_win']*100:.0f}%.")
 
+                    # ---- Each team's DEFENSE: points allowed per 100 (#rank) --
+                    def _def_line(abbr):
+                        row = ratings.get(abbr) or {}
+                        dv = row.get("def")
+                        if dv is None:
+                            return None
+                        rk = row.get("def_rank")
+                        rktxt = f" (#{rk} of 30)" if rk else ""
+                        feel = ("stingy" if (rk and rk <= 10)
+                                else "leaky" if (rk and rk >= 21)
+                                else "average")
+                        return f"**{abbr}** allows {dv:g}/100{rktxt} — {feel} D"
+                    dlines = [x for x in (_def_line(home), _def_line(away)) if x]
+                    if dlines:
+                        st.caption("🛡️ Defense (points allowed per 100 poss, "
+                                   "lower = better): " + "  ·  ".join(dlines))
+
+                    # ---- Star Tax: injuries that moved the margin ----
+                    htax = proj.get("home_injury_tax") or 0
+                    atax = proj.get("away_injury_tax") or 0
+                    if htax or atax:
+                        bits = []
+                        if htax:
+                            bits.append(f"**{home}** −{htax:.1f} ("
+                                        + ", ".join(proj.get(
+                                            "home_injury_reasons", [])) + ")")
+                        if atax:
+                            bits.append(f"**{away}** −{atax:.1f} ("
+                                        + ", ".join(proj.get(
+                                            "away_injury_reasons", [])) + ")")
+                        st.info("🩹 Injury adjustment (Star Tax) applied to the "
+                                "margin: " + "; ".join(bits)
+                                + ". A ruled-out star shifts the line toward the "
+                                "healthy team — the pick above already reflects "
+                                "this.")
+
                     # ---- Moneyline EV (if the book posted ML) ----
                     ml_home = g.get("moneyline")
                     g_away = lines.get(away) or {}
@@ -2328,7 +2512,7 @@ else:
                     sp_home = g.get("spread")
                     if sp_home is not None:
                         p_home_cov, p_away_cov = cover_probability(
-                            proj["exp_margin"], sp_home)
+                            proj["exp_margin"], sp_home, _mstd)
                         # Both sides priced ~ -110 by convention unless we have better.
                         ev_s = evaluate_prop(p_home_cov, p_away_cov, -110, -110,
                                              edge_threshold=ev_bar / 100.0)

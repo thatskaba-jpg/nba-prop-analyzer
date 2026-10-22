@@ -112,6 +112,20 @@ def player_advanced_avg(player_id: int, season: int) -> dict:
         "touches": _avg("touches"),
         "pct_pts": _avg("pct_points"),      # share of team's points
         "pct_fga": _avg("pct_fga"),         # share of team's shot attempts
+        # Matchup DEFENSE — what the player allows to who he guards.
+        "matchup_pts": _avg("matchup_player_points"),
+        "matchup_fg_pct": _avg("matchup_fg_pct"),
+        # Shot quality — how good his looks are.
+        "contested_fg_pct": _avg("contested_fg_pct"),
+        "uncontested_fg_pct": _avg("uncontested_fg_pct"),
+        "rim_fg_pct": _avg("defended_at_rim_fg_pct"),
+        # Playmaking volume.
+        "passes": _avg("passes"),
+        "secondary_ast": _avg("secondary_assists"),
+        # Scoring profile — where his points come from.
+        "pct_pts_paint": _avg("pct_pts_paint"),
+        "pct_pts_3pt": _avg("pct_pts_3pt"),
+        "pct_pts_ft": _avg("pct_pts_free_throw"),
         "games": len(rows),
     }
     _ADV_AVG_CACHE[key] = out
@@ -129,6 +143,26 @@ def lineups(game_id: int) -> list:
     Route verified real (/lineups with game_ids[]). Returns [] when lineups
     aren't posted yet — we never fabricate a lineup."""
     return _get_all("lineups", {"game_ids[]": game_id})
+
+
+def lineup_for_team(game_id: int, team_abbr: str) -> dict:
+    """Confirmed starters/bench for ONE team in a game, from the lineups feed.
+
+    Returns {'starters': [names], 'bench': [names]} using only rows whose team
+    abbreviation matches `team_abbr` — so a scrambled/placeholder feed for OTHER
+    teams can't leak in. Empty lists when lineups aren't posted yet. Honest: we
+    report exactly what the feed says for this team, nothing inferred."""
+    starters, bench = [], []
+    for r in lineups(game_id):
+        t = (r.get("team") or {}).get("abbreviation")
+        if t != team_abbr:
+            continue
+        p = r.get("player") or {}
+        nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        if not nm:
+            continue
+        (starters if r.get("starter") else bench).append(nm)
+    return {"starters": starters, "bench": bench}
 
 
 # NOTE: /teams/season_averages exists (returns 400, not 404) but its required
