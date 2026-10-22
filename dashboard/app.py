@@ -191,6 +191,34 @@ button[data-baseweb="tab"][aria-selected="true"] {
     background:var(--accent) !important; color:#0c0c0d !important; }
 div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display:none; }
 
+/* ---- All radios as clean tappable pills (chip look, no radio circle) ---- */
+div[role="radiogroup"] { gap:8px !important; flex-wrap:wrap !important; }
+div[role="radiogroup"] label {
+    background:#161617 !important; border:1px solid #2a2a2c !important;
+    border-radius:10px !important; padding:9px 14px !important;
+    margin:0 !important; cursor:pointer !important; transition:all .12s ease;
+    display:flex !important; align-items:center !important;
+    justify-content:center !important; text-align:center !important; }
+div[role="radiogroup"] label:hover { border-color:#5a5a5e !important; }
+div[role="radiogroup"] label > div:first-child { display:none !important; }
+div[role="radiogroup"] label div[data-testid="stMarkdownContainer"] p {
+    color:#d4d4d8 !important; font-size:.86rem !important; margin:0 !important;
+    white-space:nowrap !important; }
+div[role="radiogroup"] label:has(input:checked) {
+    background:#ffffff !important; border-color:#ffffff !important; }
+div[role="radiogroup"] label:has(input:checked) p {
+    color:#0c0c0d !important; font-weight:700 !important; }
+
+/* Stat picker (a radio with MANY options, 5+): a uniform 4-column grid so
+   every pill is equal width and the rows line up symmetrically. The 3-option
+   importance pills and 2-option Venue stay inline. Scoped by option count
+   because this Streamlit build (1.36) doesn't emit per-widget key classes. */
+div[role="radiogroup"]:has(> label:nth-child(5)) {
+    display:grid !important;
+    grid-template-columns:repeat(4, 1fr) !important;
+    gap:8px !important; }
+div[role="radiogroup"]:has(> label:nth-child(5)) label { min-height:42px !important; }
+
 /* ---- Inputs: recessed, white focus ---- */
 div[data-baseweb="input"] input, div[data-baseweb="select"] > div,
 .stNumberInput input, .stTextInput input {
@@ -630,6 +658,32 @@ def cached_schedule(date=None):
     return _with_deadline(_build, seconds=4, default={}) or {}
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_scores(date=None):
+    """Final/live scores per game, cached 5 min. Returns
+    {matchup "AWAY @ HOME": {"home": int, "away": int, "final": bool}} so the
+    Game Lines tab can grade the model's pick once a game is over. Empty on any
+    failure — grading is optional, never blocks the page."""
+    import datetime as _d
+    date = date or _d.date.today().isoformat()
+    def _build():
+        from collect.balldontlie_client import _get
+        out = {}
+        for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
+            h = (g.get("home_team") or {}).get("abbreviation")
+            a = (g.get("visitor_team") or {}).get("abbreviation")
+            if not (h and a):
+                continue
+            hs, as_ = g.get("home_team_score"), g.get("visitor_team_score")
+            if hs is None or as_ is None:
+                continue
+            final = str(g.get("status") or "").strip().lower().startswith("final")
+            out[f"{a} @ {h}"] = {"home": int(hs), "away": int(as_),
+                                 "final": final}
+        return out
+    return _with_deadline(_build, seconds=4, default={}) or {}
+
+
 def _game_not_started(status: str) -> bool:
     """True if the game hasn't tipped off yet (status is a future ISO time)."""
     if not status:
@@ -896,21 +950,52 @@ FACTOR_LABELS = {
 }
 
 
+def _stage_factor_set(mode, factors, name=None):
+    """Stage a (mode, factors) set to be applied at the TOP of the next run,
+    before the builder widgets instantiate. Writing a widget's session_state
+    key AFTER its widget rendered is forbidden by Streamlit, so preset / load /
+    recommended buttons stage here and rerun instead of writing directly."""
+    st.session_state["pending_model"] = {"mode": mode, "factors": dict(factors),
+                                          "name": name}
+
+
+def _apply_pending_model():
+    """Apply a staged model set. MUST run before the builder widgets render."""
+    pend = st.session_state.pop("pending_model", None)
+    if not pend:
+        return
+    mode, factors = pend["mode"], pend["factors"]
+    st.session_state["simple_mode"] = (mode == "simple")
+    st.session_state["seeded_mode"] = (mode == "simple")  # don't re-seed over it
+    for key in FACTORS:
+        st.session_state[f"on_{key}"] = key in factors
+        if key in factors:
+            st.session_state[("i_" if mode == "simple" else "w_") + key] = \
+                factors[key]
+    if pend.get("name"):
+        st.session_state["model_name"] = pend["name"]
+
+
+# Apply any staged model BEFORE the mode toggle / factor widgets are created.
+_apply_pending_model()
+
+
 def _apply_recommended():
-    """Seed the builder widgets' session_state with the recommended set."""
+    """Stage the recommended set (applied on the next run, pre-widget)."""
     mode_simple = st.session_state.get("simple_mode", True)
     rec = RECOMMENDED_SIMPLE if mode_simple else RECOMMENDED_WEIGHTED
+    _stage_factor_set("simple" if mode_simple else "weighted", rec)
+
+
+# Seed defaults on FIRST load only (runs before widgets, so a direct write is
+# safe here). Mode flips are handled live by the toggle; presets stage+rerun.
+if "seeded_mode" not in st.session_state:
+    _simple_now = st.session_state.get("simple_mode", True)
+    rec = RECOMMENDED_SIMPLE if _simple_now else RECOMMENDED_WEIGHTED
     for key in FACTORS:
         st.session_state[f"on_{key}"] = key in rec
         if key in rec:
-            st.session_state[("i_" if mode_simple else "w_") + key] = rec[key]
-
-
-# Seed defaults on first load and whenever the weighting mode flips, so the app
-# always opens on a good, ready-to-use model.
-_simple_now = st.session_state.get("simple_mode", True)
-if st.session_state.get("seeded_mode") != _simple_now:
-    _apply_recommended()
+            st.session_state[("i_" if _simple_now else "w_") + key] = rec[key]
     st.session_state["seeded_mode"] = _simple_now
 
 
@@ -941,6 +1026,101 @@ def _build_config_from_state():
 
 
 config, config_err = _build_config_from_state()
+
+
+# --------------------------------------------------------------------------- #
+# PRESETS + SAVED MODELS
+#
+# Streamlit Cloud has an EPHEMERAL filesystem (and our DB is re-downloaded on
+# boot), so a disk/DB "save" would silently vanish on restart. Instead we keep
+# saved models in session_state (durable for the session) and offer JSON
+# download/upload so a model survives across sessions — honest about the
+# platform, and portable. Built-in presets are always available.
+# --------------------------------------------------------------------------- #
+
+# Each preset: (mode, factors, one-line description). Simple mode unless noted.
+PRESETS = {
+    "⭐ Balanced (recommended)": ("simple", dict(RECOMMENDED_SIMPLE),
+        "A bit of everything — the solid all-purpose default."),
+    "🔥 Trusts recent form": ("simple", {
+        "player_last_n_avg": "high", "minutes_trend": "high",
+        "rest_days": "medium"},
+        "Leans hard on how the player's been playing lately."),
+    "🛡️ Focuses on the matchup": ("simple", {
+        "opponent_defense_by_position": "high", "opponent_team_rating": "high",
+        "player_last_n_avg": "medium", "game_environment": "medium"},
+        "Weights who they're facing — opponent defense and pace."),
+    "🩹 Chases injury news": ("simple", {
+        "teammate_injuries": "high", "player_last_n_avg": "high",
+        "minutes_trend": "medium", "opponent_defense_by_position": "medium"},
+        "Boosts players whose teammates are out (extra usage)."),
+    "🏃 Likes fast, high-scoring games": ("simple", {
+        "game_environment": "high", "opponent_team_rating": "high",
+        "player_last_n_avg": "medium"},
+        "Favors high totals and fast pace — more chances to score."),
+    "😴 Weighs rest & fatigue": ("simple", {
+        "rest_days": "high", "minutes_trend": "high",
+        "player_last_n_avg": "medium", "game_environment": "low"},
+        "Downgrades tired legs (back-to-backs), rewards fresh ones."),
+    "🏠 Cares about home vs away": ("simple", {
+        "home_away_split": "high", "player_last_n_avg": "high",
+        "opponent_defense_by_position": "medium", "rest_days": "low"},
+        "Leans on how the player does at home vs on the road."),
+    "🎯 All-around sharp pick": ("simple", {
+        "player_last_n_avg": "high", "opponent_defense_by_position": "high",
+        "teammate_injuries": "high", "opponent_team_rating": "medium",
+        "rest_days": "low"},
+        "Form + matchup + injury news, the three that matter most."),
+    "📈 Follows rising minutes": ("simple", {
+        "minutes_trend": "high", "player_last_n_avg": "high",
+        "teammate_injuries": "medium"},
+        "Backs players whose playing time is trending up."),
+    "🧊 Avoids tough defenses": ("simple", {
+        "opponent_defense_by_position": "high", "opponent_team_rating": "high",
+        "game_environment": "medium", "rest_days": "low",
+        "player_last_n_avg": "low"},
+        "Pulls projections down hard against stingy defenses."),
+    "📊 Uses every factor": ("simple", {
+        "player_last_n_avg": "high", "opponent_defense_by_position": "high",
+        "opponent_team_rating": "medium", "teammate_injuries": "medium",
+        "game_environment": "medium", "rest_days": "medium",
+        "home_away_split": "low", "minutes_trend": "low"},
+        "Turns everything on — the most thorough, least focused."),
+    "⚖️ Exact-percent (advanced)": ("weighted", {
+        "player_last_n_avg": 28, "opponent_defense_by_position": 24,
+        "teammate_injuries": 16, "opponent_team_rating": 12,
+        "game_environment": 10, "rest_days": 6, "minutes_trend": 4},
+        "Precise percentage weights that add up to 100 (power users)."),
+}
+
+
+def _apply_factor_set(mode, factors, name=None):
+    """Stage a (mode, factors) set; applied at the top of the next run before
+    the builder widgets render (callers must st.rerun() after calling)."""
+    _stage_factor_set(mode, factors, name=name)
+
+
+def _current_model_dict():
+    """Serialize the current builder state to a portable dict."""
+    simple_mode = st.session_state.get("simple_mode", True)
+    mode = "simple" if simple_mode else "weighted"
+    factors = {}
+    for key in FACTORS:
+        if st.session_state.get(f"on_{key}"):
+            factors[key] = (st.session_state.get(f"i_{key}", "medium")
+                            if simple_mode
+                            else int(st.session_state.get(f"w_{key}", 20)))
+    return {"name": st.session_state.get("model_name", "My Model"),
+            "mode": mode, "factors": factors}
+
+
+def _save_current_model():
+    """Store the current model in session_state under its name."""
+    m = _current_model_dict()
+    if not m["factors"]:
+        return False
+    st.session_state.setdefault("saved_models", {})[m["name"]] = m
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -977,25 +1157,88 @@ with tabM:
                     "exact percentages that sum to 100.")
     simple_mode = st.session_state.get("simple_mode", True)
 
-    if st.button("⭐ Use recommended factors"):
-        _apply_recommended()
-        st.rerun()
+    # ---- Presets: one-tap starting points ----
+    st.markdown("#### Presets")
+    st.caption("Each loads a ready-made model. Tap one, then tweak the factors "
+               "below if you want.")
+    preset_names = list(PRESETS.keys())
+    pcols = st.columns(2)
+    for i, pname in enumerate(preset_names):
+        col = pcols[i % 2]
+        mode, factors, desc = PRESETS[pname]
+        if col.button(pname, key=f"preset_{i}", use_container_width=True):
+            nm = pname.split(" ", 1)[-1] if " " in pname else pname
+            _apply_factor_set(mode, factors, name=nm)
+            st.rerun()
+        col.caption(desc)
+
+    # ---- Save / load your own models (session + JSON file) ----
+    with st.expander("💾 Save or load a model"):
+        sv1, sv2 = st.columns([1, 1])
+        if sv1.button("💾 Save current model", use_container_width=True):
+            if _save_current_model():
+                st.success(f"Saved **{st.session_state.get('model_name')}** "
+                           "for this session. Use **Download** below to keep it "
+                           "after the app restarts.")
+            else:
+                st.warning("Pick at least one factor before saving.")
+
+        saved = st.session_state.get("saved_models", {})
+        if saved:
+            pick = sv2.selectbox("Load a saved model",
+                                 ["—"] + list(saved.keys()))
+            if pick and pick != "—":
+                if st.button(f"Load “{pick}”"):
+                    m = saved[pick]
+                    _apply_factor_set(m["mode"], m["factors"], name=m["name"])
+                    st.rerun()
+
+        # Portable JSON so a model survives across sessions on the cloud.
+        import json as _json
+        st.download_button(
+            "⬇️ Download this model (.json)",
+            data=_json.dumps(_current_model_dict(), indent=2),
+            file_name=f"{st.session_state.get('model_name', 'model')}.json",
+            mime="application/json", use_container_width=True)
+        up = st.file_uploader("⬆️ Load a model file (.json)", type="json",
+                              key="model_upload")
+        if up is not None:
+            # Apply each uploaded file ONCE (by name+size) so re-runs don't keep
+            # overwriting the user's subsequent manual edits.
+            sig = f"{up.name}:{up.size}"
+            if st.session_state.get("model_upload_sig") != sig:
+                st.session_state["model_upload_sig"] = sig
+                try:
+                    m = _json.loads(up.read().decode("utf-8"))
+                    nm = m.get("name", "Loaded model")
+                    _apply_factor_set(m.get("mode", "simple"),
+                                      m.get("factors", {}), name=nm)
+                    st.session_state.setdefault("saved_models", {})[nm] = m
+                    st.success(f"Loaded **{nm}**.")
+                    st.rerun()
+                except Exception:
+                    st.error("That file isn't a valid model .json.")
 
     st.markdown("### Factors")
     for key, f in FACTORS.items():
         label = FACTOR_LABELS.get(key, f.label)
-        on = st.checkbox(label, key=f"on_{key}", help=FACTOR_HELP.get(key))
-        if on:
-            if simple_mode:
+        if simple_mode:
+            # One compact row: checkbox on the left, Low/Med/High pills on the
+            # right (only when the factor is on). No more tall sliders.
+            fc1, fc2 = st.columns([3, 4])
+            on = fc1.checkbox(label, key=f"on_{key}", help=FACTOR_HELP.get(key))
+            if on:
                 if f"i_{key}" not in st.session_state:
                     st.session_state[f"i_{key}"] = "medium"
-                st.select_slider(
-                    f"   {label} — importance",
-                    options=["low", "medium", "high"],
-                    format_func=lambda x: {"low": "Low", "medium": "Medium",
+                fc2.radio(
+                    f"{label} importance", options=["low", "medium", "high"],
+                    format_func=lambda x: {"low": "Low", "medium": "Med",
                                            "high": "High"}[x],
-                    key=f"i_{key}")
-            else:
+                    key=f"i_{key}", horizontal=True,
+                    label_visibility="collapsed")
+        else:
+            on = st.checkbox(label, key=f"on_{key}", help=FACTOR_HELP.get(key))
+            if on:
                 if f"w_{key}" not in st.session_state:
                     st.session_state[f"w_{key}"] = 20
                 st.number_input(f"   {label} — weight %", 0, 100, step=5,
@@ -1058,20 +1301,22 @@ else:
         st.write("The **line** is the sportsbook's number for a stat (e.g. 25.5 "
                  "points). **Over** = more than the line, **Under** = fewer. "
                  "Pick who they're facing so the matchup factors apply.")
-        c1, c2, c3 = st.columns([2, 2, 1])
+        c1, c2 = st.columns([2, 1])
         sel = c1.selectbox("Player", names,
                            index=names.index("Mikal Bridges")
                            if "Mikal Bridges" in names else 0)
-        prop_type = c2.selectbox("Stat", list(PROP_WORDS.keys()),
-                                 format_func=lambda k: PROP_WORDS[k])
         if "sgo_line" not in st.session_state:
             st.session_state["sgo_line"] = 25.5
         if "pending_line" in st.session_state:
             st.session_state["sgo_line"] = st.session_state.pop("pending_line")
-        line = c3.number_input("Line", step=0.5, key="sgo_line",
+        line = c2.number_input("Line", step=0.5, key="sgo_line",
                                help="The sportsbook's number. Over = above it, "
                                     "Under = below it. Auto-fill sets this to "
                                     "the real posted line.")
+        # Stat picker: a click-to-select pill row (not a type-to-search box).
+        prop_type = st.radio("Stat", list(PROP_WORDS.keys()),
+                             format_func=lambda k: PROP_WORDS[k],
+                             horizontal=True, key="prop_type_pick")
 
         pid = id_of[sel]
         hist = load_player_history(pid)
@@ -1468,6 +1713,26 @@ else:
                         f"PIE {(adv.get('pie') or 0)*100:.1f}% "
                         f"(overall impact). Higher usage = more shots/touches = "
                         f"a higher, steadier line.")
+                    # Extra advanced detail — share of the offense + efficiency.
+                    extra = []
+                    if adv.get("pct_pts") is not None:
+                        extra.append(f"**{adv['pct_pts']*100:.0f}%** of the "
+                                     f"team's points")
+                    if adv.get("pct_fga") is not None:
+                        extra.append(f"**{adv['pct_fga']*100:.0f}%** of its shots")
+                    if adv.get("reb_pct") is not None:
+                        extra.append(f"rebound rate {adv['reb_pct']*100:.1f}%")
+                    if adv.get("efg_pct") is not None:
+                        extra.append(f"eFG {adv['efg_pct']*100:.1f}%")
+                    if adv.get("ast_to") is not None:
+                        extra.append(f"A:TO {adv['ast_to']:.2f}")
+                    if adv.get("touches") is not None:
+                        extra.append(f"~{adv['touches']:.0f} touches/game")
+                    if adv.get("pace") is not None:
+                        extra.append(f"plays at {adv['pace']:.0f} pace")
+                    if extra:
+                        st.caption("Also: " + " · ".join(extra)
+                                   + f"  (over {adv.get('games','?')} games).")
                 sm = goat_standings(cs)
                 if sm and opp in sm:
                     o = sm[opp]
@@ -1885,6 +2150,7 @@ else:
             # One row per GAME (not per team): use the home entries.
             games = sorted({v["matchup"] for v in lines.values()})
             sched = cached_schedule(gl_date)  # {matchup: status}
+            scores = cached_scores(gl_date)   # {matchup: {home,away,final}}
             total_sched = len(sched)
             open_games = [m for m in games if _game_not_started(sched.get(m, ""))]
             live_games = [m for m in games if m not in open_games]
@@ -1960,8 +2226,60 @@ else:
                 elif proj and not is_open:
                     quick = "  —  started"
 
-                title = f"🏀  {matchup}    {tag}{quick}"
+                # ---- GRADE on FINAL games: did the model call it right? ----
+                sc = scores.get(matchup)
+                grade_title = ""
+                if proj and sc and sc.get("final"):
+                    actual_margin = sc["home"] - sc["away"]  # +ve => home won
+                    model_home = proj["exp_margin"] > 0       # model's SU pick
+                    home_won = actual_margin > 0
+                    su_right = (model_home == home_won)
+                    # ATS: did the side the model favored cover the home spread?
+                    sp_h = g.get("spread")
+                    ats = None
+                    if sp_h is not None:
+                        # home covers if actual_margin + spread > 0
+                        home_covered = (actual_margin + sp_h) > 0
+                        ats = (model_home == home_covered)
+                    winner = home if home_won else away
+                    mark = "✅" if su_right else "❌"
+                    bits = [f"{mark} winner ({winner})"]
+                    if ats is not None:
+                        bits.append(("✅" if ats else "❌") + " ATS")
+                    grade_title = (f"  —  {sc['away']}-{sc['home']}  ·  "
+                                   + "  ".join(bits))
+
+                title = f"🏀  {matchup}    {tag}{quick}{grade_title}"
                 with st.expander(title, expanded=False):
+                    if proj and sc and sc.get("final"):
+                        actual_margin = sc["home"] - sc["away"]
+                        model_home = proj["exp_margin"] > 0
+                        home_won = actual_margin > 0
+                        su_right = (model_home == home_won)
+                        winner = home if home_won else away
+                        proj_fav = home if model_home else away
+                        box = "#14321f" if su_right else "#2a1414"
+                        line_txt = (f"Final: **{away} {sc['away']} – "
+                                    f"{sc['home']} {home}** ({winner} won by "
+                                    f"{abs(actual_margin)}). "
+                                    f"Model picked **{proj_fav}** by "
+                                    f"{abs(proj['exp_margin']):.1f} → "
+                                    + ("✅ correct winner."
+                                       if su_right else "❌ wrong winner."))
+                        sp_h = g.get("spread")
+                        if sp_h is not None:
+                            home_covered = (actual_margin + sp_h) > 0
+                            ats_right = (model_home == home_covered)
+                            line_txt += (f" Against the spread ({home} "
+                                         f"{sp_h:+g}): "
+                                         + ("✅ model's side covered."
+                                            if ats_right
+                                            else "❌ model's side didn't cover."))
+                        st.markdown(
+                            f'<div style="background:{box};padding:10px 14px;'
+                            f'border-radius:10px;color:#e6e9ef;font-size:.9rem;'
+                            f'margin-bottom:10px;">{line_txt}</div>',
+                            unsafe_allow_html=True)
                     if not is_open:
                         st.caption("This game has tipped off — the line below is "
                                    "the last PRE-GAME number, kept for reference. "

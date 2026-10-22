@@ -5,7 +5,8 @@ Every function here was built against a REAL response from your key (field
 shapes confirmed live, not guessed). Endpoints covered:
 
   - season_average(player_id, season)   -> /season_averages   (pts/reb/ast/%/min)
-  - advanced_stats(game_id or player)   -> /stats/advanced     (PIE, pace, usage)
+  - advanced_stats(game_id or player)   -> /nba/v2/stats/advanced (PIE, pace,
+                                           usage, touches, team-share, matchup)
   - standings(season)                   -> /standings          (records, ranks)
 
 NOT INCLUDED — and why (honest): the tier list names "Player Props", but every
@@ -54,9 +55,15 @@ def season_average(player_id: int, season: int) -> dict:
 
 def advanced_stats(game_id: int = None, player_id: int = None,
                    season: int = None) -> list:
-    """Advanced stats (PIE, pace, usage %, assist %, rebound %, ratings).
-    Filter by game_id, or player_id + season. Returns a list of rows
-    (ALL pages)."""
+    """Advanced stats from the V2 endpoint (nba/v2/stats/advanced): PIE, pace,
+    usage %, rebound %, eFG%, A:TO, touches, share of team points/shots, and
+    matchup-defense fields. Filter by game_id, or player_id + season. Returns a
+    list of rows (ALL pages).
+
+    NOTE: V2 rows carry a `period` field (0 = full game, 1-4 = quarters,
+    5-7 = OT). Callers that want per-GAME numbers must keep only period == 0
+    rows (see player_advanced_avg), or they'll mix full-game and per-quarter
+    rows and corrupt any average."""
     params = {"per_page": 100}
     if game_id is not None:
         params["game_ids[]"] = game_id
@@ -64,7 +71,7 @@ def advanced_stats(game_id: int = None, player_id: int = None,
         params["player_ids[]"] = player_id
     if season is not None:
         params["seasons[]"] = season
-    return _get_all("stats/advanced", params)
+    return _get_all("nba/v2/stats/advanced", params)
 
 
 _ADV_AVG_CACHE: dict = {}
@@ -83,6 +90,9 @@ def player_advanced_avg(player_id: int, season: int) -> dict:
     if key in _ADV_AVG_CACHE:
         return _ADV_AVG_CACHE[key]
     rows = advanced_stats(player_id=player_id, season=season)
+    # V2 returns per-period rows too; keep FULL-GAME rows only (period 0, or
+    # rows with no period field for forward-compat) so averages aren't mixed.
+    rows = [r for r in rows if r.get("period", 0) in (0, None)]
 
     def _avg(field):
         vals = [r.get(field) for r in rows if r.get(field) is not None]
@@ -93,6 +103,15 @@ def player_advanced_avg(player_id: int, season: int) -> dict:
         "assist_pct": _avg("assist_percentage"),
         "pie": _avg("pie"),
         "ts_pct": _avg("true_shooting_percentage"),
+        # Extra V2 advanced signals surfaced in the Extra-context panel.
+        "reb_pct": _avg("rebound_percentage"),
+        "efg_pct": _avg("effective_field_goal_percentage"),
+        "ast_to": _avg("assist_to_turnover"),
+        "pace": _avg("pace"),
+        "poss": _avg("possessions"),
+        "touches": _avg("touches"),
+        "pct_pts": _avg("pct_points"),      # share of team's points
+        "pct_fga": _avg("pct_fga"),         # share of team's shot attempts
         "games": len(rows),
     }
     _ADV_AVG_CACHE[key] = out
