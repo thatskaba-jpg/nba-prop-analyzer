@@ -100,7 +100,11 @@ def _name_key(name: str) -> str:
 
 
 def _todays_game_ids():
-    today = date.today().isoformat()
+    try:
+        from database import nba_today
+        today = nba_today()
+    except Exception:
+        today = date.today().isoformat()
     rows = _get_all("v1/games", {"dates[]": today, "per_page": 100})
     return [g["id"] for g in rows]
 

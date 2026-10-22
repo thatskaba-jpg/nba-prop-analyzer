@@ -14,6 +14,23 @@ import sqlite3
 import sys
 from pathlib import Path
 
+
+def nba_today() -> str:
+    """Today's NBA 'basketball day' in US Eastern (EST/EDT), as YYYY-MM-DD.
+
+    Use this instead of date.today() anywhere 'today' means the slate being
+    played. The cloud server runs in UTC, so after ~8pm ET its date is already
+    tomorrow — which would show the wrong (tiny) slate. Eastern keeps every tab
+    on the night actually in play. zoneinfo handles DST automatically; the
+    fallback (UTC-5) is close enough if the tz database is unavailable.
+    """
+    import datetime as _d
+    try:
+        from zoneinfo import ZoneInfo
+        return _d.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return (_d.datetime.utcnow() - _d.timedelta(hours=5)).date().isoformat()
+
 # The database file lives in the project's data/ folder.
 # This file is src/database.py, so the project root is ONE level up from src/.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

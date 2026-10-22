@@ -156,7 +156,12 @@ def build_game_lines_map(date=None):
     balldontlie first (consensus across books); SportsGameOdds as fallback.
     Empty when no odds are posted yet."""
     import datetime as _dt
-    date = date or _dt.date.today().isoformat()
+    if not date:
+        try:
+            from database import nba_today
+            date = nba_today()
+        except Exception:
+            date = _dt.date.today().isoformat()
     bdl = _from_balldontlie(date)
     if bdl:
         return bdl

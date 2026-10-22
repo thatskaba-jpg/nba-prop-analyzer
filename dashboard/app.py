@@ -1684,9 +1684,13 @@ else:
 
         from models.game_model import project_game, cover_probability
         import datetime as _d5
+        from database import nba_today
 
-        gl_date = st.date_input("Game date", _d5.date.today(),
-                                help="Lines appear closer to tip-off.").isoformat()
+        gl_date = st.date_input("Game date",
+                                _d5.date.fromisoformat(nba_today()),
+                                help="Defaults to tonight's NBA slate (US "
+                                     "Eastern). Lines appear closer to tip-off."
+                                ).isoformat()
         if st.button("🔄 Refresh games"):
             # Clear the 15-min caches so a stale earlier pull (fewer games)
             # can't keep showing — forces a fresh fetch of lines + schedule.
