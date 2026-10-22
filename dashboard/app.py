@@ -2249,8 +2249,18 @@ else:
                  "compare it to the **real sportsbook line**, and flag where the "
                  "odds give you an edge. Same honest EV math as the prop tools.")
 
-        from models.game_model import (project_game, cover_probability,
-                                        GAME_PROFILES, DEFAULT_PROFILE)
+        from models.game_model import project_game, cover_probability
+        # Profiles were added later; import defensively so an older/cached
+        # game_model (e.g. before a redeploy) can't blank the whole tab — fall
+        # back to a single Balanced profile baked in here.
+        try:
+            from models.game_model import (GAME_PROFILES, DEFAULT_PROFILE,
+                                            GAME_PROFILE_DESC)
+        except ImportError:
+            GAME_PROFILES = {"Balanced": {"home_edge": 2.5, "margin_std": 12.0,
+                                          "net_scale": 1.0, "pace_gain": 1.0}}
+            DEFAULT_PROFILE = "Balanced"
+            GAME_PROFILE_DESC = {}
         import datetime as _d5
         from database import nba_today
 
@@ -2322,6 +2332,35 @@ else:
                      "to match.")
             gprofile = GAME_PROFILES[prof_name]
             _mstd = gprofile["margin_std"]
+            _desc = GAME_PROFILE_DESC.get(prof_name)
+            if _desc:
+                st.caption(f"**{prof_name}:** {_desc}")
+
+            # ---- Day-by-day profile success rate (builds over the season) ----
+            with st.expander("📈 Profile track record (builds day by day)"):
+                try:
+                    from models.profile_scoreboard import (update_scoreboard,
+                                                           get_scoreboard)
+                    update_scoreboard(_season)   # grade any new finished games
+                    board = get_scoreboard()
+                except Exception:
+                    board = []
+                if board:
+                    import pandas as _pd
+                    sb = _pd.DataFrame(
+                        [{"Profile": n,
+                          "Record": f"{c}-{t-c}",
+                          "Win %": f"{pct*100:.0f}%",
+                          "Games": t}
+                         for n, c, t, pct in board])
+                    st.dataframe(sb, use_container_width=True, hide_index=True)
+                    st.caption("Straight-up winner accuracy, graded from final "
+                               "scores as games finish. The list grows every "
+                               "night — small samples early, so give it time "
+                               "before trusting the ranking.")
+                else:
+                    st.caption("No graded games yet — this fills in as tonight's "
+                               "(and future) games go final.")
 
             # Show open (bettable) games first, then live/final ones.
             ordered = open_games + live_games
@@ -2340,7 +2379,10 @@ else:
                 else:
                     tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
                 g = lines.get(home) or {}
-                proj = project_game(home, away, ratings, gprofile, team_inj)
+                try:
+                    proj = project_game(home, away, ratings, gprofile, team_inj)
+                except TypeError:
+                    proj = project_game(home, away, ratings)  # old signature
 
                 # ---- QUICK PICK for the collapsed title: who we'd back ----
                 # Only on OPEN games — a pick on a live/final game isn't

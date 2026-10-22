@@ -51,8 +51,46 @@ GAME_PROFILES = {
                                     "net_scale": 0.7, "pace_gain": 1.0},
     "Pace-sensitive": {"home_edge": 2.5, "margin_std": 12.0, "net_scale": 1.0,
                        "pace_gain": 1.6},
+    "No home edge (neutral court)": {"home_edge": 0.0, "margin_std": 12.0,
+                                     "net_scale": 1.0, "pace_gain": 1.0},
+    "Road warrior (fade home)": {"home_edge": 1.0, "margin_std": 12.0,
+                                 "net_scale": 1.0, "pace_gain": 1.0},
+    "Underdog hunter": {"home_edge": 2.5, "margin_std": 16.0, "net_scale": 0.55,
+                        "pace_gain": 1.0},
+    "Favorite slammer (chalk)": {"home_edge": 3.5, "margin_std": 9.0,
+                                 "net_scale": 1.5, "pace_gain": 1.0},
+    "Slow grind (low pace)": {"home_edge": 2.5, "margin_std": 11.0,
+                              "net_scale": 1.0, "pace_gain": 0.5},
+    "Max confidence (sharp)": {"home_edge": 3.0, "margin_std": 8.5,
+                               "net_scale": 1.5, "pace_gain": 1.2},
 }
 DEFAULT_PROFILE = "Balanced"
+
+# Plain-English description per profile — shown in the UI like the prop presets.
+GAME_PROFILE_DESC = {
+    "Balanced": "The solid all-purpose default — standard home court and "
+                "confidence.",
+    "Strong home court": "Gives the home team extra credit — good when home "
+                         "edges are running hot.",
+    "Trust the ratings (bold)": "Leans harder on the better-rated team; more "
+                                "decisive picks.",
+    "Cautious (toward coin flip)": "Pulls close games toward 50/50 — fewer "
+                                   "strong calls, safer.",
+    "Pace-sensitive": "Reacts more to fast/slow matchups — favors up-tempo "
+                      "spots.",
+    "No home edge (neutral court)": "Ignores home court entirely — pure "
+                                    "team-vs-team on a neutral floor.",
+    "Road warrior (fade home)": "Barely credits home court — leans toward road "
+                                "teams the market overtaxes at home.",
+    "Underdog hunter": "Shrinks favorites and widens outcomes — surfaces more "
+                       "underdog value.",
+    "Favorite slammer (chalk)": "Backs favorites hard with a big home edge — "
+                                "chalk-heavy picks.",
+    "Slow grind (low pace)": "Dampens pace — built for low-scoring, grind-it-out "
+                             "games.",
+    "Max confidence (sharp)": "Tightest, most decisive model — strong rating "
+                              "trust, smallest spread of outcomes.",
+}
 
 
 def _norm_cdf(x):
