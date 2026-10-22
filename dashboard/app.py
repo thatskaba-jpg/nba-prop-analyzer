@@ -2644,6 +2644,16 @@ else:
                                              edge_threshold=ev_bar / 100.0)
                         st.markdown(f"**Spread** — {home} {sp_home:+g} / "
                                     f"{away} {-sp_home:+g}")
+                        _favt = home if sp_home < 0 else away
+                        _dogt = away if sp_home < 0 else home
+                        _num = abs(sp_home)
+                        st.caption(
+                            f"➖ **minus = favorite**: {_favt} {-_num:g} must "
+                            f"**win by more than {_num:g}** to cover. "
+                            f"➕ **plus = underdog**: {_dogt} +{_num:g} covers "
+                            f"if they **win outright OR lose by less than "
+                            f"{_num:g}**. (Land exactly on {_num:g} = push, "
+                            f"bet refunded.)")
                         if ev_s.get("is_value"):
                             over = ev_s["recommended_side"] == "over"
                             side = (f"{home} {sp_home:+g}" if over
