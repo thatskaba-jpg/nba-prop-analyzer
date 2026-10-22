@@ -1,0 +1,20 @@
+# Secrets — never commit these
+.env
+.env.local
+.streamlit/secrets.toml
+
+# Local database and cached data
+data/*.db
+data/*.csv
+data/*.parquet
+data/raw/
+data/*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store

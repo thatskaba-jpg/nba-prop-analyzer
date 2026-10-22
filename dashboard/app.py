@@ -1,0 +1,1840 @@
+"""
+app.py — Phase 7: the dashboard, written to be understood by ANYONE.
+
+Run it from the project root (with the venv active):
+
+    streamlit run dashboard/app.py
+
+Plain-language goal: pick what matters to you, pick a player, and the page tells
+you — in everyday words — how many points/rebounds/assists we expect, how likely
+the Over or Under is, and (if you type in the real odds) whether it looks like a
+good deal. A "Test It" button checks the model against real past games.
+
+Wired to the real, verified engine (prop_model_config, baseline_model, ev_engine,
+backtest). Nothing is made up: numbers come from stored games; odds only appear
+when YOU type them in.
+"""
+
+import sys
+from datetime import date
+from pathlib import Path
+
+import streamlit as st
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+from database import get_connection  # noqa: E402
+from features.features import load_player_history  # noqa: E402
+from features.opponent_defense import defense_factors  # noqa: E402
+from models.prop_model_config import FACTORS, build_config, analyze  # noqa: E402
+from models.milestone_props import milestone_probability  # noqa: E402
+from models.prediction_tracker import (  # noqa: E402
+    log_prediction, grade_pending, tracking_summary,
+)
+from odds.ev_engine import evaluate_prop  # noqa: E402
+try:
+    from odds.sportsgameodds_client import player_prop_odds as _sgo_prop, has_key as _sgo_has, todays_player_keys as _sgo_today, all_player_props as _sgo_all  # noqa: E402
+except Exception:
+    def _sgo_prop(*a, **k):
+        return None
+    def _sgo_has():
+        return False
+    def _sgo_today():
+        return set()
+    def _sgo_all():
+        return {}
+try:
+    from odds.balldontlie_props import all_player_props as _bdl_all, player_prop_odds as _bdl_prop, has_key as _bdl_has, todays_player_keys as _bdl_today, BDLPropsError as _BDLErr  # noqa: E402
+except Exception:
+    class _BDLErr(Exception):
+        pass
+    def _bdl_all():
+        return {}
+    def _bdl_prop(*a, **k):
+        return None
+    def _bdl_has():
+        return False
+    def _bdl_today():
+        return set()
+
+
+# --- Prop-odds router: balldontlie PRIMARY, SportsGameOdds BACKUP. ---
+# balldontlie props are keyed by player_id (exact match to our DB) and come from
+# the API we already rely on; SGO is the fallback if balldontlie has no key or
+# returns nothing. Rate-limit errors propagate so the UI can say "wait a minute".
+def sgo_has_key():
+    return _bdl_has() or _sgo_has()
+
+
+def sgo_all_props():
+    if _bdl_has():
+        try:
+            bdl = _bdl_all()
+            if bdl:
+                return bdl
+        except _BDLErr as e:
+            if "rate limit" in str(e).lower():
+                raise  # let the dashboard show the wait message
+    # Fallback to SportsGameOdds.
+    return _sgo_all() if _sgo_has() else {}
+
+
+def sgo_prop_odds(name, prop_type):
+    if _bdl_has():
+        try:
+            hit = _bdl_prop(name, prop_type)
+            if hit:
+                return hit
+        except _BDLErr:
+            pass
+    return _sgo_prop(name, prop_type) if _sgo_has() else None
+
+
+def sgo_today():
+    if _bdl_has():
+        try:
+            k = _bdl_today()
+            if k:
+                return k
+        except _BDLErr:
+            pass
+    return _sgo_today() if _sgo_has() else set()
+try:
+    from collect.goat_data import (  # noqa: E402
+        season_average, advanced_stats, standings_map, team_ratings_map,
+        player_advanced_avg,
+    )
+except Exception:
+    season_average = advanced_stats = standings_map = team_ratings_map = None
+    player_advanced_avg = None
+try:
+    from collect.fetch_injuries import current_injury  # noqa: E402
+except Exception:
+    def current_injury(_pid):
+        return None
+try:
+    from collect.espn_player_bio import player_bio as espn_bio  # noqa: E402
+except Exception:
+    def espn_bio(_name):
+        return None
+from backtest.backtest import run_backtest  # noqa: E402
+
+st.set_page_config(page_title="NBA Prop Helper", page_icon="🏀", layout="wide")
+
+# --- Styling: a polished MONOCHROME sports-analytics look. ---
+st.markdown("""
+<style>
+/* ---- Base typography + layout ---- */
+html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont,
+    'Segoe UI', Roboto, sans-serif; }
+.stApp { background:
+    radial-gradient(1200px 600px at 80% -10%, #1a1a1a 0%, transparent 60%),
+    radial-gradient(900px 500px at -10% 10%, #161616 0%, transparent 55%),
+    #0a0a0a; }
+.block-container { padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1180px; }
+
+/* ---- Headings ---- */
+h1, h2, h3 { letter-spacing: -0.02em; font-weight: 800; color: #fafafa; }
+h3 { border-bottom: 1px solid #262626; padding-bottom: 6px; margin-top: .4rem; }
+
+/* ---- Metric tiles: glassy card, white-edge hover ---- */
+div[data-testid="stMetric"] {
+    background: linear-gradient(160deg, #1a1a1a 0%, #121212 100%);
+    border: 1px solid #2a2a2a;
+    border-radius: 14px;
+    padding: 16px 18px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.4);
+    transition: transform .12s ease, border-color .12s ease;
+}
+div[data-testid="stMetric"]:hover { transform: translateY(-2px);
+    border-color: #e5e5e5; }
+div[data-testid="stMetric"] label { color: #9a9a9a !important; font-size: .78rem;
+    text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+div[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 800;
+    color: #ffffff; }
+
+/* ---- Buttons: light-on-dark, invert on hover ---- */
+div.stButton > button {
+    background: #f5f5f5; color: #0a0a0a; border: 1px solid #f5f5f5;
+    border-radius: 10px; font-weight: 700; padding: .5rem 1.1rem;
+    letter-spacing: .01em; box-shadow: 0 2px 10px rgba(0,0,0,.4);
+    transition: transform .1s ease, background .1s ease, color .1s ease;
+}
+div.stButton > button:hover { transform: translateY(-1px);
+    background: #0a0a0a; color: #f5f5f5; border-color: #f5f5f5; }
+div.stButton > button:active { transform: translateY(0); }
+
+/* ---- Tabs: pill-style, white active ---- */
+div[data-baseweb="tab-list"] { gap: 6px; background: #141414; padding: 5px;
+    border-radius: 12px; border: 1px solid #262626; }
+button[data-baseweb="tab"] { font-size: .98rem; font-weight: 700; border-radius: 9px;
+    padding: 8px 16px; color: #9a9a9a; }
+button[data-baseweb="tab"][aria-selected="true"] {
+    background: #f5f5f5 !important; color: #0a0a0a !important; }
+div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display:none; }
+
+/* ---- Inputs: dark, rounded, light focus ---- */
+div[data-baseweb="input"] input, div[data-baseweb="select"] > div,
+.stNumberInput input, .stTextInput input {
+    background: #141414 !important; border-radius: 9px !important;
+    border: 1px solid #2a2a2a !important; color: #ededed !important; }
+div[data-baseweb="input"]:focus-within, .stNumberInput div:focus-within {
+    border-color: #e5e5e5 !important; }
+
+/* ---- Tables: rounded, subtle ---- */
+div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden;
+    border: 1px solid #262626; }
+
+/* ---- Sidebar: deep neutral panel ---- */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #101010 0%, #080808 100%);
+    border-right: 1px solid #262626; }
+section[data-testid="stSidebar"] h1 { font-size: 1.25rem; }
+
+/* ---- Expanders ---- */
+div[data-testid="stExpander"] { border: 1px solid #262626; border-radius: 12px;
+    background: #141414; overflow: hidden; }
+
+/* ---- Radio / slider accents ---- */
+div[role="radiogroup"] label { font-weight: 600; }
+.stSlider [data-baseweb="slider"] div[role="slider"] { background: #f5f5f5; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# Everyday-word labels for things that otherwise sound technical.
+PROP_WORDS = {
+    "points": "Points", "rebounds": "Rebounds", "assists": "Assists",
+    "threes_made": "3-Pointers Made",
+    "steals": "Steals", "blocks": "Blocks", "turnovers": "Turnovers",
+    "pra": "Pts + Reb + Ast (PRA)",
+    "pr": "Pts + Reb", "pa": "Pts + Ast", "ra": "Reb + Ast",
+    "stocks": "Stocks (Stl + Blk)",
+}
+# Friendly one-line descriptions for each factor (shown under its checkbox).
+FACTOR_HELP = {
+    "player_last_n_avg": "Is the player hot or cold lately?",
+    "opponent_defense": "Is the other team easy or hard to score on?",
+    "opponent_team_rating": "Official team numbers: a weaker defense (gives up "
+                            "more points) and a faster pace (more possessions) "
+                            "both make a bigger night more likely.",
+    "rest_days": "Is the player tired (played yesterday) or well-rested?",
+    "home_away_split": "Does the player do better at home or away?",
+    "minutes_trend": "Is the player getting more or less playing time?",
+    "player_vs_team": "How has the player done against this team before?",
+    "teammate_injuries": "Are the player's teammates hurt? If a teammate sits, "
+                         "this player usually gets more shots and minutes, so "
+                         "their line nudges up. This is game-day news that "
+                         "sportsbooks are often slow to fully price in.",
+    "game_environment": "Tonight's game line. A high total means a fast, high-"
+                        "scoring game (everyone's numbers lean up); a low total "
+                        "means a grind (lean down). A huge spread means likely "
+                        "blowout — stars rest in the 4th, capping their stats.",
+}
+
+
+@st.cache_data(show_spinner=False)
+def player_list():
+    conn = get_connection()
+    # One row per NAME (players can have two ids across data sources). We pick
+    # a representative id and sum games across ids so the 20-game floor counts
+    # the player's whole career, not just one source. history loads by name
+    # anyway, so any id for that name resolves the full timeline.
+    rows = conn.execute(
+        "SELECT player_name, MIN(player_id) AS pid, COUNT(*) c "
+        "FROM player_game_logs GROUP BY player_name HAVING c >= 20 "
+        "ORDER BY player_name").fetchall()
+    conn.close()
+    return [(r["player_name"], r["pid"]) for r in rows]
+
+
+@st.cache_data(show_spinner=False)
+def defense_map(cutoff):
+    return defense_factors(cutoff)
+
+
+def defense_summary(cutoff, team):
+    """Plain-English defense read for `team` from our OWN season data
+    (opponent_defense: points allowed vs league average). Returns a dict with
+    a label, a rank (1 = toughest D), and the points-vs-league wording, or None.
+
+    Reliable — computed from the local 247k-game DB, no external API."""
+    fmap = defense_map(cutoff)
+    if not fmap or team not in fmap:
+        return None
+    # factor > 1 = allows MORE than average (soft D); < 1 = tough D.
+    # Rank 1 = toughest (lowest factor).
+    order = sorted(fmap, key=lambda t: fmap[t])
+    rank = order.index(team) + 1
+    n = len(order)
+    factor = fmap[team]
+    pct = (factor - 1.0) * 100
+    if factor >= 1.03:
+        tag = "soft defense — gives up more than average"
+    elif factor <= 0.97:
+        tag = "tough defense — stingy"
+    else:
+        tag = "average defense"
+    return {"rank": rank, "n": n, "factor": factor, "pct": pct, "tag": tag}
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_history(pid):
+    """Player game history, cached for the session so the value scanner doesn't
+    re-read the DB for the same player on every scan. Returns the DataFrame."""
+    return load_player_history(pid)
+
+
+@st.cache_data(show_spinner=False)
+def team_abbrs():
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT DISTINCT opponent FROM player_game_logs "
+        "WHERE opponent IS NOT NULL AND opponent != '' ORDER BY opponent"
+    ).fetchall()
+    conn.close()
+    return [r["opponent"] for r in rows]
+
+
+@st.cache_data(show_spinner=False)
+def positional_map(stat, cutoff):
+    from features.positional_defense import positional_defense_factors
+    if stat not in ("points", "rebounds", "assists"):
+        return {}
+    return positional_defense_factors(stat, cutoff)
+
+
+@st.cache_data(show_spinner=False)
+def player_group(pid, cutoff):
+    from features.positional_defense import player_groups
+    return player_groups(cutoff).get(pid)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def player_team(pid):
+    """The player's current team abbreviation. Prefers the OFFICIAL roster
+    (/players/active), which reflects real offseason TRADES the game log can't
+    know yet (a traded player's last game is still under his OLD team). Falls
+    back to the most-recent-game team only when the roster has no entry."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT player_name, matchup FROM player_game_logs WHERE player_id = ? "
+        "ORDER BY game_date DESC LIMIT 1", (pid,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        from collect.fetch_rosters import official_team
+        off = official_team(row["player_name"])
+        if off:
+            return off
+    except Exception:
+        pass
+    m = (row["matchup"] or "").split(" ")
+    return m[0] if m and m[0] else None
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def next_opponent(team_abbr):
+    """(opponent, is_home) for the team's next scheduled game, or None.
+
+    Tries balldontlie's schedule first (GOAT tier), then falls back to ESPN's
+    FREE public scoreboard so a dropped/rate-limited balldontlie call still
+    resolves tonight's matchup."""
+    if not team_abbr:
+        return None
+    # Primary: balldontlie.
+    try:
+        from collect.schedule import next_game_for_team
+        hit = next_game_for_team(team_abbr)
+        if hit:
+            return hit
+    except Exception:
+        pass
+    # Backup: ESPN public scoreboard (no key).
+    try:
+        from collect.schedule_espn import next_game_for_team as espn_next
+        return espn_next(team_abbr)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def goat_standings(season):
+    if standings_map is None:
+        return {}
+    try:
+        return standings_map(season)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def goat_season_avg(pid, season):
+    if season_average is None:
+        return {}
+    try:
+        return season_average(pid, season)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def goat_team_ratings(season):
+    """Team off/def/net ratings + pace from balldontlie (advanced team season
+    averages), cached an hour. Refreshes as the season's games accrue."""
+    if team_ratings_map is None:
+        return {}
+    try:
+        return team_ratings_map(season)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def goat_adv_avg(pid, season):
+    """Player's season-average advanced stats (usage%, assist%, PIE, TS%),
+    cached an hour. Real efficiency signals the box score alone doesn't show."""
+    if player_advanced_avg is None:
+        return {}
+    try:
+        return player_advanced_avg(pid, season)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_bio(player_name):
+    """Player photo + position/height/weight from ESPN (free). Cached a day —
+    bios barely change. None on any failure (cosmetic only)."""
+    try:
+        return espn_bio(player_name)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def todays_keys():
+    """Normalized name-keys of players with props posted today (SportsGameOdds)."""
+    try:
+        return sgo_today()
+    except Exception:
+        return set()
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_all_props():
+    """Bulk prop lines for today, cached 15 min so a full evening of research
+    barely touches the API (and rarely trips the free-tier rate limit). Lines
+    move slowly pre-game, so 15 min is plenty fresh. Re-raises so the scanner
+    can report a rate-limit distinctly."""
+    return sgo_all_props()
+
+
+def _with_deadline(fn, seconds=4, default=None):
+    """Run fn() on a side thread and give up after `seconds`.
+
+    The game-line and teammate-injury lookups hit the network. If a feed is
+    slow or unreachable, a direct call would block Streamlit's single render
+    thread and freeze the whole page on "RUNNING…" — which is exactly the
+    "nothing loads below the inputs" bug. This returns `default` (an empty map)
+    the instant the deadline passes, so a slow feed degrades to "no extra"
+    instead of hanging. The thread is a daemon, so a truly stuck call can't keep
+    the process alive."""
+    import threading
+    box = {"val": default}
+
+    def _run():
+        try:
+            box["val"] = fn()
+        except Exception:
+            box["val"] = default
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(seconds)
+    return box["val"]
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_out_teammates():
+    """OUT-teammate map, cached 15 min AND bounded to a short deadline so a slow
+    network pass can never stall the Analyze tab. Degrades to {} on timeout."""
+    def _build():
+        from collect.teammate_injuries import build_out_teammates_map
+        return build_out_teammates_map()
+    return _with_deadline(_build, seconds=4, default={}) or {}
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_game_lines(date=None):
+    """Game-lines map, cached 15 min AND bounded to a short deadline. A live odds
+    fetch that's slow degrades to {} instead of freezing the page."""
+    def _build():
+        from odds.game_lines import build_game_lines_map
+        return build_game_lines_map(date)
+    return _with_deadline(_build, seconds=4, default={}) or {}
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_schedule(date=None):
+    """Today's full schedule with each game's status, cached 5 min and bounded
+    to a short deadline. Returns {matchup "AWAY @ HOME": status_str}. Used to
+    tell OPEN (not yet tipped) games apart from LIVE/FINAL ones, so the Game
+    Lines tab can say '3 of 11 open' instead of a bare '3 games'. A status that
+    looks like an ISO timestamp (e.g. '2026-10-22T02:00:00Z') means the game
+    has NOT started yet; anything else ('1st Qtr', 'Final', 'Halftime') means
+    it is live or done."""
+    import datetime as _d
+    date = date or _d.date.today().isoformat()
+    def _build():
+        from collect.balldontlie_client import _get
+        out = {}
+        for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
+            h = (g.get("home_team") or {}).get("abbreviation")
+            a = (g.get("visitor_team") or {}).get("abbreviation")
+            if h and a:
+                out[f"{a} @ {h}"] = str(g.get("status") or "")
+        return out
+    return _with_deadline(_build, seconds=4, default={}) or {}
+
+
+def _game_not_started(status: str) -> bool:
+    """True if the game hasn't tipped off yet (status is a future ISO time)."""
+    if not status:
+        return False
+    s = status.strip()
+    # Scheduled games carry an ISO start time; live/final carry text like
+    # '1st Qtr', 'Halftime', 'Final'.
+    return s[:4].isdigit() and "T" in s
+
+
+# Minimum games THIS season before we trust a VALUE flag. Early in a season a
+# player's "recent form" leans on last season, so a value call on a 1-2 game
+# sample is noise — we show the projection but hold the green badge until here.
+MIN_SEASON_GAMES_FOR_VALUE = 5
+
+
+def _season_start_iso():
+    """ISO date of the current NBA season's start (Oct 1 of the season year)."""
+    t = date.today()
+    yr = t.year if t.month >= 10 else t.year - 1
+    return f"{yr}-10-01"
+
+
+def season_games_count(hist):
+    """How many games in `hist` fall in the current season (>= Oct 1)."""
+    try:
+        start = _season_start_iso()
+        return int((hist["game_date"] >= start).sum())
+    except Exception:
+        return 0
+
+
+def scan_today_value(_config, stats, edge_threshold, max_players):
+    """Run every player in today's games through the model, compare each real
+    posted prop line/odds to our projection, and return value bets ranked by EV.
+
+    _config is underscored so Streamlit's cache doesn't try to hash the model
+    object. Returns (rows, note) where rows is a list of dicts and note is a
+    plain-English status line. Pure read: no logging, no writes.
+
+    FAST PATH: all sportsbook props are fetched in ONE call (all_player_props)
+    and looked up in memory — no per-player, per-stat network requests. A full
+    slate scan is one API call instead of hundreds.
+    """
+    import datetime as _dt
+    if not sgo_has_key():
+        return [], "No SportsGameOdds key — add SPORTSGAMEODDS_KEY to .env to scan real odds."
+
+    # ONE network call (cached 5 min): every player's prop lines for today.
+    try:
+        props = cached_all_props()
+    except Exception as e:
+        if "rate limit" in str(e).lower() or "429" in str(e):
+            return [], ("⏳ SportsGameOdds rate limit hit (free tier) — wait "
+                        "about a minute, then scan again.")
+        return [], f"Couldn't fetch odds: {e}"
+    if not props:
+        return [], "No props posted yet for today (they appear ~12-24h before tip-off)."
+
+    def _nk(s):
+        return "".join(c for c in s.lower() if c.isalnum())
+
+    # Only scan players we have history for AND who have props posted today.
+    roster = [(name, pid) for (name, pid) in player_list() if _nk(name) in props]
+
+    # PERF: the opponent-defense maps cost ~0.4s each to build. They're keyed by
+    # cutoff date, and every player is predicting the SAME upcoming slate, so we
+    # compute them ONCE for a single shared cutoff (today) instead of per player
+    # (which was ~177 rebuilds = the whole slowdown). Projection impact is nil:
+    # the defensive map barely moves day to day within a slate.
+    shared_cutoff = _dt.date.today().isoformat()
+    shared_def_map = defense_map(shared_cutoff)
+    shared_pos_maps = {s: positional_map(s, shared_cutoff) for s in stats}
+    # Official balldontlie team ratings (def rating + pace), computed ONCE per
+    # scan — season year from the cutoff, >=2024 to stay on GOAT-available data.
+    try:
+        _rs = int(shared_cutoff[:4])
+    except Exception:
+        _rs = 2026
+    shared_team_ratings = goat_team_ratings(_rs if _rs >= 2024 else 2024)
+    # Game-day usage signal: which players have OUT/DOUBTFUL teammates tonight.
+    # Built ONCE per scan from the merged injuries table.
+    try:
+        shared_out_teammates = cached_out_teammates()
+    except Exception:
+        shared_out_teammates = {}
+    # Game lines (total + spread) for tonight's slate, built ONCE per scan.
+    try:
+        shared_game_lines = cached_game_lines(shared_cutoff)
+    except Exception:
+        shared_game_lines = {}
+
+    rows = []
+    for name, pid in roster:
+        try:
+            player_props = props.get(_nk(name), {})
+            if not player_props:
+                continue
+            hist = cached_history(pid)
+            if hist is None or len(hist) < 20:
+                continue
+            last_date = hist.iloc[-1]["game_date"]
+            try:
+                cutoff = (_dt.date.fromisoformat(last_date)
+                          + _dt.timedelta(days=1)).isoformat()
+            except Exception:
+                cutoff = last_date
+            my_team = player_team(pid)
+            auto = next_opponent(my_team)
+            opp, is_home = (auto if auto else (hist.iloc[-1]["opponent"], True))
+            grp = player_group(pid, cutoff)
+            inj = current_injury(pid)
+            _early = season_games_count(hist) < MIN_SEASON_GAMES_FOR_VALUE
+
+            for stat in stats:
+                hit = player_props.get(stat)
+                if not hit or not hit.get("line"):
+                    continue
+                line = hit["line"]
+                o_over = hit["odds_over"] or -110
+                o_under = hit["odds_under"] or -110
+                ctx = {
+                    "opponent_abbr": opp,
+                    "defense_factor_map": shared_def_map,
+                    "positional_defense_map": shared_pos_maps.get(stat, {}),
+                    "position_group": grp,
+                    "upcoming_is_home": is_home,
+                    "team_ratings_map": shared_team_ratings,
+                }
+                if inj:
+                    ctx["injury_status"] = inj[0]
+                mates_out = shared_out_teammates.get(pid)
+                if mates_out:
+                    ctx["out_teammates"] = mates_out
+                gl = shared_game_lines.get(my_team)
+                if gl:
+                    ctx["game_line"] = gl
+                res = analyze(_config, pid, stat, line, cutoff, hist, ctx)
+                if res["projection"] is None:
+                    continue
+                ev = evaluate_prop(res["p_over"], res["p_under"],
+                                   int(o_over), int(o_under),
+                                   edge_threshold=edge_threshold)
+                lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
+                ev_pick = ev["ev_over_pct"] if lean == "OVER" else ev["ev_under_pct"]
+                rows.append({
+                    "Player": name,
+                    "Matchup": f"{my_team} {'vs' if is_home else '@'} {opp}",
+                    "Prop": PROP_WORDS.get(stat, stat),
+                    "Line": line,
+                    "Proj": res["projection"],
+                    "Pick": lean,
+                    "Win %": int(round((res["p_over"] if lean == "OVER"
+                                        else res["p_under"]) * 100)),
+                    "Odds": o_over if lean == "OVER" else o_under,
+                    "EV %": ev_pick if ev_pick is not None else 0.0,
+                    "Value?": "✅" if (ev["is_value"] and not _early and
+                                       ev["recommended_side"] == lean.lower())
+                              else ("⏳" if (ev["is_value"] and _early) else ""),
+                    "Books": hit.get("books", 0),
+                })
+        except Exception:
+            continue  # one bad player never sinks the whole scan
+
+    # Rank best EV first.
+    rows.sort(key=lambda r: r["EV %"], reverse=True)
+    note = (f"Scanned {len(roster)} players in today's games · "
+            f"{len(rows)} priced props found.")
+    return rows, note
+
+
+def _plain_verdict(ev: dict) -> str:
+    """Turn the EV engine's verdict into one everyday sentence."""
+    if ev["is_value"]:
+        side = ev["recommended_side"].upper()
+        return (f"The math likes the {side} here — the odds give you a bit more "
+                f"than the risk, based on our guess. Still not a sure thing.")
+    return ("The math doesn't see a clear edge here — the odds are about fair or "
+            "worse, so there's no special reason to bet it.")
+
+
+def _plain_reason(adj: str) -> str:
+    """Rewrite one raw adjustment line into an everyday sentence.
+
+    Raw looks like:
+      "[Player Recent Performance w=40%] recent form cold (L5 10.8 vs season
+       17.0) x0.800 -> net x0.920 (13.1 -> 12.0)"
+    We keep the factor name, say up or down and roughly why, and show the
+    before -> after numbers — dropping the x-multipliers and 'net' math.
+    """
+    import re
+    name = adj.split("]")[0].lstrip("[").split(" w=")[0] if "]" in adj else adj
+    # Pull the "(A -> B)" at the very end for the numbers.
+    nums = re.findall(r"\(([\d.]+) -> ([\d.]+)\)", adj)
+    before, after = (nums[-1] if nums else (None, None))
+    direction = ""
+    if before and after:
+        direction = ("raised the projection" if float(after) > float(before)
+                     else "lowered the projection")
+    low = adj.lower()
+    if "vs " in low and ("soft" in low or "tough" in low):
+        why = ("opponent is soft against this player's position"
+               if "soft" in low else
+               "opponent is tough against this player's position")
+    elif "cold" in low:
+        why = "recent form below season average"
+    elif "hot" in low:
+        why = "recent form above season average"
+    elif "tough" in low:
+        why = "opponent is a strong defense"
+    elif "soft" in low:
+        why = "opponent is a weak defense"
+    elif "short rest" in low or "back-to-back" in low:
+        why = "on short rest"
+    elif "well rested" in low:
+        why = "well rested"
+    elif "home" in low:
+        why = "home-court effect"
+    elif "away" in low:
+        why = "road effect"
+    elif "rising" in low:
+        why = "trending up in minutes"
+    elif "falling" in low:
+        why = "trending down in minutes"
+    else:
+        why = "matchup adjustment"
+    if before and after:
+        return f"**{name}** — {why}; {direction} ({before} → {after})."
+    return f"**{name}** — {why}."
+
+
+# --------------------------------------------------------------------------- #
+# SIDEBAR — "What should matter?"
+# --------------------------------------------------------------------------- #
+st.sidebar.title("🏀 Build Your Model")
+st.sidebar.write("Pick the factors that matter and how much. New here? Use the "
+                 "recommended set below — it's a solid starting point.")
+
+model_name = st.sidebar.text_input("Model name", "My First Model")
+
+simple_mode = st.sidebar.toggle("Simple weighting (recommended)", value=True,
+                                help="On: rate each factor Low / Medium / High. "
+                                     "Off: assign exact percentages that sum to "
+                                     "100.")
+
+# The recommended factor set (importance for simple mode, % for weighted).
+RECOMMENDED_SIMPLE = {
+    "player_last_n_avg": "high", "opponent_defense_by_position": "high",
+    "opponent_team_rating": "medium", "teammate_injuries": "medium",
+    "game_environment": "medium",
+    "rest_days": "medium", "home_away_split": "low", "minutes_trend": "low",
+}
+RECOMMENDED_WEIGHTED = {
+    "player_last_n_avg": 30, "opponent_defense_by_position": 22,
+    "opponent_team_rating": 12, "teammate_injuries": 11, "game_environment": 10,
+    "rest_days": 7, "home_away_split": 4, "minutes_trend": 4,
+}
+
+
+def _apply_recommended():
+    """Seed the sidebar widgets' session_state with the recommended set."""
+    rec = RECOMMENDED_SIMPLE if simple_mode else RECOMMENDED_WEIGHTED
+    for key in FACTORS:
+        st.session_state[f"on_{key}"] = key in rec
+        if key in rec:
+            st.session_state[("i_" if simple_mode else "w_") + key] = rec[key]
+
+
+# On the very first load, pre-select the recommended factors.
+if "seeded_defaults" not in st.session_state:
+    _apply_recommended()
+    st.session_state["seeded_defaults"] = True
+
+if st.sidebar.button("⭐ Use recommended factors"):
+    _apply_recommended()
+
+st.sidebar.markdown("### Factors")
+chosen = {}
+for key, f in FACTORS.items():
+    label = {
+        "player_last_n_avg": "Recent form",
+        "opponent_defense": "Opponent defense",
+        "opponent_team_rating": "Opponent team rating (def + pace)",
+        "rest_days": "Rest",
+        "home_away_split": "Home / away",
+        "minutes_trend": "Playing-time trend",
+        "player_vs_team": "History vs this opponent",
+        "teammate_injuries": "Teammate injuries (usage boost)",
+        "game_environment": "Game line (total + spread)",
+    }.get(key, f.label)
+    on = st.sidebar.checkbox(label, key=f"on_{key}", help=FACTOR_HELP.get(key))
+    if on:
+        if simple_mode:
+            if f"i_{key}" not in st.session_state:
+                st.session_state[f"i_{key}"] = "medium"
+            chosen[key] = st.sidebar.select_slider(
+                f"   {label} — importance",
+                options=["low", "medium", "high"],
+                format_func=lambda x: {"low": "Low", "medium": "Medium",
+                                       "high": "High"}[x],
+                key=f"i_{key}")
+        else:
+            if f"w_{key}" not in st.session_state:
+                st.session_state[f"w_{key}"] = 20
+            chosen[key] = st.sidebar.number_input(
+                f"   {label} — weight %", 0, 100, step=5, key=f"w_{key}")
+
+if not simple_mode and chosen:
+    total = sum(int(v) for v in chosen.values())
+    ok = (total == 100)
+    st.sidebar.markdown(
+        f"Weights total **:{'green' if ok else 'red'}[{total}%]** "
+        + ("✅" if ok else "— must sum to 100%"))
+
+config, config_err = None, None
+if chosen:
+    try:
+        config = build_config(
+            model_name, "simple" if simple_mode else "weighted",
+            {k: (v if simple_mode else int(v)) for k, v in chosen.items()})
+    except ValueError as e:
+        config_err = str(e)
+
+
+# --------------------------------------------------------------------------- #
+# MAIN
+# --------------------------------------------------------------------------- #
+st.markdown("""
+<div style="position:relative; padding: 22px 26px; border-radius: 16px;
+            margin-bottom: 14px; overflow:hidden;
+            background: linear-gradient(120deg, #2a2a2a 0%, #171717 55%, #0e0e0e 100%);
+            border: 1px solid #333; box-shadow: 0 8px 30px rgba(0,0,0,.5);">
+  <div style="position:absolute; inset:0;
+       background: radial-gradient(400px 160px at 90% -30%, rgba(255,255,255,.10), transparent 70%);"></div>
+  <div style="position:relative;">
+    <div style="font-size: 1.85rem; font-weight: 900; color: #ffffff;
+                letter-spacing:-.02em;">🏀 NBA Player-Prop Analyzer</div>
+    <div style="color: #b5b5b5; font-size: 0.95rem; margin-top: 4px; font-weight:500;">
+      Projects a stat line, estimates the Over/Under chance, and — with your
+      odds — tells you if it's a good deal. A research tool, not a guarantee.</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+if config_err:
+    st.error(f"Config issue: {config_err}")
+elif not config:
+    st.info("👈 Select at least one factor to build your model. A solid start: "
+            "**Recent form** + **Opponent defense**.")
+else:
+    tab1, tab4, tab2, tab3, tab5, tab6 = st.tabs(["🔍 Analyze a Prop", "🎯 Value Scanner",
+                                      "📊 Backtest", "📒 Track Record",
+                                      "🏀 Game Lines (ML + Spread)",
+                                      "🛒 Line Shopping"])
+
+    # ----------------------- Check a Player ----------------------- #
+    with tab1:
+        players = player_list()
+
+        # Optional filter: only players in today's games (props posted).
+        tkeys = todays_keys()
+        if tkeys:
+            only_today = st.checkbox(
+                f"Only players in today's games ({len(tkeys)} posted)",
+                value=True)
+            if only_today:
+                def _nk(s):
+                    return "".join(c for c in s.lower() if c.isalnum())
+                filtered = [p for p in players if _nk(p[0]) in tkeys]
+                if filtered:
+                    players = filtered
+                else:
+                    st.caption("No roster matches to today's posted players — "
+                               "showing everyone.")
+
+        names = [p[0] for p in players]
+        id_of = dict(players)
+
+        st.subheader("Select player, opponent, and line")
+        st.write("The **line** is the sportsbook's number for a stat (e.g. 25.5 "
+                 "points). **Over** = more than the line, **Under** = fewer. "
+                 "Pick who they're facing so the matchup factors apply.")
+        c1, c2, c3 = st.columns([2, 2, 1])
+        sel = c1.selectbox("Player", names,
+                           index=names.index("Mikal Bridges")
+                           if "Mikal Bridges" in names else 0)
+        prop_type = c2.selectbox("Stat", list(PROP_WORDS.keys()),
+                                 format_func=lambda k: PROP_WORDS[k])
+        if "sgo_line" not in st.session_state:
+            st.session_state["sgo_line"] = 25.5
+        if "pending_line" in st.session_state:
+            st.session_state["sgo_line"] = st.session_state.pop("pending_line")
+        line = c3.number_input("Line", step=0.5, key="sgo_line",
+                               help="The sportsbook's number. Over = above it, "
+                                    "Under = below it. Auto-fill sets this to "
+                                    "the real posted line.")
+
+        pid = id_of[sel]
+        hist = load_player_history(pid)
+        # Predict an UPCOMING game: cutoff = the day AFTER the last game on
+        # record, so every game to date is used (and nothing in the future —
+        # there is nothing after it yet). This makes the card a true forward
+        # projection rather than "re-predicting" the last game already played.
+        import datetime as _dt
+        last_date = hist.iloc[-1]["game_date"]
+        try:
+            cutoff = (_dt.date.fromisoformat(last_date)
+                      + _dt.timedelta(days=1)).isoformat()
+        except Exception:
+            cutoff = last_date
+
+        # Auto-detect the player's team (official roster) and next opponent.
+        my_team = player_team(pid)
+        auto = next_opponent(my_team)  # (opp, is_home) or None
+        teams = team_abbrs()
+
+        if auto:
+            auto_opp, auto_home = auto
+            default_opp = auto_opp
+            default_site_idx = 0 if auto_home else 1
+            st.caption(f"{sel} — {my_team} · next: "
+                       f"{'vs' if auto_home else '@'} {auto_opp}")
+        else:
+            default_opp = hist.iloc[-1]["opponent"]
+            default_site_idx = 0
+            st.caption(f"{sel} — {my_team or '?'} · no scheduled game, pick below")
+
+        d1, d2 = st.columns([1, 1])
+        opp = d1.selectbox(
+            "Opponent", teams,
+            index=teams.index(default_opp) if default_opp in teams else 0,
+            help="Auto-filled from the schedule. Change it to test a different "
+                 "matchup.")
+        site = d2.radio("Venue", ["Home", "Away"], index=default_site_idx,
+                        horizontal=True,
+                        help="Auto-filled from the schedule.")
+        is_home = (site == "Home")
+
+        grp = player_group(pid, cutoff)
+        try:
+            _rs = int(cutoff[:4])
+        except Exception:
+            _rs = 2026
+        ctx = {
+            "opponent_abbr": opp,
+            "defense_factor_map": defense_map(cutoff),
+            "positional_defense_map": positional_map(prop_type, cutoff),
+            "position_group": grp,
+            "upcoming_is_home": is_home,
+            "team_ratings_map": goat_team_ratings(_rs if _rs >= 2024 else 2024),
+        }
+        # Injury status (from the GOAT injuries snapshot, if fetched).
+        inj = current_injury(pid)
+        if inj:
+            ctx["injury_status"] = inj[0]
+            st.warning(f"⚠️ Injury: **{sel}** is listed **{inj[0]}**"
+                       + (f" — {inj[1]}" if inj[1] else "")
+                       + ". The projection accounts for this if 'Injury Status' "
+                         "is one of your factors.")
+        # Teammate injuries + game line are EXTRAS that need the network. They
+        # are loaded through deadline-bounded cached wrappers (max 4s each) so a
+        # slow feed can never freeze the page — on timeout they return {} and
+        # the projection still renders. These were the two calls that caused the
+        # "nothing loads below the inputs" freeze; the deadline is the guard.
+        try:
+            mates_out = cached_out_teammates().get(pid)
+        except Exception:
+            mates_out = None
+        if mates_out:
+            ctx["out_teammates"] = mates_out
+            _who = ", ".join(f"{m[0]} ({m[2]:.0f} ppg)" if len(m) > 2 else m[0]
+                             for m in mates_out[:3])
+            st.info(f"🟢 Teammate(s) out: **{_who}**"
+                    + ("…" if len(mates_out) > 3 else "")
+                    + f" — more usage available for {sel}. The projection "
+                      "bumps up (weighted by how much each absent teammate "
+                      "scores) if 'Teammate Injuries' is one of your factors.")
+        # Game line (total + spread) — scoring environment + blowout risk.
+        try:
+            gl = cached_game_lines().get(my_team)
+        except Exception:
+            gl = None
+        if gl:
+            ctx["game_line"] = gl
+            _t = gl.get("total")
+            _s = gl.get("spread")
+            _bits = []
+            if _t is not None:
+                feel = ("high-scoring — leans overs up" if _t >= 235
+                        else "low-scoring — leans unders" if _t <= 222
+                        else "average pace")
+                _bits.append(f"total **{_t:g}** ({feel})")
+            if _s is not None:
+                fav = "favored" if _s < 0 else "underdog"
+                big = " — big spread, blowout risk caps starters' minutes" \
+                      if abs(_s) >= 12 else ""
+                _bits.append(f"{my_team} **{_s:+g}** ({fav}{big})")
+            if _bits:
+                st.info("📈 Game line: " + "; ".join(_bits)
+                        + ". Wired into the projection if 'Game Line' is one of "
+                          "your factors.")
+        if grp:
+            st.caption(f"{sel} is classified as a **{grp}** — the matchup factor "
+                       f"uses how {opp} defends {grp}s for this stat.")
+
+        # Odds inputs live here so the EV verdict can render inside the slip.
+        st.markdown("**Sportsbook odds** (optional — enter the real price for "
+                    "an EV check; -110 = risk \\$110 to win \\$100)")
+
+        # Auto-fill real odds from the odds router (balldontlie primary).
+        if sgo_has_key():
+            if st.button("🎯 Auto-fill real odds"):
+                # Reuse the cached bulk slate first (free if already fetched);
+                # only fall back to a direct single call if this player isn't in
+                # it. Keeps auto-fill from spending an API call most of the time.
+                hit = None
+                try:
+                    nk = "".join(c for c in sel.lower() if c.isalnum())
+                    allp = cached_all_props()
+                    hit = (allp.get(nk) or {}).get(prop_type)
+                except Exception:
+                    hit = None
+                if not hit:
+                    hit = sgo_prop_odds(sel, prop_type)
+                if hit and (hit["odds_over"] or hit["odds_under"]):
+                    # Stage pulled values under 'pending_' keys; they are applied
+                    # to the real widget keys at the TOP of the next run, before
+                    # those widgets are instantiated (Streamlit forbids writing a
+                    # widget key after its widget renders).
+                    st.session_state["pending_over"] = hit["odds_over"] or -110
+                    st.session_state["pending_under"] = hit["odds_under"] or -110
+                    if hit.get("line"):
+                        st.session_state["pending_line"] = hit["line"]
+                    st.session_state["sgo_msg"] = (
+                        f"Pulled consensus from {hit['books']} books: "
+                        f"line {hit.get('line','?')}, "
+                        f"O {hit['odds_over']} / U {hit['odds_under']}.")
+                    st.rerun()
+                else:
+                    st.info("No prop odds posted for this player yet (they appear "
+                            "~12-24h before tip-off). Enter odds by hand for now.")
+            if st.session_state.get("sgo_msg"):
+                st.success(st.session_state.pop("sgo_msg"))
+        else:
+            st.caption("Tip: add a free SPORTSGAMEODDS_KEY to .env to auto-fill "
+                       "real prop odds. For now, type them in.")
+
+        oc1, oc2 = st.columns(2)
+        if "sgo_over" not in st.session_state:
+            st.session_state["sgo_over"] = -110
+        if "sgo_under" not in st.session_state:
+            st.session_state["sgo_under"] = -110
+        if "pending_over" in st.session_state:
+            st.session_state["sgo_over"] = st.session_state.pop("pending_over")
+        if "pending_under" in st.session_state:
+            st.session_state["sgo_under"] = st.session_state.pop("pending_under")
+        odds_over = oc1.number_input("Over odds", step=5, key="sgo_over")
+        odds_under = oc2.number_input("Under odds", step=5, key="sgo_under")
+
+        res = analyze(config, pid, prop_type, line, cutoff, hist, ctx)
+
+        if res["projection"] is None:
+            st.warning("Not enough prior games for this player to project.")
+        else:
+            lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
+            chance = res["p_over"] if lean == "OVER" else res["p_under"]
+            conf = res["confidence"].split("(")[0].strip()
+            conf_word = {"solid": "Reasonable confidence",
+                         "moderate": "Moderate confidence — volatile form",
+                         "low": "Low confidence — small sample",
+                         "none": "No prior games"}.get(conf, conf)
+            venue_txt = "vs" if is_home else "@"
+            pick_color = "#22c55e" if lean == "OVER" else "#ef4444"
+            edge = res["projection"] - line
+            edge_txt = (f"+{edge:.1f} over the line" if edge >= 0
+                        else f"{edge:.1f} under the line")
+            pct = int(round(chance * 100))
+
+            # Expected value for the side we lean, using the entered odds.
+            ev = evaluate_prop(res["p_over"], res["p_under"],
+                               int(odds_over), int(odds_under))
+            ev_pick = ev["ev_over_pct"] if lean == "OVER" else ev["ev_under_pct"]
+            ev_odds = odds_over if lean == "OVER" else odds_under
+            if ev_pick is None:
+                # Invalid/blank odds — prompt rather than show a fake EV.
+                ev_bg = "#1b2130"
+                ev_strip = (
+                    f'<div style="background:{ev_bg}; padding:8px 20px; '
+                    f'border-top:1px solid #2a3142; color:#93a1b5; '
+                    f'font-size:.9rem;">Enter real odds above (e.g. -110) to '
+                    f'check value.</div>')
+            else:
+                season_n = season_games_count(hist)
+                early = season_n < MIN_SEASON_GAMES_FOR_VALUE
+                # Plain-English money framing: EV% ~ profit per $100 over time.
+                per100 = f"${abs(ev_pick):.0f} per $100 you'd bet"
+                if ev["is_value"] and ev["recommended_side"] == lean.lower() \
+                        and not early:
+                    ev_bg = "#14321f"
+                    ev_label = (f"✅ Good deal — over time you'd expect to make "
+                                f"about {per100}")
+                elif ev["is_value"] and early:
+                    ev_bg = "#2a2410"
+                    ev_label = (f"⏳ Looks good, but this player's only played "
+                                f"{season_n} game"
+                                f"{'s' if season_n != 1 else ''} this season — "
+                                f"too early to trust")
+                elif ev_pick > 0:
+                    ev_bg = "#2a2410"
+                    ev_label = (f"Small edge — maybe {per100} over time. Not much")
+                else:
+                    ev_bg = "#2a1414"
+                    ev_label = (f"Bad deal — you'd expect to LOSE about {per100} "
+                                f"over time. Skip it")
+                ev_strip = (
+                    f'<div style="background:{ev_bg}; padding:8px 20px; '
+                    f'border-top:1px solid #2a3142; color:#e6e9ef; font-size:.9rem;">'
+                    f'{ev_label}.</div>')
+
+            # --- The bet slip ---
+            bio = cached_bio(sel)
+            if bio and bio.get("headshot"):
+                sub = " · ".join(x for x in [bio.get("position"),
+                                             bio.get("height"),
+                                             bio.get("weight")] if x)
+                head_html = (
+                    f'<img src="{bio["headshot"]}" alt="" style="width:46px;'
+                    f'height:46px;border-radius:50%;object-fit:cover;'
+                    f'background:#0b0f17;margin-right:10px;" />')
+                name_block = (
+                    f'<div style="display:flex;align-items:center;">{head_html}'
+                    f'<div><div style="font-size:1.15rem;font-weight:700;'
+                    f'color:#e6e9ef;">{sel}</div>'
+                    f'<div style="color:#6b7688;font-size:.72rem;">{sub}</div>'
+                    f'</div></div>')
+            else:
+                name_block = (f'<div style="font-size:1.15rem;font-weight:700;'
+                              f'color:#e6e9ef;">{sel}</div>')
+            st.markdown(f"""
+<div style="background:#141926; border:1px solid #2a3142; border-radius:14px;
+            overflow:hidden; margin:6px 0 14px 0;
+            box-shadow:0 4px 18px rgba(0,0,0,.35);">
+  <div style="display:flex; justify-content:space-between; align-items:center;
+              background:#1b2130; padding:12px 18px; border-bottom:1px solid #2a3142;">
+    {name_block}
+    <div style="color:#93a1b5; font-size:.9rem;">{my_team} {venue_txt} {opp}
+         · {'Home' if is_home else 'Away'}</div>
+  </div>
+  <div style="display:flex; align-items:stretch;">
+    <div style="flex:0 0 118px; background:{pick_color}; color:#0b0f17;
+                display:flex; flex-direction:column; justify-content:center;
+                align-items:center; padding:16px 8px;">
+      <div style="font-size:1.5rem; font-weight:800; line-height:1;">{lean}</div>
+      <div style="font-size:1.1rem; font-weight:700; margin-top:2px;">{line}</div>
+    </div>
+    <div style="flex:1; padding:14px 20px;">
+      <div style="color:#93a1b5; font-size:.78rem; text-transform:uppercase;
+                  letter-spacing:.05em;">{PROP_WORDS[prop_type]}</div>
+      <div style="font-size:1.05rem; color:#e6e9ef; margin:2px 0 10px 0;">
+        Projected <b>{res['projection']}</b>
+        <span style="color:{pick_color};">({edge_txt})</span></div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <div style="flex:1; background:#0b0f17; border-radius:6px; height:10px;
+                    overflow:hidden;">
+          <div style="width:{pct}%; height:100%; background:{pick_color};"></div>
+        </div>
+        <div style="font-weight:700; color:#e6e9ef; font-size:.95rem;">{pct}%</div>
+      </div>
+      <div style="color:#93a1b5; font-size:.8rem; margin-top:8px;">
+        {conf_word} · {res['games_played_before']} games of history</div>
+    </div>
+  </div>
+  {ev_strip}
+</div>
+""", unsafe_allow_html=True)
+
+            if st.button("📒 Log this prediction to my track record"):
+                log_prediction(
+                    pid, sel, cutoff, prop_type, line, res["projection"],
+                    lean.lower(), round(chance, 4), opponent=opp,
+                    model_name=config.name)
+                st.success("Logged. It'll be graded automatically once that "
+                           "game is in the data — see the Track Record tab.")
+
+            with st.expander("Why — factor breakdown"):
+                st.write(f"Base projection (recent + season form): "
+                         f"**{res['base_projection']}**. Your selected factors "
+                         f"then adjusted it:")
+                if res["adjustments"]:
+                    for a_ in res["adjustments"]:
+                        st.write("• " + _plain_reason(a_))
+                else:
+                    st.write("• No factor had enough signal to move it "
+                             "(missing opponent/venue data, or neutral).")
+
+            with st.expander("📊 Extra context (live GOAT data)"):
+                cur_season = cutoff[:4] if cutoff else "2026"
+                try:
+                    cs = int(cur_season) if int(cur_season) >= 2024 else 2024
+                except Exception:
+                    cs = 2024
+                savg = goat_season_avg(pid, cs)
+                if savg:
+                    st.write(f"**Official {cs}-{str(cs+1)[-2:]} season averages** "
+                             f"(balldontlie): {savg.get('pts','?')} pts, "
+                             f"{savg.get('reb','?')} reb, {savg.get('ast','?')} ast, "
+                             f"{savg.get('stl','?')} stl, {savg.get('blk','?')} blk "
+                             f"in {savg.get('games_played','?')} games "
+                             f"({savg.get('min','?')} min).")
+                else:
+                    st.caption("No official season-average row for this player/"
+                               "season yet.")
+                # Advanced efficiency (usage%, assist%, PIE) — how big a role the
+                # player plays and how efficiently, beyond raw box-score totals.
+                adv = goat_adv_avg(pid, cs)
+                if adv and adv.get("usage") is not None:
+                    st.write(
+                        f"**Role & efficiency** (balldontlie advanced): "
+                        f"usage **{adv['usage']*100:.1f}%** "
+                        f"(share of the team's plays this player finishes), "
+                        f"assist rate {(adv.get('assist_pct') or 0)*100:.1f}%, "
+                        f"true-shooting {(adv.get('ts_pct') or 0)*100:.1f}%, "
+                        f"PIE {(adv.get('pie') or 0)*100:.1f}% "
+                        f"(overall impact). Higher usage = more shots/touches = "
+                        f"a higher, steadier line.")
+                sm = goat_standings(cs)
+                if sm and opp in sm:
+                    o = sm[opp]
+                    st.write(f"**Opponent {opp} this season:** {o['wins']}-"
+                             f"{o['losses']} "
+                             f"(conf. rank {o.get('conf_rank','?')}).")
+                # Defensive strength from OUR own data (points allowed vs league
+                # average) — reliable, no external API.
+                dsum = defense_summary(cutoff, opp)
+                if dsum:
+                    arrow = ("allows ~{:+.0f}% vs the average team"
+                             .format(dsum["pct"]))
+                    st.write(f"**{opp} defense:** {dsum['tag']} — ranked "
+                             f"**#{dsum['rank']} of {dsum['n']}** toughest "
+                             f"({arrow}). Softer defense = easier night for the "
+                             f"player.")
+                # Official balldontlie team off/def ratings (points per 100
+                # possessions). Updates as the season's games accrue.
+                tr = goat_team_ratings(cs)
+                if tr and opp in tr and tr[opp].get("def") is not None:
+                    o_ = tr[opp]
+                    dr = o_.get("def_rank")
+                    st.write(
+                        f"**{opp} official ratings** (balldontlie): "
+                        f"offense {o_.get('off','?')}, defense {o_.get('def','?')}"
+                        + (f" (defense ranked #{dr}/30)" if dr else "")
+                        + f", pace {o_.get('pace','?')}. "
+                        "Lower defensive rating = tougher D; higher pace = more "
+                        "possessions (more chances to hit an Over).")
+                st.caption("Context only — the projection is still built from the "
+                           "player's own game log with no look-ahead.")
+
+            with st.expander("💡 How the value (EV) was figured"):
+                st.write(_plain_verdict(ev))
+                st.write(f"Removing the sportsbook margin (**{ev['vig_pct']}%** "
+                         f"vig), the fair no-vig probabilities are "
+                         f"Over {ev['fair_over']}, Under {ev['fair_under']}.")
+                st.write(f"Expected value per \\$1: Over "
+                         f"**{ev['ev_over_pct']}%**, Under "
+                         f"**{ev['ev_under_pct']}%** (positive = edge). Change "
+                         f"the odds above the slip to re-check.")
+
+            st.subheader("Game log")
+            g1, g2 = st.columns([1, 1])
+            n_games = g1.radio("How many games", [5, 10, 20], index=1,
+                               horizontal=True)
+            scope = g2.radio("Which games", ["Most recent",
+                                             f"Vs {opp} only"], horizontal=True)
+
+            log = hist.copy()
+            # Only games the player actually played in (exclude DNPs / 0-min
+            # scratches, which would otherwise clutter the log with empty rows).
+            log = log[log["minutes"].fillna(0) > 0]
+            if scope.startswith("Vs"):
+                log = log[log["opponent"] == opp]
+                if log.empty:
+                    st.info(f"No games played against {opp} for {sel}.")
+            cols_all = ["game_date", "opponent", "is_home", "minutes",
+                        "points", "rebounds", "assists", "threes_made",
+                        "steals", "blocks", "turnovers", "fouls"]
+            recent = log.tail(n_games)[cols_all].copy()
+            if not recent.empty:
+                recent["is_home"] = recent["is_home"].map(
+                    {1: "Home", 0: "Away"}).fillna("?")
+                # Add the combo columns for convenience.
+                recent["PRA"] = (recent["points"] + recent["rebounds"]
+                                 + recent["assists"])
+                recent["PR"] = recent["points"] + recent["rebounds"]
+                recent["PA"] = recent["points"] + recent["assists"]
+                recent["RA"] = recent["rebounds"] + recent["assists"]
+                recent = recent.rename(columns={
+                    "game_date": "Date", "opponent": "Opp", "is_home": "Site",
+                    "minutes": "Min", "points": "Pts", "rebounds": "Reb",
+                    "assists": "Ast", "threes_made": "3PM", "steals": "Stl",
+                    "blocks": "Blk", "turnovers": "TO", "fouls": "PF"})
+                st.dataframe(
+                    recent.iloc[::-1], use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Date": st.column_config.Column(help="Game date"),
+                        "Opp": st.column_config.Column(help="Opponent team"),
+                        "Site": st.column_config.Column(help="Home or Away"),
+                        "Min": st.column_config.Column(help="Minutes played"),
+                        "Pts": st.column_config.Column(help="Points"),
+                        "Reb": st.column_config.Column(help="Rebounds"),
+                        "Ast": st.column_config.Column(help="Assists"),
+                        "3PM": st.column_config.Column(help="3-pointers made"),
+                        "Stl": st.column_config.Column(help="Steals"),
+                        "Blk": st.column_config.Column(help="Blocks"),
+                        "TO": st.column_config.Column(help="Turnovers"),
+                        "PF": st.column_config.Column(help="Personal fouls"),
+                        "PRA": st.column_config.Column(
+                            help="Points + Rebounds + Assists"),
+                        "PR": st.column_config.Column(
+                            help="Points + Rebounds"),
+                        "PA": st.column_config.Column(
+                            help="Points + Assists"),
+                        "RA": st.column_config.Column(
+                            help="Rebounds + Assists"),
+                    })
+                if scope.startswith("Vs") and len(recent) < 3:
+                    st.caption(f"⚠️ Only {len(recent)} game(s) vs {opp} — too "
+                               "small a sample to read much into.")
+
+            st.subheader("Double-Double / Triple-Double")
+            st.caption("These are yes/no outcomes (not Over/Under a number), so "
+                       "they use an event-probability model: the player's recent "
+                       "rate, shrunk for small samples. 10+ in 2 categories = "
+                       "double-double; 3 = triple-double.")
+            dd = milestone_probability(pid, "double_double", cutoff, hist)
+            td = milestone_probability(pid, "triple_double", cutoff, hist)
+            mc1, mc2 = st.columns(2)
+            if dd["probability"] is not None:
+                mc1.metric("Double-Double chance",
+                           f"{dd['probability']*100:.0f}%",
+                           help=f"Observed {dd['hits']}/{dd['games']} games. "
+                                f"{dd['confidence']}.")
+            if td["probability"] is not None:
+                mc2.metric("Triple-Double chance",
+                           f"{td['probability']*100:.1f}%",
+                           help=f"Observed {td['hits']}/{td['games']} games. "
+                                f"{td['confidence']}.")
+
+    # ----------------------- Backtest ----------------------- #
+    with tab2:
+        st.subheader("Test it on the past")
+        st.write("Pick a stat and a date range, hit the button, and the bot "
+                 "re-plays those real games — predicting each one without "
+                 "peeking at the result — then shows how it did. Think of it as "
+                 "a report card on past games. (Pretend money, never real bets.)")
+
+        b1, b2, b3 = st.columns(3)
+        bt_prop = b1.selectbox("Stat", ["points", "rebounds", "assists",
+                                        "steals", "blocks", "turnovers"],
+                               format_func=lambda k: PROP_WORDS[k])
+        start = b2.text_input("From date", "2020-10-01")
+        end = b3.text_input("To date", date.today().isoformat())
+        max_games = st.slider("How many games to test (more = slower)",
+                              100, 1200, 400, step=100)
+
+        if st.button("▶ Run the test"):
+            with st.spinner("Re-playing past games..."):
+                result = run_backtest(config, prop_type=bt_prop,
+                                      start_date=start, end_date=end,
+                                      max_games=max_games)
+            m, base = result["model"], result["baseline"]
+            if not m:
+                st.warning("Not enough games to test — widen the date range.")
+            else:
+                import pandas as pd
+                acc = m["accuracy"] * 100
+                vs = (m["accuracy"] - base["accuracy"]) * 100
+                roi = m["roi"] * 100
+
+                # One plain-English verdict line up top.
+                if m["roi"] > 0 and m["beat_break_even"]:
+                    st.success(
+                        f"✅ Over {result['games_evaluated']} past games, the bot "
+                        f"picked the right side **{acc:.0f}% of the time** and "
+                        f"would've turned a **{roi:+.0f}% pretend profit** — "
+                        f"beating both a dumb guess and the sportsbook's cut. "
+                        f"Encouraging, but remember: this used a stand-in line, "
+                        f"not a real Vegas line, so it's a good sign — not a "
+                        f"guarantee of beating a real sportsbook.")
+                else:
+                    st.info(
+                        f"Over {result['games_evaluated']} games the bot was "
+                        f"right {acc:.0f}% of the time and would've made "
+                        f"{roi:+.0f}% pretend profit — not enough to clear the "
+                        f"sportsbook's cut here. That's normal; try different "
+                        f"factors on the left and test again.")
+
+                # Three friendly numbers.
+                k1, k2, k3 = st.columns(3)
+                k1.metric("How often it was right", f"{acc:.0f}%",
+                          f"{vs:+.0f}% vs a dumb guess")
+                k2.metric("Pretend profit",
+                          "Made money" if m["roi"] > 0 else "Lost money",
+                          f"{roi:+.0f}%")
+                k3.metric("Passed the sportsbook test?",
+                          "Yes 👍" if m["beat_break_even"] else "Not yet")
+
+                # Money-over-time chart, plain caption.
+                st.markdown("**How the pretend money grew (or shrank)**")
+                st.caption("Each step is one bet, in order. The worst dip along "
+                           f"the way was about {m['max_drawdown']:.0f} bets down "
+                           "from its best point — the rough patch you'd have had "
+                           "to sit through.")
+                if m.get("equity_curve"):
+                    st.line_chart(pd.DataFrame({"Pretend profit": m["equity_curve"]}))
+
+                # Season table, plain.
+                if result.get("by_season"):
+                    st.markdown("**Year by year** (did it work every season, or "
+                                "just one lucky one?)")
+                    sdf = pd.DataFrame([
+                        {"Season": s, "Games": v["n_bets"],
+                         "Right %": f"{v['accuracy']*100:.0f}%",
+                         "Pretend profit": f"{v['roi']*100:+.0f}%"}
+                        for s, v in result["by_season"].items()])
+                    st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+                # Everything technical hidden behind one optional expander.
+                with st.expander("🤓 Advanced details (optional)"):
+                    st.caption("For the curious — you don't need these to use "
+                               "the bot.")
+                    st.write(f"- **Brier score:** {m['brier']} "
+                             f"(lower is better; baseline {base['brier']})")
+                    st.write(f"- **Log loss:** {m['log_loss']} "
+                             f"(lower is better; baseline {base['log_loss']})")
+                    st.write(f"- **Break-even bar:** {m['break_even_rate']*100:.1f}% "
+                             f"(you must beat this, not 50%, because of the "
+                             f"sportsbook's cut)")
+                    st.markdown("**Calibration** — when the bot says a chance, "
+                                "does it really happen that often?")
+                    cal = pd.DataFrame(m["calibration"])
+                    if not cal.empty:
+                        cal = cal.rename(columns={
+                            "band": "Bot said about…", "n": "Times",
+                            "predicted": "…this chance", "actual": "Really happened"})
+                        st.dataframe(cal, use_container_width=True,
+                                     hide_index=True)
+                        st.caption("The last two columns should be close. If the "
+                                   "bot says 90% but only 80% happens, it's a "
+                                   "little overconfident.")
+
+    # ----------------------- Track Record ----------------------- #
+    with tab3:
+        st.subheader("Prediction track record")
+        st.write("Every prediction you log is saved and graded against the real "
+                 "result once that game is in the data — a forward-looking "
+                 "honesty check, separate from the backtest. This is paper "
+                 "tracking: no real bets, no money.")
+
+        cols = st.columns([1, 1, 2])
+        if cols[0].button("Grade finished games"):
+            n = grade_pending()
+            st.success(f"Graded {n} prediction(s) whose games are now final.")
+
+        summary = tracking_summary()
+        acc = (f"{summary['accuracy']*100:.0f}%"
+               if summary["accuracy"] is not None else "—")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Graded predictions", summary["graded"])
+        m2.metric("Live accuracy", acc,
+                  help="Hit rate on real games since you started logging. "
+                       "Compare to the 52.4% break-even bar.")
+        m3.metric("Still pending", summary["pending"],
+                  help="Logged but the game hasn't been played / isn't in the "
+                       "data yet.")
+
+        if summary["recent"]:
+            import pandas as pd
+            df = pd.DataFrame(summary["recent"])
+            df["correct"] = df["correct"].map({1: "✅", 0: "❌"}).fillna("—")
+            df["prob"] = (df["prob"] * 100).round(0).astype("Int64").astype(str) + "%"
+            df = df.rename(columns={
+                "player_name": "Player", "game_date": "Game",
+                "prop_type": "Prop", "line": "Line", "pick": "Pick",
+                "prob": "Our prob", "result": "Actual", "correct": "Hit?"})
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No graded predictions yet. Analyze props and log them "
+                    "(from the Analyze tab), then grade once their games finish.")
+
+    # ----------------------- Value Scanner ----------------------- #
+    with tab4:
+        st.subheader("Today's value board")
+        st.write("Runs **every player in today's games** through your model, "
+                 "compares our projection to the **real sportsbook line**, and "
+                 "ranks the bets with the biggest edge. A ✅ means the odds give "
+                 "you more than the risk — based on our estimate, not a promise.")
+
+        if not sgo_has_key():
+            st.warning("Add a free **SPORTSGAMEODDS_KEY** to your `.env` to scan "
+                       "real odds. Without it there are no live lines to compare "
+                       "against.")
+        elif not config:
+            st.info("👈 Pick at least one factor in the sidebar first — the "
+                    "scanner uses the same model you build there.")
+        else:
+            sc1, sc2 = st.columns([2, 1])
+            scan_stats = sc1.multiselect(
+                "Stats to scan", list(PROP_WORDS.keys()),
+                default=["points", "rebounds", "assists"],
+                format_func=lambda k: PROP_WORDS[k],
+                help="More stats = a longer scan. Start with the big three.")
+            min_edge = sc2.slider(
+                "Min edge to flag ✅", 1, 10, 3,
+                help="How much better than the fair line our number must be "
+                     "before we call it value. 3% is a sensible default.")
+            top_n = st.radio(
+                "Show top", [5, 10, 20], index=0, horizontal=True,
+                help="How many of the highest-EV plays to list.")
+
+            def _run_scan():
+                """Run the scan ONCE (no blocking sleep) and store results.
+
+                The old auto-retry used time.sleep(), which froze the whole app
+                for a minute and often still hit the limit. Instead we scan once
+                and, if rate-limited, surface a 'Try again' button — responsive,
+                honest, and the user stays in control."""
+                with st.spinner("Scanning today's players against live odds…"):
+                    rows, note = scan_today_value(
+                        config, scan_stats, min_edge / 100.0, 300)
+                st.session_state["scan_rows"] = rows
+                st.session_state["scan_note"] = note
+                st.session_state["scan_sig"] = (tuple(scan_stats), min_edge)
+
+            # Auto-load: scan when the tab opens with settings we haven't run yet.
+            # The 5-min odds cache means re-opening the tab is usually free.
+            sig = (tuple(scan_stats), min_edge)
+            refresh = st.button("🔄 Refresh now")
+            if (refresh
+                    or "scan_rows" not in st.session_state
+                    or st.session_state.get("scan_sig") != sig):
+                _run_scan()
+
+            rows = st.session_state.get("scan_rows")
+            note = st.session_state.get("scan_note", "")
+            # If rate-limited, offer a non-blocking retry instead of freezing.
+            if "rate limit" in note.lower():
+                st.warning(note + "  The free tier allows 10 pulls per minute; "
+                           "it clears within a minute.")
+                if st.button("🔁 Try the scan again"):
+                    _run_scan()
+                    st.rerun()
+            if rows is not None and "rate limit" not in note.lower():
+                st.caption(note)
+                if rows:
+                    import pandas as pd
+                    value_rows = [r for r in rows if r["Value?"] == "✅"]
+                    base = value_rows if value_rows else rows
+                    if value_rows:
+                        st.markdown(f"**{len(value_rows)} value bet(s)** found.")
+                    else:
+                        st.markdown(
+                            "**No ✅ value bets yet** (early season — the model "
+                            "holds the stamp until a player has 5+ games this "
+                            "season). Showing the plays the model likes most by "
+                            "EV, just not yet trustworthy enough to flag.")
+
+                    view = st.radio("View", ["Ranked list", "By game"],
+                                    index=0, horizontal=True)
+
+                    def _fmt(df):
+                        df = df.copy()
+                        df["EV %"] = df["EV %"].map(lambda v: f"{v:+.1f}%")
+                        df["Win %"] = df["Win %"].astype(str) + "%"
+                        df["Odds"] = df["Odds"].map(lambda v: f"{int(v):+d}")
+                        return df
+
+                    if view == "Ranked list":
+                        top = base[:top_n]
+                        st.markdown(f"Top {len(top)} by EV:")
+                        st.dataframe(_fmt(pd.DataFrame(top)),
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        # Group by matchup; show each game's best `per_game` plays.
+                        per_game = 3
+                        games = {}
+                        for r in base:
+                            games.setdefault(r["Matchup"], []).append(r)
+                        st.caption(f"Each game's top {per_game} plays by EV. "
+                                   f"{len(games)} game(s) on the board.")
+                        for matchup in sorted(games):
+                            grows = games[matchup][:per_game]
+                            st.markdown(f"**🏀 {matchup}**")
+                            show = [{k: v for k, v in r.items()
+                                     if k != "Matchup"} for r in grows]
+                            st.dataframe(_fmt(pd.DataFrame(show)),
+                                         use_container_width=True,
+                                         hide_index=True)
+                    st.caption("Ranked by EV (best first). 'Value?' ✅ = edge "
+                               "clears your bar. Always sanity-check a pick on "
+                               "the Analyze tab before trusting it.")
+                else:
+                    st.info("No priced props to evaluate right now — check back "
+                            "closer to tip-off when sportsbooks post lines.")
+
+    # ----------------------- Game Lines: ML + Spread ----------------------- #
+    with tab5:
+        st.subheader("Game lines — moneyline & spread")
+        st.write("Bet the **game itself**, not just player props. We project "
+                 "each game's winner and margin from team ratings + home court, "
+                 "compare it to the **real sportsbook line**, and flag where the "
+                 "odds give you an edge. Same honest EV math as the prop tools.")
+
+        from models.game_model import project_game, cover_probability
+        import datetime as _d5
+
+        gl_date = st.date_input("Game date", _d5.date.today(),
+                                help="Lines appear closer to tip-off.").isoformat()
+        lines = cached_game_lines(gl_date)
+        ratings = goat_team_ratings(2025)
+
+        if not lines:
+            st.info("No game lines posted for this date yet. Sportsbook game "
+                    "odds usually appear within a few hours of tip-off — check "
+                    "back closer to game time.")
+        elif not ratings:
+            st.warning("Team ratings aren't available right now, so we can't "
+                       "project the games. Try again shortly.")
+        else:
+            # One row per GAME (not per team): use the home entries.
+            games = sorted({v["matchup"] for v in lines.values()})
+            sched = cached_schedule(gl_date)  # {matchup: status}
+            total_sched = len(sched)
+            open_games = [m for m in games if _game_not_started(sched.get(m, ""))]
+            live_games = [m for m in games if m not in open_games]
+
+            # Plain-language headline: how many of the full slate are still
+            # bettable (not tipped off) vs. already underway/finished.
+            if total_sched:
+                msg = (f"**{len(open_games)} of {total_sched} games still open** "
+                       f"(not tipped off yet) on {gl_date}.")
+                if live_games:
+                    msg += (f" {len(live_games)} already underway or final — "
+                            "shown with a 🔴 LIVE tag (pre-game lines only; "
+                            "you usually can't place a pre-game bet once it tips).")
+                if total_sched > len(games):
+                    msg += (f" {total_sched - len(games)} game"
+                            f"{'s' if total_sched - len(games) != 1 else ''} "
+                            "have no posted line yet.")
+                st.caption(msg + " Our model vs the market — ✅ means our "
+                           "estimate beats the price.")
+            else:
+                st.caption(f"{len(games)} game(s) with lines on {gl_date}. "
+                           "Our model vs the market — ✅ means our estimate "
+                           "beats the price.")
+            ev_bar = st.slider("Min edge to flag ✅ (game bets)", 1, 10, 3,
+                               help="How much better than the fair line our "
+                                    "number must be before we call it value.")
+
+            # Show open (bettable) games first, then live/final ones.
+            ordered = open_games + live_games
+            for matchup in ordered:
+                # matchup is "AWAY @ HOME"
+                try:
+                    away, home = [t.strip() for t in matchup.split("@")]
+                except ValueError:
+                    continue
+                status = sched.get(matchup, "")
+                is_open = matchup in open_games
+                if is_open:
+                    tag = "🟢 OPEN"
+                elif status.strip().lower().startswith("final"):
+                    tag = "⚫ FINAL"
+                else:
+                    tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
+                g = lines.get(home) or {}
+                proj = project_game(home, away, ratings)
+                with st.expander(f"🏀 {matchup}   ·   {tag}",
+                                 expanded=(is_open and len(open_games) <= 3)):
+                    if not is_open:
+                        st.caption("This game has tipped off — the line below is "
+                                   "the last PRE-GAME number, kept for reference. "
+                                   "You generally can't place a pre-game ML/spread "
+                                   "bet once the game is live.")
+                    if not proj:
+                        st.caption("Missing team ratings for one side — can't "
+                                   "project this game yet (common very early in "
+                                   "the season).")
+                        continue
+                    c1, c2 = st.columns(2)
+                    c1.metric(f"{home} (home) projected",
+                              f"{proj['exp_home_pts']:.0f}")
+                    c2.metric(f"{away} (away) projected",
+                              f"{proj['exp_away_pts']:.0f}")
+                    fav = home if proj["exp_margin"] > 0 else away
+                    st.write(f"**Our projection:** {fav} by "
+                             f"**{abs(proj['exp_margin']):.1f}** "
+                             f"(total ~{proj['exp_total']:.0f}, "
+                             f"pace {proj['pace']:.0f}). Win odds: "
+                             f"{home} {proj['p_home_win']*100:.0f}% / "
+                             f"{away} {proj['p_away_win']*100:.0f}%.")
+
+                    # ---- Moneyline EV (if the book posted ML) ----
+                    ml_home = g.get("moneyline")
+                    g_away = lines.get(away) or {}
+                    ml_away = g_away.get("moneyline")
+                    if ml_home is not None and ml_away is not None:
+                        ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
+                                           int(ml_home), int(ml_away),
+                                           edge_threshold=ev_bar / 100.0)
+                        st.markdown(f"**Moneyline** — {home} {int(ml_home):+} / "
+                                    f"{away} {int(ml_away):+}")
+                        if ev.get("is_value"):
+                            over = ev["recommended_side"] == "over"
+                            side = home if over else away
+                            edge = (ev["edge_over_pct"] if over
+                                    else ev["edge_under_pct"])
+                            st.success(f"✅ Value on **{side}** moneyline "
+                                       f"(edge {edge:+.1f}% vs the fair line).")
+                        else:
+                            st.caption("No moneyline edge — the price matches our "
+                                       "estimate.")
+
+                    # ---- Spread EV (if the book posted a spread) ----
+                    sp_home = g.get("spread")
+                    if sp_home is not None:
+                        p_home_cov, p_away_cov = cover_probability(
+                            proj["exp_margin"], sp_home)
+                        # Both sides priced ~ -110 by convention unless we have better.
+                        ev_s = evaluate_prop(p_home_cov, p_away_cov, -110, -110,
+                                             edge_threshold=ev_bar / 100.0)
+                        st.markdown(f"**Spread** — {home} {sp_home:+g} / "
+                                    f"{away} {-sp_home:+g}")
+                        if ev_s.get("is_value"):
+                            over = ev_s["recommended_side"] == "over"
+                            side = (f"{home} {sp_home:+g}" if over
+                                    else f"{away} {-sp_home:+g}")
+                            edge = (ev_s["edge_over_pct"] if over
+                                    else ev_s["edge_under_pct"])
+                            st.success(f"✅ Value on **{side}** "
+                                       f"(we have the cover at "
+                                       f"{max(p_home_cov, p_away_cov)*100:.0f}%, "
+                                       f"edge {edge:+.1f}%).")
+                        else:
+                            st.caption("No spread edge — our margin agrees with "
+                                       "the line.")
+
+                    if g.get("total") is not None:
+                        st.caption(f"Game total (O/U): **{g['total']:g}**. "
+                                   f"Our projected total: {proj['exp_total']:.0f}.")
+            st.caption("⚠️ Game-side projections come from team ratings + home "
+                       "court — a transparent baseline, not a simulation. Treat "
+                       "a ✅ as 'worth a look', and remember sides are efficiently "
+                       "priced; your edge is a soft/stale line, not out-guessing "
+                       "the market.")
+
+    # ----------------------- Line Shopping ----------------------- #
+    with tab6:
+        st.subheader("Line shopping — best price across every sportsbook")
+        st.write("This is your **real edge**. Our model can't out-guess the "
+                 "books' consensus — but the books don't all post the same "
+                 "number. When one book is slow or soft, the same player's prop "
+                 "sits at a different line there. You take the **Over at the "
+                 "book with the lowest line** and the **Under at the book with "
+                 "the highest line** — buying the best number the market itself "
+                 "is already offering. The wider the gap between books, the "
+                 "bigger the opportunity.")
+
+        @st.cache_data(show_spinner="Comparing lines across all books…", ttl=900)
+        def _cached_gaps():
+            def _build():
+                from odds.line_shopping import biggest_gaps
+                return biggest_gaps(60)
+            return _with_deadline(_build, seconds=12, default=[]) or []
+
+        colf1, colf2 = st.columns([1, 1])
+        min_spread = colf1.slider(
+            "Minimum gap between books (points)", 0.5, 6.0, 1.5, 0.5,
+            help="How far apart the lowest and highest line must be before we "
+                 "show it. A bigger gap = a bigger shopping edge.")
+        prop_opts = ["All"] + sorted(PROP_WORDS.values())
+        prop_filter = colf2.selectbox("Prop type", prop_opts, index=0)
+
+        gaps = _cached_gaps()
+        if not gaps:
+            st.info("No cross-book prop lines posted yet (they fill in closer to "
+                    "tip-off), or the feed is briefly rate-limited. Try again in "
+                    "a minute.")
+        else:
+            def _pretty(pt):
+                return PROP_WORDS.get(pt, pt)
+            shown = [g for g in gaps
+                     if g["line_spread"] >= min_spread
+                     and (prop_filter == "All" or _pretty(g["prop_type"]) == prop_filter)]
+            st.caption(f"{len(shown)} shopping opportunit"
+                       f"{'y' if len(shown) == 1 else 'ies'} with a gap of "
+                       f"{min_spread:g}+ points, across up to 8 books. "
+                       "Biggest gaps first.")
+
+            for g in shown:
+                bo, bu = g["best_over"], g["best_under"]
+                with st.expander(
+                        f"🛒 {g['player']} — {_pretty(g['prop_type'])}   ·   "
+                        f"gap {g['line_spread']:g} pts   ·   consensus "
+                        f"{g['consensus_line']:g}",
+                        expanded=False):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**⬆️ Best spot to bet the OVER**")
+                        st.success(f"**{bo['line']:g}** @ "
+                                   f"{int(bo['odds']):+} — **{bo['book']}**"
+                                   if bo['odds'] is not None else
+                                   f"**{bo['line']:g}** — **{bo['book']}**")
+                        st.caption("Lowest line on the board — easiest number "
+                                   "to clear if you like the over.")
+                    with c2:
+                        st.markdown("**⬇️ Best spot to bet the UNDER**")
+                        st.success(f"**{bu['line']:g}** @ "
+                                   f"{int(bu['odds']):+} — **{bu['book']}**"
+                                   if bu['odds'] is not None else
+                                   f"**{bu['line']:g}** — **{bu['book']}**")
+                        st.caption("Highest line on the board — most cushion if "
+                                   "you like the under.")
+
+                    # Full per-book table.
+                    import pandas as _pd
+                    rows = [{"Book": q["book"], "Line": q["line"],
+                             "Over": (f"{int(q['over']):+}"
+                                      if q["over"] is not None else "—"),
+                             "Under": (f"{int(q['under']):+}"
+                                       if q["under"] is not None else "—")}
+                            for q in g["all"]]
+                    st.dataframe(_pd.DataFrame(rows), hide_index=True,
+                                 use_container_width=True)
+
+            st.caption("⚠️ Line shopping needs accounts at multiple sportsbooks "
+                       "to actually use. The gap is the opportunity, but always "
+                       "confirm the live number on the book before betting — "
+                       "lines move, and these are a recent snapshot (cached 15 "
+                       "min).")

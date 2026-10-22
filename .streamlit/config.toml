@@ -1,0 +1,14 @@
+[theme]
+# Monochrome dark look: neutral grays with a near-white accent.
+base = "dark"
+primaryColor = "#e5e5e5"
+backgroundColor = "#0a0a0a"
+secondaryBackgroundColor = "#161616"
+textColor = "#ededed"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
