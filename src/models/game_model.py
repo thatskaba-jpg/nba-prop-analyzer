@@ -113,16 +113,19 @@ def _star_tax_points(out_list):
         status = (entry[1] if len(entry) > 1 else "out") or ""
         ppg = entry[2] if len(entry) > 2 else 0.0
         s = status.lower()
-        if "doubtful" in s:
-            weight = 0.5
-        elif "out" in s:
+        if "out" in s:
             weight = 1.0
+        elif "doubtful" in s:
+            weight = 0.5
+        elif "question" in s:
+            weight = 0.25   # ~50/50 to play — small partial dock
         else:
             continue
         val = max(1.0, min(7.0, (ppg or 0.0) * 0.20)) * weight
         total += val
-        reasons.append(f"{nm} {('DOUBTFUL' if weight < 1 else 'OUT')} "
-                       f"(-{val:.1f})")
+        _lbl = ("OUT" if weight >= 1.0
+                else "DOUBTFUL" if weight >= 0.5 else "QUESTIONABLE")
+        reasons.append(f"{nm} {_lbl} (-{val:.1f})")
     return round(total, 1), reasons
 
 
