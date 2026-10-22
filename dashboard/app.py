@@ -103,9 +103,12 @@ try:
         season_average, advanced_stats, standings_map, team_ratings_map,
         player_advanced_avg,
     )
+    from collect.goat_data import expected_threes, standings  # noqa: E402
 except Exception:
     season_average = advanced_stats = standings_map = team_ratings_map = None
     player_advanced_avg = None
+    expected_threes = None
+    standings = None
 try:
     from collect.fetch_injuries import current_injury  # noqa: E402
 except Exception:
@@ -446,6 +449,27 @@ def cached_history(pid):
     return load_player_history(pid)
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_four_factors(season):
+    """Team Four Factors map (eFG/TOV/OREB), cached an hour. {} on error."""
+    try:
+        from collect.goat_data import team_four_factors_map
+        return team_four_factors_map(season)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def cached_polymarket(home_abbr, away_abbr):
+    """Polymarket crowd probability for a game, cached 2 min (prices move fast).
+    None when no market / unavailable."""
+    try:
+        from odds.polymarket import game_probability
+        return game_probability(home_abbr, away_abbr)
+    except Exception:
+        return None
+
+
 @st.cache_data(show_spinner=False)
 def team_abbrs():
     conn = get_connection()
@@ -608,6 +632,18 @@ def goat_adv_avg(pid, season):
         return {}
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def goat_expected_threes(pid, season):
+    """Rough per-game 3PT attempts/makes from shooting splits, cached an hour.
+    Context for a 3-Pointers-Made prop. {} when unavailable."""
+    if expected_threes is None:
+        return {}
+    try:
+        return expected_threes(pid, season)
+    except Exception:
+        return {}
+
+
 @st.cache_data(show_spinner=False, ttl=86400)
 def cached_bio(player_name):
     """Player photo + position/height/weight from ESPN (free). Cached a day —
@@ -704,6 +740,48 @@ def cached_team_lineup(team_abbr):
     return _with_deadline(_build, seconds=4,
                           default={"starters": [], "bench": []}) \
         or {"starters": [], "bench": []}
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_opp_starters(opp_abbr):
+    """Opponent's confirmed starters WITH position + player_id for tonight's
+    game: [{'name','position','player_id'}, ...]. Used to pick the likely
+    primary defender (same position group) for a matchup-defense note."""
+    if not opp_abbr:
+        return []
+    def _build():
+        from collect.goat_data import starters_detailed
+        from odds.balldontlie_props import _todays_game_ids
+        for gid in _todays_game_ids():
+            s = starters_detailed(gid, opp_abbr)
+            if s:
+                return s
+        return []
+    return _with_deadline(_build, seconds=4, default=[]) or []
+
+
+def primary_defender_note(opp_abbr, player_group, season):
+    """Pick the opponent starter whose position matches the player's group and
+    return a plain note on what he allows to his man. None if unavailable.
+    Honest: this is the LIKELY matchup by position, not a confirmed assignment —
+    defenders switch, so we label it as such."""
+    starters = cached_opp_starters(opp_abbr)
+    if not starters:
+        return None
+    # Map our position groups to lineup slots (G/F/C).
+    grp = (player_group or "").lower()
+    want = ("G" if "guard" in grp else "C" if "big" in grp or "center" in grp
+            else "F")
+    cand = [s for s in starters if s.get("position", "").startswith(want)]
+    cand = cand or starters  # fall back to any starter if no slot match
+    for s in cand:
+        pid = s.get("player_id")
+        if pid is None:
+            continue
+        adv = goat_adv_avg(pid, season)
+        if adv and adv.get("matchup_pts") is not None:
+            return {"name": s["name"], "adv": adv}
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -908,7 +986,11 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                 ev = evaluate_prop(res["p_over"], res["p_under"],
                                    int(o_over), int(o_under),
                                    edge_threshold=edge_threshold)
-                lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
+                # Pick = which side the PROJECTION lands on vs the line. This is
+                # unambiguous (proj above line -> OVER) and never contradicts the
+                # shown projection, unlike leaning on p_over which can be
+                # miscalibrated for very low lines (e.g. 0.5 blocks/steals).
+                lean = "OVER" if res["projection"] > line else "UNDER"
                 ev_pick = ev["ev_over_pct"] if lean == "OVER" else ev["ev_under_pct"]
                 rows.append({
                     "Player": name,
@@ -1528,9 +1610,59 @@ else:
             st.caption(f"{sel} is classified as a **{grp}** — the matchup factor "
                        f"uses how {opp} defends {grp}s for this stat.")
 
+        # ---- Likely primary defender (context only, not a projection factor) --
+        # Who on the opponent probably guards this player (same position group),
+        # and what that defender allows to his man. Defenders switch, so this is
+        # the LIKELY matchup, not a confirmed assignment.
+        try:
+            _pd_note = primary_defender_note(opp, grp, _rs if _rs >= 2024 else 2024)
+        except Exception:
+            _pd_note = None
+        if _pd_note:
+            a = _pd_note["adv"]
+            bits = [f"~{a['matchup_pts']:.1f} pts"]
+            if a.get("matchup_fg_pct") is not None:
+                bits.append(f"{a['matchup_fg_pct']*100:.0f}% FG")
+            if a.get("matchup_3pt_pct") is not None:
+                bits.append(f"{a['matchup_3pt_pct']*100:.0f}% from 3")
+            if a.get("matchup_ast") is not None:
+                bits.append(f"{a['matchup_ast']:.1f} ast")
+            st.caption(f"🥊 Likely on {sel}: **{_pd_note['name']}** ({opp}) — "
+                       f"allows his matchup " + ", ".join(bits)
+                       + ". (Likely by position — defenders switch, so this is "
+                         "context, not baked into the projection.)")
+
+        # ---- Shooting splits (context) — only for the 3-Pointers Made prop ----
+        # How many threes this player actually launches per game, from distance
+        # splits. Direct read on a 3PM over/under; approximate, context only.
+        if prop_type == "threes_made":
+            try:
+                _et = goat_expected_threes(pid, _rs if _rs >= 2024 else 2024)
+            except Exception:
+                _et = {}
+            if _et:
+                st.caption(
+                    f"🎯 Shooting splits: **{sel}** takes ~{_et['fga_3']:.1f} "
+                    f"threes a game, makes ~{_et['fgm_3']:.1f} "
+                    f"({_et['fg3_pct']*100:.0f}%). Compare the **makes** to the "
+                    "line above. (From last season's distance splits — context, "
+                    "not baked into the projection.)")
+
         # Odds inputs live here so the EV verdict can render inside the slip.
         st.markdown("**Sportsbook odds** (optional — enter the real price for "
                     "an EV check; -110 = risk \\$110 to win \\$100)")
+        with st.expander("❓ What do odds like -194 or +138 mean?"):
+            st.markdown(
+                "American odds tell you **who's favored** and **what a bet pays**:\n\n"
+                "- **Minus (−)** = favorite. The number is what you **risk to win "
+                "\\$100**. −194 → bet \\$194 to win \\$100.\n"
+                "- **Plus (+)** = underdog. The number is what you **win on a "
+                "\\$100 bet**. +138 → bet \\$100 to win \\$138.\n"
+                "- **−110** is the normal \"coin-flip\" price (the book's cut). "
+                "The further from −110, the more lopsided the matchup.\n\n"
+                "Scaled to \\$10: +138 wins \\$13.80; −194 wins about \\$5.15. "
+                "Enter the **over** price and the **under** price and we'll tell "
+                "you if there's real value (positive EV) on either side.")
 
         # Auto-fill real odds from the odds router (balldontlie primary).
         if sgo_has_key():
@@ -1854,6 +1986,16 @@ else:
                         sq.append(f"at the rim {adv['rim_fg_pct']*100:.0f}%")
                     if sq:
                         st.caption("🎯 Shot quality (FG%): " + " · ".join(sq))
+                    # Shot ATTEMPT volume (counts per game) — how many looks.
+                    sa = []
+                    if adv.get("uncontested_fga") is not None:
+                        sa.append(f"{adv['uncontested_fga']:.1f} uncontested")
+                    if adv.get("contested_fga") is not None:
+                        sa.append(f"{adv['contested_fga']:.1f} contested")
+                    if adv.get("rim_fga") is not None:
+                        sa.append(f"{adv['rim_fga']:.1f} at the rim")
+                    if sa:
+                        st.caption("📈 Shot attempts/game: " + " · ".join(sa))
                     # Scoring profile — where his points come from.
                     sp = []
                     if adv.get("pct_pts_paint") is not None:
@@ -2230,16 +2372,27 @@ else:
                         st.dataframe(_fmt(pd.DataFrame(top)),
                                      use_container_width=True, hide_index=True)
                     else:
-                        # Group by matchup; show each game's best `per_game` plays.
+                        # Group by GAME. A player's Matchup is team-relative
+                        # ("DEN @ OKC" vs "OKC vs DEN" for the same game), so key
+                        # by the sorted team pair to merge both sides into one.
                         per_game = 3
+                        import re as _re
                         games = {}
+                        labels = {}
                         for r in base:
-                            games.setdefault(r["Matchup"], []).append(r)
+                            teams = _re.split(r"\s+(?:@|vs\.?)\s+",
+                                              r["Matchup"].strip())
+                            key = " / ".join(sorted(t.strip() for t in teams
+                                                    if t.strip()))
+                            games.setdefault(key, []).append(r)
+                            labels.setdefault(key, key.replace(" / ", " vs "))
                         st.caption(f"Each game's top {per_game} plays by EV. "
                                    f"{len(games)} game(s) on the board.")
-                        for matchup in sorted(games):
-                            grows = games[matchup][:per_game]
-                            st.markdown(f"**🏀 {matchup}**")
+                        for key in sorted(games):
+                            # Rank this game's plays by EV, then take the top N.
+                            grows = sorted(games[key],
+                                           key=lambda x: -x["EV %"])[:per_game]
+                            st.markdown(f"**🏀 {labels[key]}**")
                             show = [{k: v for k, v in r.items()
                                      if k != "Matchup"} for r in grows]
                             st.dataframe(_fmt(pd.DataFrame(show)),
@@ -2320,6 +2473,7 @@ else:
         except Exception:
             pass
         team_inj = cached_team_injuries()  # {team: [(name, status, ppg), ...]}
+        _gl_four_factors = cached_four_factors(_season)  # eFG/TOV/OREB per team
 
         if not lines:
             st.info("No game lines posted for this date yet. Sportsbook game "
@@ -2450,9 +2604,13 @@ else:
                     tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
                 g = lines.get(home) or {}
                 try:
-                    proj = project_game(home, away, ratings, gprofile, team_inj)
+                    proj = project_game(home, away, ratings, gprofile, team_inj,
+                                        four_factors=_gl_four_factors)
                 except TypeError:
-                    proj = project_game(home, away, ratings)  # old signature
+                    try:
+                        proj = project_game(home, away, ratings, gprofile, team_inj)
+                    except TypeError:
+                        proj = project_game(home, away, ratings)  # old signature
 
                 # ---- ATS capture: store our spread pick on OPEN games so the
                 # separate spread track record can grade it after the final.
@@ -2576,6 +2734,43 @@ else:
                              f"pace {proj['pace']:.0f}). Win odds: "
                              f"{home} {proj['p_home_win']*100:.0f}% / "
                              f"{away} {proj['p_away_win']*100:.0f}%.")
+
+                    # ---- Four Factors: eFG% edge folded into the margin ----
+                    ffp = proj.get("four_factor_pts")
+                    hff = _gl_four_factors.get(home) or {}
+                    aff = _gl_four_factors.get(away) or {}
+                    if hff.get("efg") is not None and aff.get("efg") is not None:
+                        _side = home if ffp and ffp > 0 else away
+                        st.caption(
+                            f"📐 Four Factors — eFG%: {home} "
+                            f"{hff['efg']*100:.1f}% vs {away} "
+                            f"{aff['efg']*100:.1f}%"
+                            + (f"  →  nudged the margin **{ffp:+.1f}** toward "
+                               f"{_side}." if ffp else " (even).")
+                            + f"  TOV%: {home} {hff.get('tov_pct',0)*100:.1f}% / "
+                            f"{away} {aff.get('tov_pct',0)*100:.1f}%  ·  "
+                            f"OREB%: {home} {hff.get('oreb_pct',0)*100:.1f}% / "
+                            f"{away} {aff.get('oreb_pct',0)*100:.1f}%")
+
+                    # ---- Polymarket: a SECOND price to diff against the book --
+                    pm = cached_polymarket(home, away)
+                    if pm:
+                        pm_h = pm["p_home"] * 100
+                        model_h = proj["p_home_win"] * 100
+                        gap = model_h - pm_h
+                        vol = pm.get("volume_24h", 0)
+                        agree = "same side" if (model_h >= 50) == (pm_h >= 50) \
+                            else "OPPOSITE sides"
+                        note = ("thin market — treat as weak" if vol < 5000
+                                else "")
+                        st.info(
+                            f"🪙 **Polymarket (crowd):** {home} {pm_h:.0f}% / "
+                            f"{away} {100-pm_h:.0f}%  ·  our model {home} "
+                            f"{model_h:.0f}%.  Gap **{gap:+.0f} pts**, {agree}."
+                            + (f"  ⚠️ {note}." if note else "")
+                            + f"  (24h vol ${vol:,.0f}.) A big gap vs the "
+                              "sportsbook line below can flag news the book "
+                              "hasn't moved on yet — a signal, not a bet.")
 
                     # ---- Each team's DEFENSE: points allowed per 100 (#rank) --
                     def _def_line(abbr):
