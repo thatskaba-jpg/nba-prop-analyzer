@@ -37,6 +37,9 @@ from database import get_connection  # noqa: E402
 # Only these statuses meaningfully free up usage. "Day-To-Day"/"Questionable"
 # are too uncertain to boost on (the player might play), so we ignore them here.
 _OUT_STATUSES = ("out", "doubtful")
+# The game-model Star Tax also docks QUESTIONABLE (partially); include it in the
+# team-level injury map only. The prop usage-boost keeps using _OUT_STATUSES.
+_TEAM_TAX_STATUSES = ("out", "doubtful", "question")
 
 
 def _team_from_matchup(matchup: str, player_is_home) -> str:
@@ -167,7 +170,7 @@ def out_players_by_team():
     out_by_name = {}
     for r in conn.execute("SELECT player_name, status FROM injuries"):
         st = (r["status"] or "").strip().lower()
-        if any(s in st for s in _OUT_STATUSES):
+        if any(s in st for s in _TEAM_TAX_STATUSES):
             out_by_name[r["player_name"]] = r["status"]
     ppg_by_name = {}
     if out_by_name:
