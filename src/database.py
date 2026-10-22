@@ -60,11 +60,31 @@ def _ensure_db_present():
         print(f"Database not found locally — downloading from DB_URL…",
               file=sys.stderr)
         urllib.request.urlretrieve(url, tmp)
-        if tmp.stat().st_size < _MIN_DB_BYTES:
-            raise ValueError(f"downloaded file too small "
-                             f"({tmp.stat().st_size} bytes) — bad URL?")
-        tmp.replace(DB_PATH)
-        print(f"Database downloaded to {DB_PATH} "
+        # DB_URL may point at a .zip (GitHub Releases reject a bare .db upload,
+        # and a zip is much smaller). Detect a zip by content and extract the
+        # bot.db inside it.
+        import zipfile
+        if zipfile.is_zipfile(tmp):
+            with zipfile.ZipFile(tmp) as zf:
+                # Prefer an entry literally named bot.db; else the first .db.
+                names = zf.namelist()
+                member = next((n for n in names
+                               if n.endswith("bot.db")), None) \
+                    or next((n for n in names if n.endswith(".db")), None)
+                if not member:
+                    raise ValueError("zip has no .db file inside")
+                with zf.open(member) as src, open(DB_PATH, "wb") as dst:
+                    import shutil
+                    shutil.copyfileobj(src, dst)
+            tmp.unlink(missing_ok=True)
+        else:
+            if tmp.stat().st_size < _MIN_DB_BYTES:
+                raise ValueError(f"downloaded file too small "
+                                 f"({tmp.stat().st_size} bytes) — bad URL?")
+            tmp.replace(DB_PATH)
+        if DB_PATH.stat().st_size < _MIN_DB_BYTES:
+            raise ValueError("extracted database is too small — bad archive?")
+        print(f"Database ready at {DB_PATH} "
               f"({DB_PATH.stat().st_size // 1_048_576} MB).", file=sys.stderr)
     except Exception as e:
         # Leave no half-written file behind; surface the reason, don't crash.
