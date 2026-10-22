@@ -135,21 +135,29 @@ def _team_timeline(games: pd.DataFrame) -> dict:
 
 
 def _form_before(timeline, team, date):
-    """Rolling (off, def, winrate, rest_days) for `team` using only games
-    strictly before `date`. None if too few prior games."""
+    """Rolling pre-game form for `team` from games strictly before `date`.
+    Returns (off, def, winrate, rest, net, scoring_std, last5_off, last5_def)
+    — all leak-free. None if too few prior games."""
     rows = [x for x in timeline.get(team, []) if x[0] < date]
     if len(rows) < _MIN_PRIOR:
         return None
     recent = rows[-_ROLL:]
-    off = float(np.mean([x[1] for x in recent]))
-    dfn = float(np.mean([x[2] for x in recent]))
+    pf = [x[1] for x in recent]
+    pa = [x[2] for x in recent]
+    off = float(np.mean(pf))
+    dfn = float(np.mean(pa))
     wr = float(np.mean([x[3] for x in recent]))
+    net = off - dfn                          # point differential (net rating-ish)
+    scoring_std = float(np.std(pf)) if len(pf) >= 2 else 10.0  # consistency
+    last5 = recent[-5:]
+    l5_off = float(np.mean([x[1] for x in last5]))   # hotter/colder recently
+    l5_def = float(np.mean([x[2] for x in last5]))
     try:
         rest = (pd.to_datetime(date) - pd.to_datetime(rows[-1][0])).days
         rest = max(0, min(rest, 10))   # clamp offseason gaps
     except Exception:
         rest = 2
-    return off, dfn, wr, rest
+    return off, dfn, wr, rest, net, scoring_std, l5_off, l5_def
 
 
 def _build_matrix(games: pd.DataFrame):
@@ -161,8 +169,8 @@ def _build_matrix(games: pd.DataFrame):
         af = _form_before(tl, r["away_team"], r["game_date"])
         if hf is None or af is None:
             continue
-        ho, hd, hw, hr = hf
-        ao, ad, aw, ar = af
+        ho, hd, hw, hr, hnet, hstd, hl5o, hl5d = hf
+        ao, ad, aw, ar, anet, astd, al5o, al5d = af
         # Feature vector: each team's form + the differentials that matter.
         X.append([
             ho, hd, hw, hr,
@@ -171,6 +179,11 @@ def _build_matrix(games: pd.DataFrame):
             ao - hd,          # away offense vs home defense
             hw - aw,          # win-rate gap
             hr - ar,          # rest advantage
+            hnet, anet,       # each team's point differential (net rating)
+            hnet - anet,      # NET-rating gap (strongest single signal)
+            hstd, astd,       # scoring consistency (streaky vs steady)
+            hl5o - hl5d,      # home last-5 net (recent hot/cold)
+            al5o - al5d,      # away last-5 net
         ])
         yw.append(int(r["home_win"]))
         ym.append(float(r["margin"]))
@@ -183,7 +196,10 @@ def _build_matrix(games: pd.DataFrame):
 _FEATURES = ["home_off", "home_def", "home_wr", "home_rest",
              "away_off", "away_def", "away_wr", "away_rest",
              "home_off_vs_away_def", "away_off_vs_home_def",
-             "wr_gap", "rest_gap"]
+             "wr_gap", "rest_gap",
+             "home_net", "away_net", "net_gap",
+             "home_scoring_std", "away_scoring_std",
+             "home_last5_net", "away_last5_net"]
 
 
 def train(save: bool = True) -> dict:
@@ -301,10 +317,19 @@ def predict_from_features(home_form, away_form) -> dict:
     fit = load_model()
     if not fit:
         return None
-    ho, hd, hw, hr = home_form
-    ao, ad, aw, ar = away_form
+    ho, hd, hw, hr = home_form[:4]
+    ao, ad, aw, ar = away_form[:4]
+    hnet, anet = ho - hd, ao - ad
+    # Dashboard passes only off/def/winrate/rest; derive the rest sensibly
+    # (net = off-def, consistency defaults to league ~12, last-5 net = net).
+    hstd = home_form[5] if len(home_form) > 5 else 12.0
+    astd = away_form[5] if len(away_form) > 5 else 12.0
+    hl5 = (home_form[6] - home_form[7]) if len(home_form) > 7 else hnet
+    al5 = (away_form[6] - away_form[7]) if len(away_form) > 7 else anet
     x = [ho, hd, hw, hr, ao, ad, aw, ar,
-         ho - ad, ao - hd, hw - aw, hr - ar]
+         ho - ad, ao - hd, hw - aw, hr - ar,
+         hnet, anet, hnet - anet,
+         hstd, astd, hl5, al5]
     logit = _apply_linear(fit, x, "win_coef", "win_intercept")
     p_home = 1.0 / (1.0 + math.exp(-logit))
     margin = _apply_linear(fit, x, "margin_coef", "margin_intercept")

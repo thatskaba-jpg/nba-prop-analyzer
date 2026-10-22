@@ -1161,8 +1161,10 @@ def cached_montecarlo(home, away, spread_home, total_line):
     every click and slowing every tab). Keyed by matchup + lines."""
     try:
         from models.game_sim import simulate_game
-        rf = cached_team_form_rich()
-        hr, ar = rf.get(home), rf.get(away)
+        # Build strength for ONLY the two teams in THIS matchup (not all 30 —
+        # that was the ~33s Game Lines cold-load cost). Each is disk-stored.
+        hr = team_form_one(home)
+        ar = team_form_one(away)
         if not hr or not ar:
             return None
         return simulate_game(
@@ -1171,6 +1173,16 @@ def cached_montecarlo(home, away, spread_home, total_line):
             total_line=(float(total_line) if total_line is not None else None))
     except Exception:
         return None
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def team_form_one(team):
+    """{off, deff, std, pace} for ONE team — roster-based early season (disk
+    stored), so a matchup only builds its two teams, never all 30."""
+    rs = cached_roster_strength(team)
+    if rs:
+        return {"off": rs["off"], "deff": rs["deff"], "std": 12.0, "pace": None}
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -3344,6 +3356,19 @@ else:
                 else:
                     tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
                 g = lines.get(home) or {}
+                # Early season: override this matchup's team ratings with
+                # roster-based strength (current players), so project_game's
+                # header pick reflects offseason moves, not last year's team.
+                try:
+                    for _t in (home, away):
+                        _rs = cached_roster_strength(_t)
+                        if _rs:
+                            _r = dict(ratings.get(_t) or {})
+                            _r["off"], _r["def"] = _rs["off"], _rs["deff"]
+                            _r.setdefault("pace", 100.0)
+                            ratings[_t] = _r
+                except Exception:
+                    pass
                 try:
                     proj = project_game(home, away, ratings, gprofile, team_inj,
                                         four_factors=_gl_four_factors)
@@ -3360,26 +3385,32 @@ else:
                 if proj:
                     try:
                         from models.game_ml_model import predict_from_features
-                        _form = cached_team_form()
-                        _hf, _af = _form.get(home), _form.get(away)
+                        # Roster-based strength (reflects current rosters) for
+                        # just these two teams, as (off,def,winrate,rest) tuples.
+                        _hs = team_form_one(home)
+                        _as = team_form_one(away)
+                        _hf = ((_hs["off"], _hs["deff"], 0.5, 2) if _hs else None)
+                        _af = ((_as["off"], _as["deff"], 0.5, 2) if _as else None)
                         if _hf and _af:
                             _tm = predict_from_features(_hf, _af)
                             if _tm:
-                                proj["p_home_win"] = round(
-                                    0.60 * _tm["p_home_win"]
-                                    + 0.40 * proj["p_home_win"], 4)
-                                proj["p_away_win"] = round(
-                                    1.0 - proj["p_home_win"], 4)
-                                proj["trained_margin"] = round(_tm["margin"], 1)
+                                # ONE model, ONE number. The trained model's
+                                # margin drives everything — win-odds, points,
+                                # total — so nothing on the card can contradict.
+                                import math as _math
+                                _bm = round(_tm["margin"], 1)
+                                _mstd_h = proj.get("margin_std") or 12.0
+                                _ph = 1.0 / (1.0 + _math.exp(-_bm / _mstd_h))
+                                proj["exp_margin"] = _bm
+                                proj["p_home_win"] = round(_ph, 4)
+                                proj["p_away_win"] = round(1.0 - _ph, 4)
+                                _tot = round(_tm["total"], 1) if _tm.get(
+                                    "total") is not None else (
+                                    proj.get("exp_total") or 230)
+                                proj["exp_total"] = _tot
+                                proj["exp_home_pts"] = round((_tot + _bm) / 2, 1)
+                                proj["exp_away_pts"] = round((_tot - _bm) / 2, 1)
                                 proj["trained"] = True
-                                # Trained TOTAL leads the displayed total (the
-                                # old pace formula was the weaker estimate).
-                                if _tm.get("total") is not None:
-                                    _old_total = proj.get("exp_total")
-                                    proj["exp_total"] = round(
-                                        0.70 * _tm["total"]
-                                        + 0.30 * (_old_total or _tm["total"]), 1)
-                                    proj["trained_total"] = round(_tm["total"], 1)
                     except Exception:
                         pass
 
@@ -3498,9 +3529,35 @@ else:
                              f"{home} {proj['p_home_win']*100:.0f}% / "
                              f"{away} {proj['p_away_win']*100:.0f}%.")
 
-                    # ---- Monte Carlo: simulate the game 10,000 times ----
-                    # CACHED per matchup — it used to re-run 10k sims on every
-                    # rerun, which is what made every tab slow.
+                    # ---- Model vs OPENING LINE agreement flag ----
+                    # The opening spread is the market's read. When our model
+                    # and the market pick the SAME favorite, that's a confident
+                    # spot; when they split, treat it as low-confidence.
+                    try:
+                        _opn = _gl_open_odds.get(matchup)
+                        _osp = _opn.get("spread_home") if _opn else None
+                        if _osp is not None:
+                            # Opening line's favorite: negative home spread =
+                            # home favored. Our model: positive exp_margin =
+                            # home favored.
+                            _mkt_home_fav = _osp < 0
+                            _mdl_home_fav = proj["exp_margin"] > 0
+                            _mkt_side = home if _mkt_home_fav else away
+                            _mdl_side = home if _mdl_home_fav else away
+                            if _mkt_side == _mdl_side:
+                                st.success(
+                                    f"🤝 Model AGREES with the opening line — "
+                                    f"both favor **{_mdl_side}** (market opened "
+                                    f"{home} {_osp:+g}). Higher confidence.")
+                            else:
+                                st.warning(
+                                    f"⚠️ Model DISAGREES with the opening line — "
+                                    f"we lean **{_mdl_side}**, the market opened "
+                                    f"on **{_mkt_side}** ({home} {_osp:+g}). "
+                                    f"Lower confidence — the market may know "
+                                    f"something (check injuries/news).")
+                    except Exception:
+                        pass
                     try:
                         _sp = g.get("spread")
                         _tl = g.get("total")
