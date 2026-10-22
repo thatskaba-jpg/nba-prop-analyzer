@@ -120,160 +120,121 @@ from backtest.backtest import run_backtest  # noqa: E402
 
 st.set_page_config(page_title="NBA Prop Helper", page_icon="🏀", layout="wide")
 
-# --- Styling: PREMIUM TERMINAL — near-black, monospace figures, amber glow,
-#     sharp data-dense panels. A "Bloomberg-for-props" insider-tool feel. ---
+# --- Styling: MODERN MONOCHROME — near-black, layered greys, crisp white
+#     accent. Minimal, high-contrast, premium. No color, all contrast. ---
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
 
 :root {
-    --amber: #ffb000;           /* terminal amber accent */
-    --amber-dim: #cc8d00;
-    --amber-glow: rgba(255,176,0,.30);
-    --bg: #050607;
-    --panel: #0b0d10;
-    --panel-2: #0f1216;
-    --line: #1a1e24;
-    --grid: rgba(255,176,0,.05);
-    --text: #d7dde3;
-    --muted: #6b7682;
-    --green: #35d07f;
-    --red: #ff5d5d;
-    --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    --bg:#0c0c0d; --panel:#161617; --panel-2:#1d1d1f; --raise:#242427;
+    --line:#2a2a2d; --line-2:#363639;
+    --text:#f4f4f5; --muted:#9a9aa0; --faint:#6e6e73;
+    --accent:#ffffff;            /* pure white accent — the only "color" */
+    --accent-soft:rgba(255,255,255,.08);
+    --up:#e6e6e6; --down:#8a8a8f;
 }
 
-/* ---- Base: dark with a faint terminal grid ---- */
-html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
-.stApp {
-    background:
-      linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 100% 34px,
-      linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 34px 100%,
-      radial-gradient(900px 480px at 88% -10%, rgba(255,176,0,.07) 0%, transparent 55%),
-      var(--bg);
-    color: var(--text);
-}
-.block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1220px; }
+/* ---- Base ---- */
+html, body, [class*="css"] { font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; }
+.stApp { background:
+    radial-gradient(1100px 560px at 50% -15%, #1a1a1c 0%, transparent 60%),
+    var(--bg); color:var(--text); }
+.block-container { padding-top:1.2rem; padding-bottom:3rem; max-width:1180px; }
 
-/* numbers everywhere lean monospace for that terminal readout feel */
-div[data-testid="stMetricValue"], .stDataFrame, code, .term-num { font-family: var(--mono); }
+/* ---- Headings: clean, tight, thin rule ---- */
+h1,h2,h3 { color:var(--text); font-weight:800; letter-spacing:-.02em; }
+h2,h3 { font-size:1.05rem !important; border-bottom:1px solid var(--line);
+    padding-bottom:9px; margin-top:.4rem; }
 
-/* ---- Headings: uppercase, tracked-out, amber tick ---- */
-h1, h2, h3 { font-weight: 800; color: var(--text); letter-spacing: .01em; }
-h2, h3 { text-transform: uppercase; font-size: 1.02rem !important; letter-spacing: .14em;
-     color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 8px;
-     position: relative; }
-h2::before, h3::before { content:"▸ "; color: var(--amber); }
-
-/* ---- Metric tiles: sharp panel, amber top-rule, mono value, glow on hover ---- */
+/* ---- Metric tiles: soft raised card, white number, gentle lift ---- */
 div[data-testid="stMetric"] {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-top: 2px solid var(--amber);
-    border-radius: 4px;
-    padding: 14px 16px;
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,.015);
-    transition: box-shadow .12s ease, border-color .12s ease;
-}
-div[data-testid="stMetric"]:hover {
-    box-shadow: 0 0 0 1px var(--amber-glow), 0 0 24px -6px var(--amber-glow); }
-div[data-testid="stMetric"] label { color: var(--muted) !important; font-size: .68rem;
-    text-transform: uppercase; letter-spacing: .14em; font-weight: 700; }
-div[data-testid="stMetricValue"] { font-size: 1.75rem; font-weight: 800;
-    color: var(--amber); text-shadow: 0 0 18px var(--amber-glow); letter-spacing: -.01em; }
+    background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line); border-radius:16px; padding:16px 18px;
+    box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 10px 30px -18px #000;
+    transition:transform .14s ease, border-color .14s ease; }
+div[data-testid="stMetric"]:hover { transform:translateY(-2px); border-color:var(--line-2); }
+div[data-testid="stMetric"] label { color:var(--muted) !important; font-size:.72rem;
+    text-transform:uppercase; letter-spacing:.09em; font-weight:700; }
+div[data-testid="stMetricValue"] { font-size:1.9rem; font-weight:900;
+    color:#fff; letter-spacing:-.03em; }
 
-/* ---- Buttons: sharp amber-outline, fills + glows on hover ---- */
+/* ---- Buttons: white fill, invert to outline on hover ---- */
 div.stButton > button {
-    background: transparent; color: var(--amber);
-    border: 1px solid var(--amber); border-radius: 4px;
-    font-family: var(--mono); font-weight: 700; padding: .5rem 1.2rem;
-    letter-spacing: .06em; text-transform: uppercase; font-size: .82rem;
-    transition: all .12s ease;
-}
-div.stButton > button:hover { background: var(--amber); color: #120c00;
-    box-shadow: 0 0 22px -4px var(--amber-glow); }
-div.stButton > button:active { transform: translateY(1px); }
+    background:var(--accent); color:#0c0c0d; border:1px solid var(--accent);
+    border-radius:12px; font-weight:800; padding:.55rem 1.3rem; letter-spacing:-.01em;
+    box-shadow:0 8px 24px -14px #fff; transition:all .14s ease; }
+div.stButton > button:hover { background:transparent; color:var(--accent);
+    box-shadow:none; }
+div.stButton > button:active { transform:translateY(1px); }
 
-/* ---- Tabs: terminal command strip, amber active with underglow ---- */
-div[data-baseweb="tab-list"] { gap: 2px; background: var(--panel); padding: 4px;
-    border: 1px solid var(--line); border-radius: 4px; }
-button[data-baseweb="tab"] { font-family: var(--mono); font-size: .82rem; font-weight: 600;
-    border-radius: 3px; padding: 9px 15px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: .06em; transition: all .1s ease; }
-button[data-baseweb="tab"]:hover { color: var(--text); background: var(--panel-2); }
+/* ---- Tabs: soft segmented control, white active ---- */
+div[data-baseweb="tab-list"] { gap:4px; background:var(--panel); padding:5px;
+    border:1px solid var(--line); border-radius:14px; }
+button[data-baseweb="tab"] { font-size:.9rem; font-weight:700; border-radius:10px;
+    padding:9px 16px; color:var(--muted); letter-spacing:-.01em; transition:all .12s ease; }
+button[data-baseweb="tab"]:hover { color:var(--text); background:var(--panel-2); }
 button[data-baseweb="tab"][aria-selected="true"] {
-    background: rgba(255,176,0,.10) !important; color: var(--amber) !important;
-    box-shadow: inset 0 -2px 0 var(--amber); }
+    background:var(--accent) !important; color:#0c0c0d !important; }
 div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display:none; }
 
-/* ---- Inputs: sharp, mono, amber focus ---- */
+/* ---- Inputs: recessed, white focus ---- */
 div[data-baseweb="input"] input, div[data-baseweb="select"] > div,
 .stNumberInput input, .stTextInput input {
-    background: #070809 !important; border-radius: 4px !important;
-    border: 1px solid var(--line) !important; color: var(--text) !important;
-    font-family: var(--mono) !important; }
+    background:#0f0f10 !important; border-radius:11px !important;
+    border:1px solid var(--line) !important; color:var(--text) !important; }
 div[data-baseweb="input"]:focus-within, .stNumberInput div:focus-within,
 div[data-baseweb="select"] > div:focus-within {
-    border-color: var(--amber) !important;
-    box-shadow: 0 0 0 1px var(--amber-glow), 0 0 16px -6px var(--amber-glow) !important; }
+    border-color:var(--accent) !important;
+    box-shadow:0 0 0 3px var(--accent-soft) !important; }
 
-/* ---- Tables: sharp, mono, gridded ---- */
-div[data-testid="stDataFrame"] { border-radius: 4px; overflow: hidden;
-    border: 1px solid var(--line); }
+/* ---- Tables ---- */
+div[data-testid="stDataFrame"] { border-radius:12px; overflow:hidden;
+    border:1px solid var(--line); }
 
-/* ---- Sidebar: control panel ---- */
+/* ---- Sidebar ---- */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #080a0c 0%, #050607 100%);
-    border-right: 1px solid var(--line); }
-section[data-testid="stSidebar"] h1 { font-size: 1.05rem; text-transform: uppercase;
-    letter-spacing: .12em; color: var(--amber); }
+    background:linear-gradient(180deg,#121213,#0c0c0d); border-right:1px solid var(--line); }
+section[data-testid="stSidebar"] h1 { font-size:1.15rem; letter-spacing:-.02em; }
 
-/* ---- Expanders: sharp panels, amber edge on hover ---- */
-div[data-testid="stExpander"] { border: 1px solid var(--line); border-radius: 4px;
-    background: var(--panel); overflow: hidden; transition: border-color .12s ease; }
-div[data-testid="stExpander"]:hover { border-color: var(--amber); }
-div[data-testid="stExpander"] summary { font-family: var(--mono); letter-spacing: .02em; }
+/* ---- Expanders: soft card, brighter edge on hover ---- */
+div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:14px;
+    background:var(--panel); overflow:hidden; transition:border-color .14s ease; }
+div[data-testid="stExpander"]:hover { border-color:var(--line-2); }
 
 /* ---- Alerts ---- */
-div[data-testid="stAlert"] { border-radius: 4px; border: 1px solid var(--line);
-    background: var(--panel) !important; }
+div[data-testid="stAlert"] { border-radius:12px; border:1px solid var(--line);
+    background:var(--panel) !important; }
 
-/* ---- Radio / slider / checkbox: amber ---- */
-div[role="radiogroup"] label { font-weight: 600; font-family: var(--mono);
-    font-size: .85rem; }
-.stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--amber); }
+/* ---- Radio / slider / checkbox: monochrome ---- */
+div[role="radiogroup"] label { font-weight:600; }
+.stSlider [data-baseweb="slider"] div[role="slider"] { background:var(--accent); }
 .stCheckbox [data-baseweb="checkbox"] span[aria-checked="true"] {
-    background: var(--amber) !important; border-color: var(--amber) !important; }
+    background:var(--accent) !important; border-color:var(--accent) !important; }
 
-/* ---- Terminal hero header ---- */
+/* ---- Monochrome hero: glass panel, thin top highlight ---- */
 .sb-hero {
-    background: var(--panel);
-    border: 1px solid var(--line); border-left: 3px solid var(--amber);
-    border-radius: 4px; padding: 16px 20px; margin-bottom: 18px;
-    box-shadow: inset 0 0 40px -20px var(--amber-glow);
-    position: relative; overflow: hidden;
-}
-.sb-hero::after { content:""; position:absolute; top:0; right:0; width:220px; height:100%;
-    background: radial-gradient(120px 80px at 90% 0%, var(--amber-glow), transparent 70%); }
-.sb-hero h1 { margin: 0; font-family: var(--mono); font-size: 1.5rem; font-weight: 800;
-    color: var(--text); letter-spacing: .02em; }
-.sb-hero h1 .cur { color: var(--amber); animation: blink 1.1s steps(1) infinite; }
-@keyframes blink { 50% { opacity: 0; } }
-@media (prefers-reduced-motion: reduce) { .sb-hero h1 .cur { animation: none; } }
-.sb-hero p { margin: .4rem 0 0; color: var(--muted); font-size: .9rem;
-    font-family: var(--mono); max-width: 680px; line-height: 1.5; }
-.sb-pill { display:inline-block; border:1px solid var(--amber); color: var(--amber);
-    font-family: var(--mono); font-weight:700; font-size:.66rem; letter-spacing:.12em;
-    text-transform:uppercase; padding: 2px 9px; border-radius: 3px; margin-bottom: 9px; }
+    background:linear-gradient(180deg,var(--panel-2),var(--panel));
+    border:1px solid var(--line); border-radius:20px; padding:22px 26px;
+    margin-bottom:18px; position:relative; overflow:hidden;
+    box-shadow:0 1px 0 rgba(255,255,255,.05) inset, 0 20px 50px -30px #000; }
+.sb-hero::after { content:""; position:absolute; inset:0 0 auto 0; height:1px;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.3),transparent); }
+.sb-hero h1 { margin:0; font-size:1.95rem; font-weight:900; letter-spacing:-.03em; color:#fff; }
+.sb-hero p { margin:.4rem 0 0; color:var(--muted); font-size:.95rem; max-width:640px;
+    line-height:1.5; }
+.sb-pill { display:inline-block; background:var(--accent-soft); color:var(--text);
+    border:1px solid var(--line-2); font-weight:700; font-size:.68rem; letter-spacing:.1em;
+    text-transform:uppercase; padding:3px 11px; border-radius:999px; margin-bottom:10px; }
 
-/* ---- Hide Streamlit's own chrome so it reads as a standalone app ---- */
-#MainMenu { visibility: hidden; }
-header[data-testid="stHeader"] { display: none; }
-footer { display: none; }
-div[data-testid="stToolbar"] { display: none; }
-div[data-testid="stDecoration"] { display: none; }
-.stDeployButton { display: none; }
-/* pull content up now that the header is gone */
-.block-container { padding-top: 0.6rem !important; }
+/* ---- Hide Streamlit chrome so it reads as a standalone app ---- */
+#MainMenu { visibility:hidden; }
+header[data-testid="stHeader"] { display:none; }
+footer { display:none; }
+div[data-testid="stToolbar"] { display:none; }
+div[data-testid="stDecoration"] { display:none; }
+.stDeployButton { display:none; }
+.block-container { padding-top:0.6rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -904,10 +865,10 @@ if chosen:
 # --------------------------------------------------------------------------- #
 st.markdown("""
 <div class="sb-hero">
-  <span class="sb-pill">◉ NBA · LIVE TERMINAL</span>
-  <h1>props://analyzer<span class="cur">_</span></h1>
-  <p>&gt; project stat lines · estimate over/under · check EV · shop every book
-     for the edge.<br>&gt; research terminal — not a guarantee.</p>
+  <span class="sb-pill">NBA · Player Props</span>
+  <h1>Prop Analyzer</h1>
+  <p>Project a stat line, estimate the Over/Under chance, and — with your odds —
+     see if it's a good deal. Shop every book for the edge.</p>
 </div>
 """, unsafe_allow_html=True)
 

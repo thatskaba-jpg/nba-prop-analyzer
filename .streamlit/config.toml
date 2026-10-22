@@ -1,11 +1,11 @@
 [theme]
-# Premium terminal: near-black with an amber accent.
+# Modern monochrome: near-black, layered greys, white accent.
 base = "dark"
-primaryColor = "#ffb000"
-backgroundColor = "#050607"
-secondaryBackgroundColor = "#0b0d10"
-textColor = "#d7dde3"
-font = "monospace"
+primaryColor = "#ffffff"
+backgroundColor = "#0c0c0d"
+secondaryBackgroundColor = "#161617"
+textColor = "#f4f4f5"
+font = "sans serif"
 
 [server]
 headless = true
