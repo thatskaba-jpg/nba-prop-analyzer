@@ -9,13 +9,70 @@ Every table we create gets a clear, documented purpose so you always
 know what's actual data vs. model output.
 """
 
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 # The database file lives in the project's data/ folder.
 # This file is src/database.py, so the project root is ONE level up from src/.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "data" / "bot.db"
+
+# Minimum plausible size (bytes) for a real database. A truncated/failed
+# download leaves a tiny file; we treat anything under this as "not really
+# here" so a bad download is retried rather than silently used.
+_MIN_DB_BYTES = 1_000_000  # 1 MB
+
+
+def _db_url() -> str:
+    """Where to download the database from when it's missing locally (cloud
+    deploy). Read from a Streamlit secret (DB_URL) or an env var; empty means
+    'no remote source' (normal on your Mac, where the file already exists)."""
+    url = os.getenv("DB_URL", "").strip()
+    if not url:
+        try:
+            import streamlit as st  # only present in the dashboard runtime
+            url = str(st.secrets.get("DB_URL", "")).strip()
+        except Exception:
+            url = ""
+    return url
+
+
+def _ensure_db_present():
+    """On a host where data/bot.db is missing (e.g. Streamlit Cloud), download
+    it once from DB_URL. A no-op on your Mac, where the file already exists.
+
+    Never fabricates data: if there's no file AND no DB_URL, the caller just
+    gets an empty database (schema only), which is the honest outcome."""
+    try:
+        if DB_PATH.exists() and DB_PATH.stat().st_size >= _MIN_DB_BYTES:
+            return  # real file already here — nothing to do
+    except OSError:
+        pass
+    url = _db_url()
+    if not url:
+        return  # no remote source configured; caller gets an empty DB
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DB_PATH.with_suffix(".db.part")
+    try:
+        import urllib.request
+        print(f"Database not found locally — downloading from DB_URL…",
+              file=sys.stderr)
+        urllib.request.urlretrieve(url, tmp)
+        if tmp.stat().st_size < _MIN_DB_BYTES:
+            raise ValueError(f"downloaded file too small "
+                             f"({tmp.stat().st_size} bytes) — bad URL?")
+        tmp.replace(DB_PATH)
+        print(f"Database downloaded to {DB_PATH} "
+              f"({DB_PATH.stat().st_size // 1_048_576} MB).", file=sys.stderr)
+    except Exception as e:
+        # Leave no half-written file behind; surface the reason, don't crash.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"Database download failed: {e}", file=sys.stderr)
 
 
 def get_connection():
@@ -25,6 +82,7 @@ def get_connection():
     by number, which keeps the rest of the code readable.
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_db_present()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
