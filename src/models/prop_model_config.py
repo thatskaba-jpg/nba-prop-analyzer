@@ -200,6 +200,40 @@ def _teammate_injuries_factor(feats, ctx):
     return 1.0 + boost, f"teammate(s) out ({who}) — usage up x{1.0 + boost:.3f}"
 
 
+def _confirmed_lineup_factor(feats, ctx):
+    """confirmed_lineup: adjust for TONIGHT'S confirmed starting lineup.
+
+    Lineups post near tip-off. Starting vs coming off the bench is a direct
+    signal about minutes and usage that the injury report alone can miss (a
+    healthy player can still be benched, and a surprise starter gets a real
+    bump). ctx carries:
+        lineup_status  — 'starter' | 'bench' | None  (what the feed says tonight)
+        usually_starts — bool: did this player start most of his recent games?
+
+    Rules, deliberately gentle (lineups are not a minutes guarantee):
+      * confirmed BENCH + usually a starter  -> downgrade (benched / load-
+        managed): x0.80.
+      * confirmed BENCH + usually a bench guy -> no change (already priced in).
+      * confirmed STARTER + usually a bench guy -> surprise starter: x1.10.
+      * confirmed STARTER + usually a starter -> no change (expected).
+      * nothing posted yet -> no-op.
+    We never infer a lineup; only an explicit feed value moves the number."""
+    status = (ctx.get("lineup_status") or "").strip().lower()
+    if status not in ("starter", "bench"):
+        return 1.0, None
+    usually_starts = bool(ctx.get("usually_starts"))
+    if status == "bench":
+        if usually_starts:
+            return 0.80, ("confirmed on the BENCH tonight (usually starts) — "
+                          "fewer minutes/usage expected")
+        return 1.0, None  # bench player benched: already reflected in his form
+    # status == "starter"
+    if not usually_starts:
+        return 1.10, ("confirmed STARTING tonight (usually a reserve) — "
+                      "more minutes/usage expected")
+    return 1.0, None
+
+
 def _game_environment_factor(feats, ctx):
     """game_environment: use the GAME LINE (total + this team's spread) as a
     scoring-environment nudge for counting-stat props.
@@ -379,6 +413,11 @@ FACTORS: Dict[str, Factor] = {
         _teammate_injuries_factor,
         needs="which of the player's teammates are OUT/DOUBTFUL tonight "
               "(from the merged ESPN + GOAT injuries feed)"),
+    "confirmed_lineup": Factor(
+        "confirmed_lineup", "Confirmed Starting Lineup", "Situational",
+        _confirmed_lineup_factor,
+        needs="tonight's confirmed lineup (starter/bench, from the balldontlie "
+              "lineups feed) + whether the player usually starts"),
     "game_environment": Factor(
         "game_environment", "Game Line (total + spread)", "Matchup",
         _game_environment_factor,
@@ -485,7 +524,8 @@ def analyze(config: ModelConfig, player_id: int, prop_type: str, line: float,
     ctx = context or {}
     if history is None:
         history = load_player_history(player_id)
-    feats = pregame_features(player_id, prop_type, cutoff_date, history)
+    feats = pregame_features(player_id, prop_type, cutoff_date, history,
+                             current_team=ctx.get("current_team"))
 
     base = project_stat(feats)
     if base is None:

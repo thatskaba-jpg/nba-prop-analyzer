@@ -40,7 +40,39 @@ def _ensure_table(conn):
             fetched_at  TEXT
         )
         """)
+    # Record WHICH feed wrote each row ('espn' or 'balldontlie'). ESPN posts
+    # game-day scratches first, so it takes priority on conflict (see
+    # upsert_injury). Older DBs won't have the column — add it idempotently.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(injuries)")}
+    if "source" not in cols:
+        conn.execute("ALTER TABLE injuries ADD COLUMN source TEXT")
     conn.commit()
+
+
+# Feed priority: higher wins on conflict. ESPN is faster for day-of actives, so
+# it overrides balldontlie; balldontlie fills in players ESPN doesn't list.
+_SOURCE_PRIORITY = {"balldontlie": 1, "espn": 2}
+
+
+def upsert_injury(conn, pid, name, status, desc, now, source):
+    """Write one injury row, but only if `source` outranks (or ties) whatever is
+    already stored for this player. Lets ESPN override a balldontlie status
+    regardless of which collector ran last, while still letting balldontlie
+    populate players ESPN never mentions. Returns True if it wrote."""
+    existing = conn.execute(
+        "SELECT source FROM injuries WHERE player_id = ?", (int(pid),)
+    ).fetchone()
+    if existing is not None:
+        prev = (existing["source"] if hasattr(existing, "keys")
+                else existing[0]) or "balldontlie"
+        if _SOURCE_PRIORITY.get(source, 0) < _SOURCE_PRIORITY.get(prev, 0):
+            return False  # a higher-priority feed already owns this row
+    conn.execute(
+        "INSERT OR REPLACE INTO injuries "
+        "(player_id, player_name, status, description, fetched_at, source) "
+        "VALUES (?,?,?,?,?,?)",
+        (int(pid), name, status, str(desc), now, source))
+    return True
 
 
 def _now():
@@ -48,11 +80,20 @@ def _now():
 
 
 def fetch_injuries():
-    """Pull all current injuries and replace the injuries table snapshot."""
+    """Pull all current injuries and refresh the balldontlie-sourced rows.
+
+    balldontlie is a full snapshot of the present, so we first drop the rows it
+    previously owned (a player who recovered should disappear), then write the
+    current set. ESPN-sourced rows are left untouched — ESPN takes priority on
+    conflict (see upsert_injury) because it posts game-day scratches first."""
     conn = get_connection()
     _ensure_table(conn)
     stored = 0
     try:
+        # Clear only our own prior snapshot; keep ESPN overrides intact.
+        conn.execute("DELETE FROM injuries WHERE source = 'balldontlie' "
+                     "OR source IS NULL")
+        conn.commit()
         for rows, _cur in iter_pages("player_injuries", {}, start_cursor=None):
             conn.execute("BEGIN")
             for r in rows:
@@ -63,12 +104,9 @@ def fetch_injuries():
                 name = f"{player.get('first_name','')} {player.get('last_name','')}".strip()
                 status = (r.get("status") or "").strip()
                 desc = (r.get("description") or r.get("return_date") or "")
-                conn.execute(
-                    "INSERT OR REPLACE INTO injuries "
-                    "(player_id, player_name, status, description, fetched_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (int(pid), name, status, str(desc), _now()))
-                stored += 1
+                if upsert_injury(conn, pid, name, status, desc, _now(),
+                                 "balldontlie"):
+                    stored += 1
             conn.commit()
     except BallDontLieError as e:
         conn.close()

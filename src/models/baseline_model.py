@@ -42,23 +42,81 @@ from features.features import pregame_features, load_player_history  # noqa: E40
 MIN_GAMES_FOR_CONFIDENCE = 10
 
 
+# How many games on the current team we want before we fully trust current-team
+# form as the anchor. Below this we blend it toward the overall sample so one or
+# two games don't swing the projection.
+_SOLID_TEAM_SAMPLE = 10
+
+
 def project_stat(feats: dict) -> float:
     """Blend recent and season form into an expected stat. Returns None if we
-    have no usable history."""
+    have no usable history.
+
+    TRADE-AWARE ANCHOR
+      The default blend weights recent form heavily (0.5/0.3/0.2 over
+      last5/last10/season). That is right for a settled player, but misleading
+      for one who just changed teams: his "recent" games were a different role
+      on a different team. We use the per-game team context from features to
+      pick a sensible anchor:
+
+        * recent games already on his CURRENT team  -> normal recency blend, but
+          the season anchor is his CURRENT-TEAM average (not career years on
+          other teams), when we have a solid current-team sample.
+        * just TRADED (his most recent game was on the old team) -> down-weight
+          the stale recent windows and lean on his current-team average, or the
+          overall season average if he has no current-team games yet.
+
+      Thin current-team samples are blended toward the overall sample so a
+      single new-team game doesn't dominate. Nothing here invents data — it
+      only re-weights games the player actually played.
+    """
     if feats.get("games_played_before", 0) == 0:
         return None
     a5 = feats.get("avg_last_5")
     a10 = feats.get("avg_last_10")
     season = feats.get("season_avg")
+    team_avg = feats.get("current_team_avg")
+    n_team = feats.get("games_on_current_team", 0) or 0
+    stale_recent = feats.get("recent_is_stale_team", False)
 
-    # Fall back gracefully when a window is missing (few games played).
+    # The "anchor" is the stable, slow-moving level the recency windows pull
+    # away from. Prefer the current-team average when it's a meaningful sample;
+    # blend it toward the overall season average when the sample is thin.
+    anchor = season
+    if team_avg is not None and n_team >= 1:
+        if n_team >= _SOLID_TEAM_SAMPLE:
+            anchor = team_avg
+        elif season is not None:
+            # Linearly trust the team average more as the sample grows.
+            w_team = n_team / _SOLID_TEAM_SAMPLE
+            anchor = w_team * team_avg + (1 - w_team) * season
+        else:
+            anchor = team_avg
+
+    # Just traded: the recent windows describe the OLD team, so they're stale.
+    # Lean almost entirely on the anchor (current-team / season level) and give
+    # the recent windows only a small voice.
+    if stale_recent:
+        parts, weights = [], []
+        if anchor is not None:
+            parts.append(anchor); weights.append(0.8)
+        if a10 is not None:
+            parts.append(a10); weights.append(0.15)
+        if a5 is not None:
+            parts.append(a5); weights.append(0.05)
+        if not parts:
+            return None
+        total_w = sum(weights)
+        return sum(p * w for p, w in zip(parts, weights)) / total_w
+
+    # Normal case: recency-weighted blend, anchored on the current-team level.
     parts, weights = [], []
     if a5 is not None:
         parts.append(a5); weights.append(0.5)
     if a10 is not None:
         parts.append(a10); weights.append(0.3)
-    if season is not None:
-        parts.append(season); weights.append(0.2)
+    if anchor is not None:
+        parts.append(anchor); weights.append(0.2)
     if not parts:
         return None
     total_w = sum(weights)
@@ -142,15 +200,19 @@ def confidence_label(feats: dict) -> str:
 
 
 def analyze_prop(player_id: int, prop_type: str, line: float,
-                 cutoff_date: str, history=None) -> dict:
+                 cutoff_date: str, history=None, current_team: str = None) -> dict:
     """Full Phase-4 analysis for one prop: projection, probabilities, confidence.
 
     Returns a dict with everything a dashboard card needs (odds/EV come in
     Phase 6). cutoff_date is the game date; only prior games are used.
+
+    current_team (optional) is the player's live-roster team, so the projection
+    can be trade-aware (lean on current-team form for a just-moved player).
     """
     if history is None:
         history = load_player_history(player_id)
-    feats = pregame_features(player_id, prop_type, cutoff_date, history)
+    feats = pregame_features(player_id, prop_type, cutoff_date, history,
+                             current_team=current_team)
     projection = project_stat(feats)
     probs = over_under_probabilities(projection, line, feats.get("std_recent"))
 
@@ -167,6 +229,10 @@ def analyze_prop(player_id: int, prop_type: str, line: float,
         "avg_last_5": feats.get("avg_last_5"),
         "avg_last_10": feats.get("avg_last_10"),
         "season_avg": feats.get("season_avg"),
+        "current_team": feats.get("current_team"),
+        "current_team_avg": feats.get("current_team_avg"),
+        "games_on_current_team": feats.get("games_on_current_team", 0),
+        "recent_is_stale_team": feats.get("recent_is_stale_team", False),
         "confidence": confidence_label(feats),
     }
 

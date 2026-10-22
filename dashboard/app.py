@@ -1097,6 +1097,7 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                     "position_group": grp,
                     "upcoming_is_home": is_home,
                     "team_ratings_map": shared_team_ratings,
+                    "current_team": my_team,
                 }
                 if inj:
                     ctx["injury_status"] = inj[0]
@@ -1215,13 +1216,15 @@ def _plain_reason(adj: str) -> str:
 RECOMMENDED_SIMPLE = {
     "player_last_n_avg": "high", "opponent_defense_by_position": "high",
     "opponent_team_rating": "medium", "teammate_injuries": "medium",
+    "confirmed_lineup": "medium",
     "game_environment": "medium",
     "rest_days": "medium", "home_away_split": "low", "minutes_trend": "low",
 }
 RECOMMENDED_WEIGHTED = {
-    "player_last_n_avg": 30, "opponent_defense_by_position": 22,
-    "opponent_team_rating": 12, "teammate_injuries": 11, "game_environment": 10,
-    "rest_days": 7, "home_away_split": 4, "minutes_trend": 4,
+    "player_last_n_avg": 28, "opponent_defense_by_position": 20,
+    "opponent_team_rating": 12, "teammate_injuries": 10,
+    "confirmed_lineup": 8, "game_environment": 10,
+    "rest_days": 6, "home_away_split": 3, "minutes_trend": 3,
 }
 
 # Friendly labels for the factor controls.
@@ -1235,6 +1238,7 @@ FACTOR_LABELS = {
     "minutes_trend": "Playing-time trend",
     "player_vs_team": "History vs this opponent",
     "teammate_injuries": "Teammate injuries (usage boost)",
+    "confirmed_lineup": "Confirmed starting lineup",
     "game_environment": "Game line (total + spread)",
     "injury": "Injury status",
 }
@@ -1785,9 +1789,12 @@ else:
         # confirmed five and (b) flag the player's starter/bench role.
         lu = cached_team_lineup(my_team) if my_team else {"starters": [],
                                                           "bench": []}
+        lineup_status = None  # 'starter' | 'bench' | None (fed to the model)
         if lu.get("starters"):
             in_starters = any(sel.split()[-1] in s for s in lu["starters"])
             in_bench = any(sel.split()[-1] in b for b in lu["bench"])
+            lineup_status = ("starter" if in_starters
+                             else "bench" if in_bench else None)
             role = ("🟢 confirmed STARTER" if in_starters
                     else "🪑 off the bench" if in_bench
                     else "⚠️ not in the posted lineup — may be out/traded")
@@ -1822,7 +1829,19 @@ else:
             "position_group": grp,
             "upcoming_is_home": is_home,
             "team_ratings_map": goat_team_ratings(_rs if _rs >= 2024 else 2024),
+            "current_team": my_team,
         }
+        # Confirmed starting lineup (tonight) -> minutes/usage signal. We feed
+        # the role only when the lineup is actually posted. "Usually starts" is
+        # proxied by recent minutes (a rotation starter plays ~24+ mpg), so a
+        # benching of a usual starter downgrades and a surprise starter bumps.
+        if lineup_status:
+            ctx["lineup_status"] = lineup_status
+            try:
+                usually = float(hist["minutes"].tail(10).mean()) >= 24.0
+            except Exception:
+                usually = False
+            ctx["usually_starts"] = usually
         # Injury status (from the GOAT injuries snapshot, if fetched).
         inj = current_injury(pid)
         if inj:

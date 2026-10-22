@@ -115,11 +115,18 @@ def _stat_series(df: pd.DataFrame, prop_type: str) -> pd.Series:
 
 
 def pregame_features(player_id: int, prop_type: str, cutoff_date: str,
-                     history: pd.DataFrame = None) -> dict:
+                     history: pd.DataFrame = None,
+                     current_team: str = None) -> dict:
     """Build features for a player's game on cutoff_date using ONLY prior games.
 
     cutoff_date is 'YYYY-MM-DD'. We keep rows with game_date < cutoff_date.
     Passing a preloaded `history` avoids re-querying in tight loops (backtests).
+
+    current_team (optional) is the player's CURRENT team abbreviation from the
+    live roster feed (which reflects offseason trades the game log can't). When
+    given, we compute current-team-only form so a just-traded player is judged
+    on his new team, not stale games from the old one. When omitted, we infer it
+    from his most recent prior game.
     """
     df = history if history is not None else load_player_history(player_id)
     if df.empty:
@@ -150,6 +157,40 @@ def pregame_features(player_id: int, prop_type: str, cutoff_date: str,
             float(stat.std(ddof=0)) if n >= 2 else None),
         "avg_minutes_last_10": float(prior["minutes"].tail(10).mean()),
     }
+
+    # --- Trade-aware team context (leak-free: all from `prior`) ---------------
+    # The per-game `matchup` string starts with the player's OWN team for that
+    # game (e.g. "CLE vs NYK" -> "CLE"), so we can tell which team each prior
+    # game was played on. A traded player's recent games may be on his OLD team,
+    # which makes recent-form weighting misleading — so we also compute his
+    # form on his CURRENT team only, and let project_stat lean on that.
+    feats["current_team"] = None
+    feats["games_on_current_team"] = 0
+    feats["current_team_avg"] = None
+    feats["recent_is_stale_team"] = False
+    try:
+        if "matchup" in prior.columns and prior["matchup"].notna().any():
+            game_team = (prior["matchup"].fillna("")
+                         .str.split(" ").str[0].str.upper())
+            cur = (current_team or "").upper() or None
+            if cur is None:
+                # Infer from the most recent prior game when not supplied.
+                last_team = game_team.iloc[-1]
+                cur = last_team or None
+            feats["current_team"] = cur
+            if cur is not None:
+                on_cur_mask = (game_team == cur).values
+                cur_stat = stat[on_cur_mask]
+                feats["games_on_current_team"] = int(len(cur_stat))
+                if len(cur_stat) >= 1:
+                    feats["current_team_avg"] = float(cur_stat.mean())
+                # "Stale recent form" = his most recent game was NOT on his
+                # current team (a genuine, just-happened trade). In that case
+                # last-5/last-10 describe the old team's role.
+                feats["recent_is_stale_team"] = bool(
+                    len(game_team) and game_team.iloc[-1] != cur)
+    except Exception:
+        pass
 
     # --- Phase 5 context features (still leak-free: all from `prior`) ---
 

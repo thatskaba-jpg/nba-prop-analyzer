@@ -40,6 +40,9 @@ except ImportError:
     raise SystemExit("Run:  pip install -r requirements.txt")
 
 from database import get_connection  # noqa: E402
+# Share the source-aware schema + priority upsert with the balldontlie fetcher
+# so ESPN rows and balldontlie rows live in one table with one override rule.
+from fetch_injuries import _ensure_table, upsert_injury  # noqa: E402
 
 ESPN_URL = ("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/"
             "injuries")
@@ -58,20 +61,6 @@ def _now():
 
 def _name_key(name: str) -> str:
     return "".join(ch for ch in (name or "").lower() if ch.isalnum())
-
-
-def _ensure_table(conn):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS injuries (
-            player_id   INTEGER PRIMARY KEY,
-            player_name TEXT,
-            status      TEXT,
-            description TEXT,
-            fetched_at  TEXT
-        )
-        """)
-    conn.commit()
 
 
 def _fetch_raw():
@@ -117,6 +106,12 @@ def fetch_injuries_espn():
         id_by_name.setdefault(_name_key(row["player_name"]),
                               (row["player_id"], row["player_name"]))
 
+    # ESPN is a fresh snapshot too: drop the rows ESPN previously owned so a
+    # player ESPN no longer lists (recovered/activated) stops downgrading. Rows
+    # owned by balldontlie are left for the upsert to override as appropriate.
+    conn.execute("DELETE FROM injuries WHERE source = 'espn'")
+    conn.commit()
+
     stored, unmatched = 0, 0
     conn.execute("BEGIN")
     for name, status, comment in _flatten(payload):
@@ -125,12 +120,8 @@ def fetch_injuries_espn():
             unmatched += 1
             continue
         pid, db_name = hit
-        conn.execute(
-            "INSERT OR REPLACE INTO injuries "
-            "(player_id, player_name, status, description, fetched_at) "
-            "VALUES (?,?,?,?,?)",
-            (int(pid), db_name, status, comment, _now()))
-        stored += 1
+        if upsert_injury(conn, pid, db_name, status, comment, _now(), "espn"):
+            stored += 1
     conn.commit()
     conn.close()
     print(f"ESPN: stored {stored} injuries (matched to our players); "
