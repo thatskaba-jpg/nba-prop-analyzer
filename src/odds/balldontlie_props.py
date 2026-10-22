@@ -126,14 +126,36 @@ def _resolve_names_via_api(player_ids):
     return out
 
 
-def _todays_game_ids():
+def _todays_game_ids(date_iso=None):
     try:
         from database import nba_today
-        today = nba_today()
+        today = date_iso or nba_today()
     except Exception:
-        today = date.today().isoformat()
+        today = date_iso or date.today().isoformat()
     rows = _get_all("v1/games", {"dates[]": today, "per_page": 100})
     return [g["id"] for g in rows]
+
+
+def games_on_date(date_iso):
+    """Scheduled NBA games for a date: [{matchup, home, away, status, time}].
+    Pure schedule (no odds) — works for any date the league has games. []
+    on error."""
+    try:
+        rows = _get_all("v1/games", {"dates[]": date_iso, "per_page": 100})
+    except Exception:
+        return []
+    out = []
+    for g in rows:
+        h = (g.get("home_team") or {}).get("abbreviation")
+        a = (g.get("visitor_team") or {}).get("abbreviation")
+        if not h or not a:
+            continue
+        out.append({
+            "matchup": f"{a} @ {h}", "home": h, "away": a,
+            "status": (g.get("status") or "").strip(),
+            "time": g.get("status") if ":" in str(g.get("status")) else None,
+        })
+    return out
 
 
 def _id_to_name():
@@ -145,8 +167,8 @@ def _id_to_name():
     return {r["player_id"]: r["player_name"] for r in rows}
 
 
-def all_player_props():
-    """Every player's over/under prop lines for today, as
+def all_player_props(date_iso=None):
+    """Every player's over/under prop lines for a date (default today), as
     {name_key: {prop_type: {line, odds_over, odds_under, books}}}.
 
     Raises BDLPropsError('rate limit') on a 429 so the dashboard can show the
@@ -158,7 +180,7 @@ def all_player_props():
     # player_id -> prop_type -> {lines, over, under, books}
     acc = defaultdict(lambda: defaultdict(
         lambda: {"lines": [], "over": [], "under": [], "books": set()}))
-    for gid in _todays_game_ids():
+    for gid in _todays_game_ids(date_iso):
         for p in _get_all("v2/odds/player_props", {"game_id": gid}):
             prop = _PROP_MAP.get(p.get("prop_type"))
             if not prop:

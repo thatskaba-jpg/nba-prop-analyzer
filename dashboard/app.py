@@ -749,6 +749,33 @@ def todays_keys():
 
 
 @st.cache_data(show_spinner=False, ttl=900)
+def cached_games_on_date(date_iso):
+    """Scheduled NBA games for a date (matchup/home/away/status). Cached 15 min.
+    [] on error. Works for any date — pure schedule, no odds needed."""
+    try:
+        from odds.balldontlie_props import games_on_date
+        return games_on_date(date_iso)
+    except Exception:
+        return []
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_prop_keys_for_date(date_iso):
+    """Normalized name-keys of players who have OVER/UNDER props posted for a
+    date (balldontlie). Empty when books haven't posted props yet (future days)
+    — the caller treats empty as 'props not up', not 'no players'. Cached 15
+    min; deadline-bounded so a slow feed can't hang the tab."""
+    def _build():
+        from odds.balldontlie_props import all_player_props
+        props = all_player_props(date_iso) or {}
+        return set(props.keys())
+    try:
+        return _with_deadline(_build, seconds=6, default=set()) or set()
+    except Exception:
+        return set()
+
+
+@st.cache_data(show_spinner=False, ttl=900)
 def cached_all_props():
     """Bulk prop lines for today, cached 15 min so a full evening of research
     barely touches the API (and rarely trips the free-tier rate limit). Lines
@@ -1610,21 +1637,62 @@ else:
     with tab1:
         players = player_list()
 
-        # Optional filter: only players in today's games (props posted).
-        tkeys = todays_keys()
-        if tkeys:
-            only_today = st.checkbox(
-                f"Only players in today's games ({len(tkeys)} posted)",
-                value=True)
-            if only_today:
+        # ---- DATE SELECTOR: pick a day, see its NBA games, auto-filter the
+        # player list to players with props posted that day (like the NBA app's
+        # scoreboard). Props post near tip-off, so future days show games but
+        # may have no props yet — we say so rather than hiding players. --------
+        import datetime as _da
+        from database import nba_today as _nt
+        _today_iso = _nt()
+        _tdate = _da.date.fromisoformat(_today_iso)
+        # Week window: Sunday..Saturday containing today (NBA app style strip).
+        _sun = _tdate - _da.timedelta(days=(_tdate.weekday() + 1) % 7)
+        _week = [_sun + _da.timedelta(days=i) for i in range(7)]
+        _dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        if "analyze_date" not in st.session_state:
+            st.session_state["analyze_date"] = _today_iso
+        st.caption("📅 **Pick a day** — see its NBA games; if the books have "
+                   "posted props, the player list auto-filters to who's playing.")
+        _cols = st.columns(7)
+        for _i, _dt in enumerate(_week):
+            _iso = _dt.isoformat()
+            _lbl = f"{_dow[_i]}\n{_dt.month}/{_dt.day}"
+            _is_sel = st.session_state["analyze_date"] == _iso
+            if _cols[_i].button(("🔵 " if _is_sel else "") + _lbl,
+                                key=f"dsel_{_iso}", use_container_width=True):
+                st.session_state["analyze_date"] = _iso
+                st.rerun()
+        sel_date = st.session_state["analyze_date"]
+
+        # Show that day's games as a compact strip.
+        _games = cached_games_on_date(sel_date)
+        if _games:
+            _mu = " · ".join(gg["matchup"] for gg in _games)
+            st.caption(f"🏀 **{len(_games)} game"
+                       f"{'s' if len(_games) != 1 else ''}** on {sel_date}:  "
+                       f"{_mu}")
+        else:
+            st.caption(f"No NBA games scheduled on {sel_date}.")
+
+        # Player filter: players with props posted for the SELECTED date.
+        pkeys = cached_prop_keys_for_date(sel_date)
+        if pkeys:
+            only_games = st.checkbox(
+                f"Only players with props posted on {sel_date} "
+                f"({len(pkeys)} players)", value=True)
+            if only_games:
                 def _nk(s):
                     return "".join(c for c in s.lower() if c.isalnum())
-                filtered = [p for p in players if _nk(p[0]) in tkeys]
+                filtered = [p for p in players if _nk(p[0]) in pkeys]
                 if filtered:
                     players = filtered
                 else:
-                    st.caption("No roster matches to today's posted players — "
+                    st.caption("No roster matches to the posted players — "
                                "showing everyone.")
+        elif _games:
+            st.caption("📋 Books haven't posted props for this day yet (they go "
+                       "up closer to tip-off). Showing the full player list — "
+                       "you can still project any player manually.")
 
         names = [p[0] for p in players]
         id_of = dict(players)
