@@ -1659,23 +1659,28 @@ else:
         from database import nba_today as _nt
         _today_iso = _nt()
         _tdate = _da.date.fromisoformat(_today_iso)
-        # Week window: Sunday..Saturday containing today (NBA app style strip).
-        _sun = _tdate - _da.timedelta(days=(_tdate.weekday() + 1) % 7)
-        _week = [_sun + _da.timedelta(days=i) for i in range(7)]
-        _dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        # Window: TODAY + the next 6 days (no past dates — you can't bet them).
+        _week = [_tdate + _da.timedelta(days=i) for i in range(7)]
+        _dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         if "analyze_date" not in st.session_state:
             st.session_state["analyze_date"] = _today_iso
+
+        def _pick_date(_iso):
+            # Callback: runs BEFORE the rerun, so Streamlit keeps the Analyze
+            # tab active (st.rerun() would reset to the first tab).
+            st.session_state["analyze_date"] = _iso
+
         st.caption("📅 **Pick a day** — see its NBA games; if the books have "
                    "posted props, the player list auto-filters to who's playing.")
         _cols = st.columns(7)
         for _i, _dt in enumerate(_week):
             _iso = _dt.isoformat()
-            _lbl = f"{_dow[_i]}\n{_dt.month}/{_dt.day}"
+            _day = "Today" if _iso == _today_iso else _dow[_dt.weekday()]
+            _lbl = f"{_day}\n{_dt.month}/{_dt.day}"
             _is_sel = st.session_state["analyze_date"] == _iso
-            if _cols[_i].button(("🔵 " if _is_sel else "") + _lbl,
-                                key=f"dsel_{_iso}", use_container_width=True):
-                st.session_state["analyze_date"] = _iso
-                st.rerun()
+            _cols[_i].button(("🔵 " if _is_sel else "") + _lbl,
+                             key=f"dsel_{_iso}", use_container_width=True,
+                             on_click=_pick_date, args=(_iso,))
         sel_date = st.session_state["analyze_date"]
 
         # Show that day's games as a compact strip.
