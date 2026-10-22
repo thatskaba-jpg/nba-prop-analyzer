@@ -22,6 +22,23 @@ from pathlib import Path
 import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+
+# --- Always run FRESH code (no stale modules) ---------------------------------
+# Streamlit re-runs this script on every interaction but does NOT re-import an
+# already-imported module — so after we edit a file in src/, the running process
+# can keep serving the OLD version (the cause of every "cannot import name …" /
+# "only one profile shows" glitch during development). Purging our own src
+# packages from the import cache at the TOP of each run forces a clean re-import
+# of app code below, while leaving third-party packages (streamlit, pandas, …)
+# cached for speed. Set BOMBVEGAS_NO_RELOAD=1 to disable (e.g. a perf-sensitive
+# deploy where code never changes between runs).
+import os as _os  # noqa: E402
+if _os.getenv("BOMBVEGAS_NO_RELOAD", "").strip() not in ("1", "true", "yes"):
+    _OUR_PKGS = ("database", "features", "models", "odds", "collect")
+    for _m in [m for m in list(sys.modules)
+               if m.split(".")[0] in _OUR_PKGS]:
+        sys.modules.pop(_m, None)
+
 from database import get_connection  # noqa: E402
 from features.features import load_player_history  # noqa: E402
 from features.opponent_defense import defense_factors  # noqa: E402
@@ -2249,21 +2266,14 @@ else:
                  "compare it to the **real sportsbook line**, and flag where the "
                  "odds give you an edge. Same honest EV math as the prop tools.")
 
-        from models.game_model import project_game, cover_probability
-        # Reload game_model so a module cached from before the profiles were
-        # added (stale Streamlit process) refreshes to the current version —
-        # otherwise the selector can show only the fallback's single profile.
+        # Fresh code is guaranteed by the top-of-file module purge, so a plain
+        # import always gets the current version. Keep a tiny fallback only so
+        # the tab still renders if game_model ever fails to import outright.
         try:
-            import importlib
-            import models.game_model as _gm
-            importlib.reload(_gm)
-            GAME_PROFILES = _gm.GAME_PROFILES
-            DEFAULT_PROFILE = _gm.DEFAULT_PROFILE
-            GAME_PROFILE_DESC = getattr(_gm, "GAME_PROFILE_DESC", {})
-            project_game = _gm.project_game
-            cover_probability = _gm.cover_probability
+            from models.game_model import (project_game, cover_probability,
+                                            GAME_PROFILES, DEFAULT_PROFILE,
+                                            GAME_PROFILE_DESC)
         except Exception:
-            # Last-resort fallback so the tab still renders.
             GAME_PROFILES = {"Balanced": {"home_edge": 2.5, "margin_std": 12.0,
                                           "net_scale": 1.0, "pace_gain": 1.0}}
             DEFAULT_PROFILE = "Balanced"
