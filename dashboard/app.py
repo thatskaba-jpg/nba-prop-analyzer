@@ -118,7 +118,7 @@ except Exception:
         return None
 from backtest.backtest import run_backtest  # noqa: E402
 
-st.set_page_config(page_title="NBA Prop Helper", page_icon="🏀", layout="wide")
+st.set_page_config(page_title="Bomb Vegas · Prop Analyzer", page_icon="💣", layout="wide")
 
 # --- Styling: MODERN MONOCHROME — near-black, layered greys, crisp white
 #     accent. Minimal, high-contrast, premium. No color, all contrast. ---
@@ -159,13 +159,25 @@ div[data-testid="stMetric"] label { color:var(--muted) !important; font-size:.72
 div[data-testid="stMetricValue"] { font-size:1.9rem; font-weight:900;
     color:#fff; letter-spacing:-.03em; }
 
-/* ---- Buttons: white fill, invert to outline on hover ---- */
-div.stButton > button {
-    background:var(--accent); color:#0c0c0d; border:1px solid var(--accent);
+/* ---- Buttons (ALL: main, sidebar, form, download): white fill, DARK text,
+   invert to outline on hover. The !important dark color stops any button from
+   rendering white-on-white (invisible). ---- */
+div.stButton > button, div.stDownloadButton > button,
+section[data-testid="stSidebar"] button[kind],
+div[data-testid="stForm"] button {
+    background:var(--accent) !important; color:#0c0c0d !important;
+    border:1px solid var(--accent) !important;
     border-radius:12px; font-weight:800; padding:.55rem 1.3rem; letter-spacing:-.01em;
     box-shadow:0 8px 24px -14px #fff; transition:all .14s ease; }
-div.stButton > button:hover { background:transparent; color:var(--accent);
+div.stButton > button *, div.stDownloadButton > button *,
+section[data-testid="stSidebar"] button[kind] * {
+    color:#0c0c0d !important; }
+div.stButton > button:hover, div.stDownloadButton > button:hover,
+section[data-testid="stSidebar"] button[kind]:hover {
+    background:transparent !important; color:var(--accent) !important;
     box-shadow:none; }
+div.stButton > button:hover *, section[data-testid="stSidebar"] button[kind]:hover * {
+    color:var(--accent) !important; }
 div.stButton > button:active { transform:translateY(1px); }
 
 /* ---- Tabs: soft segmented control, white active ---- */
@@ -875,10 +887,10 @@ if chosen:
 # --------------------------------------------------------------------------- #
 st.markdown("""
 <div class="sb-hero">
-  <span class="sb-pill">NBA · Player Props</span>
-  <h1>Prop Analyzer</h1>
-  <p>Project a stat line, estimate the Over/Under chance, and — with your odds —
-     see if it's a good deal. Shop every book for the edge.</p>
+  <span class="sb-pill">💣 NBA · Player Props</span>
+  <h1>Bomb Vegas <span style="color:var(--muted);font-weight:700;">· Prop Analyzer</span></h1>
+  <p>Your edge, every night. Stat projections, Over/Under reads, and the best
+     price across 8 books. 💣</p>
 </div>
 """, unsafe_allow_html=True)
 
