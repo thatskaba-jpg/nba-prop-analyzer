@@ -1687,6 +1687,12 @@ else:
 
         gl_date = st.date_input("Game date", _d5.date.today(),
                                 help="Lines appear closer to tip-off.").isoformat()
+        if st.button("🔄 Refresh games"):
+            # Clear the 15-min caches so a stale earlier pull (fewer games)
+            # can't keep showing — forces a fresh fetch of lines + schedule.
+            cached_game_lines.clear()
+            cached_schedule.clear()
+            st.rerun()
         lines = cached_game_lines(gl_date)
         ratings = goat_team_ratings(2025)
 
@@ -1705,21 +1711,18 @@ else:
             open_games = [m for m in games if _game_not_started(sched.get(m, ""))]
             live_games = [m for m in games if m not in open_games]
 
-            # Plain-language headline: how many of the full slate are still
-            # bettable (not tipped off) vs. already underway/finished.
+            # Plain-language headline: lead with how many games are SHOWN so it
+            # never looks like fewer are displayed, then the open/live split.
             if total_sched:
-                msg = (f"**{len(open_games)} of {total_sched} games still open** "
-                       f"(not tipped off yet) on {gl_date}.")
-                if live_games:
-                    msg += (f" {len(live_games)} already underway or final — "
-                            "shown with a 🔴 LIVE tag (pre-game lines only; "
-                            "you usually can't place a pre-game bet once it tips).")
+                msg = (f"**Showing {len(games)} game"
+                       f"{'s' if len(games) != 1 else ''}** on {gl_date}"
+                       f" — {len(open_games)} open (not tipped off), "
+                       f"{len(live_games)} live/final.")
                 if total_sched > len(games):
-                    msg += (f" {total_sched - len(games)} game"
-                            f"{'s' if total_sched - len(games) != 1 else ''} "
-                            "have no posted line yet.")
-                st.caption(msg + " Our model vs the market — ✅ means our "
-                           "estimate beats the price.")
+                    msg += (f" {total_sched - len(games)} more scheduled with no "
+                            "line posted yet.")
+                st.caption(msg + " 🔴 LIVE = pre-game line only (can't bet once "
+                           "tipped). ✅ means our estimate beats the price.")
             else:
                 st.caption(f"{len(games)} game(s) with lines on {gl_date}. "
                            "Our model vs the market — ✅ means our estimate "

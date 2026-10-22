@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0e14">
+<title>SmackedEm · Props</title>
+<style>
+  :root{
+    --bg:#0a0e14; --surface:#121824; --surface2:#19202e; --line:#232c3d;
+    --text:#eef2f7; --muted:#8b97a8; --accent:#6c5ce7; --accent2:#00d2ff;
+    --green:#2ec27e; --red:#ff5c6c; --radius:18px;
+    --grad:linear-gradient(135deg,#6c5ce7 0%,#00d2ff 100%);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;}
+  body{max-width:520px;margin:0 auto;min-height:100vh;padding-bottom:92px;position:relative;}
+
+  /* ---- top app bar ---- */
+  .appbar{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);
+    background:rgba(10,14,20,.82);border-bottom:1px solid var(--line);
+    padding:16px 20px 12px;display:flex;align-items:center;gap:10px;}
+  .appbar .logo{width:34px;height:34px;border-radius:10px;background:var(--grad);
+    display:grid;place-items:center;font-size:18px;box-shadow:0 4px 16px rgba(108,92,231,.5);}
+  .appbar h1{font-size:1.15rem;font-weight:800;margin:0;letter-spacing:-.02em;}
+  .appbar .sub{font-size:.72rem;color:var(--muted);margin-top:1px;}
+
+  .screen{padding:16px 16px 0;animation:fade .25s ease;}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .hide{display:none;}
+  .sec-title{font-size:.78rem;text-transform:uppercase;letter-spacing:.1em;
+    color:var(--muted);font-weight:700;margin:4px 2px 10px;}
+
+  /* ---- cards ---- */
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px;margin-bottom:14px;box-shadow:0 8px 24px -12px rgba(0,0,0,.6);}
+  .field{margin-bottom:12px;}
+  .field label{display:block;font-size:.74rem;color:var(--muted);font-weight:600;
+    text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;}
+  select,input{width:100%;background:var(--bg);border:1px solid var(--line);
+    color:var(--text);border-radius:12px;padding:13px 14px;font-size:1rem;
+    appearance:none;font-family:inherit;}
+  select:focus,input:focus{outline:none;border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(108,92,231,.25);}
+  .row{display:flex;gap:10px;}
+  .row>*{flex:1;}
+  .seg{display:flex;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:4px;}
+  .seg button{flex:1;background:none;border:none;color:var(--muted);font-weight:700;
+    padding:10px;border-radius:9px;font-size:.9rem;cursor:pointer;font-family:inherit;}
+  .seg button.on{background:var(--grad);color:#fff;}
+  .btn{width:100%;background:var(--grad);border:none;color:#fff;font-weight:800;
+    font-size:1rem;padding:15px;border-radius:14px;cursor:pointer;margin-top:4px;
+    box-shadow:0 8px 24px -8px rgba(108,92,231,.7);font-family:inherit;}
+  .btn:active{transform:translateY(1px);}
+  .btn.ghost{background:transparent;border:1px solid var(--accent);color:var(--accent);box-shadow:none;}
+
+  /* ---- bet-slip result ---- */
+  .slip{background:linear-gradient(165deg,var(--surface2),var(--surface));
+    border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;margin-bottom:14px;}
+  .slip .top{padding:18px 18px 12px;}
+  .slip .player{font-size:1.3rem;font-weight:800;letter-spacing:-.02em;}
+  .slip .meta{color:var(--muted);font-size:.85rem;margin-top:2px;}
+  .bignum{display:flex;align-items:baseline;gap:8px;margin:12px 0 4px;}
+  .bignum .proj{font-size:2.6rem;font-weight:900;letter-spacing:-.03em;
+    background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;}
+  .bignum .vs{color:var(--muted);font-size:.95rem;}
+  .pick{display:inline-flex;align-items:center;gap:6px;font-weight:800;
+    padding:6px 12px;border-radius:999px;font-size:.9rem;margin-top:6px;}
+  .pick.over{background:rgba(46,194,126,.16);color:var(--green);}
+  .pick.under{background:rgba(255,92,108,.16);color:var(--red);}
+  .verdict{padding:14px 18px;font-size:.92rem;font-weight:600;border-top:1px solid var(--line);}
+  .verdict.good{background:rgba(46,194,126,.1);color:var(--green);}
+  .verdict.bad{background:rgba(255,92,108,.08);color:#ffb3ba;}
+  .verdict.meh{background:var(--surface2);color:var(--muted);}
+
+  /* ---- gap / game cards ---- */
+  .gap{display:flex;justify-content:space-between;align-items:center;
+    padding:14px 16px;background:var(--surface);border:1px solid var(--line);
+    border-radius:14px;margin-bottom:10px;}
+  .gap .who{font-weight:700;}
+  .gap .who small{display:block;color:var(--muted);font-weight:500;font-size:.78rem;margin-top:2px;}
+  .gap .spread{text-align:right;}
+  .gap .spread b{font-size:1.25rem;background:var(--grad);-webkit-background-clip:text;
+    background-clip:text;color:transparent;}
+  .gap .spread small{display:block;color:var(--muted);font-size:.72rem;}
+  .books{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;}
+  .chip{background:var(--bg);border:1px solid var(--line);border-radius:8px;
+    padding:5px 9px;font-size:.78rem;color:var(--muted);}
+  .chip b{color:var(--text);}
+  .chip.best{border-color:var(--green);color:var(--green);}
+
+  /* ---- bottom tab nav ---- */
+  .nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;
+    max-width:520px;background:rgba(10,14,20,.9);backdrop-filter:blur(16px);
+    border-top:1px solid var(--line);display:flex;padding:8px 8px calc(8px + env(safe-area-inset-bottom));z-index:30;}
+  .nav button{flex:1;background:none;border:none;color:var(--muted);
+    display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px;
+    font-size:.68rem;font-weight:600;cursor:pointer;font-family:inherit;}
+  .nav button .ic{font-size:1.25rem;}
+  .nav button.on{color:var(--text);}
+  .nav button.on .ic{transform:translateY(-1px);filter:drop-shadow(0 4px 10px rgba(108,92,231,.6));}
+
+  .loading{text-align:center;color:var(--muted);padding:30px;font-size:.9rem;}
+  .spinner{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--accent);
+    border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .muted{color:var(--muted);font-size:.85rem;line-height:1.5;}
+</style>
+</head>
+<body>
+  <div class="appbar">
+    <div class="logo">🏀</div>
+    <div>
+      <h1>SmackedEm</h1>
+      <div class="sub">NBA props · research terminal</div>
+    </div>
+  </div>
+
+  <!-- ===== ANALYZE ===== -->
+  <section id="s-analyze" class="screen">
+    <div class="sec-title">Analyze a prop</div>
+    <div class="card">
+      <div class="field"><label>Player</label><select id="player"></select></div>
+      <div class="row">
+        <div class="field"><label>Stat</label><select id="stat"></select></div>
+        <div class="field"><label>Line</label><input id="line" type="number" step="0.5" value="25.5"></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Over odds</label><input id="oo" type="number" step="5" value="-110"></div>
+        <div class="field"><label>Under odds</label><input id="uo" type="number" step="5" value="-110"></div>
+      </div>
+      <button class="btn" onclick="runAnalyze()">Analyze</button>
+    </div>
+    <div id="analyze-out"></div>
+  </section>
+
+  <!-- ===== GAME LINES ===== -->
+  <section id="s-games" class="screen hide">
+    <div class="sec-title">Game lines · ML + spread</div>
+    <div id="games-out"><div class="loading"><div class="spinner"></div>Loading tonight's games…</div></div>
+  </section>
+
+  <!-- ===== LINE SHOPPING ===== -->
+  <section id="s-shop" class="screen hide">
+    <div class="sec-title">Line shopping · best price across books</div>
+    <div class="seg" style="margin-bottom:12px">
+      <button id="shop-top" class="on" onclick="shopMode('top')">Top 10 gaps</button>
+      <button id="shop-player" onclick="shopMode('player')">By player</button>
+    </div>
+    <div id="shop-player-pick" class="field hide"><label>Player</label><select id="shop-sel" onchange="loadShop()"></select></div>
+    <div id="shop-out"><div class="loading"><div class="spinner"></div>Comparing books…</div></div>
+  </section>
+
+  <!-- ===== bottom nav ===== -->
+  <nav class="nav">
+    <button id="n-analyze" class="on" onclick="go('analyze')"><span class="ic">🎯</span>Analyze</button>
+    <button id="n-games" onclick="go('games')"><span class="ic">🏀</span>Games</button>
+    <button id="n-shop" onclick="go('shop')"><span class="ic">🛒</span>Shop</button>
+  </nav>
+
+<script>
+// API base: same origin in production; localhost:8000 when opening the file in dev.
+const API = (location.protocol==='file:'||location.port==='') && !location.pathname.includes('api')
+  ? 'http://127.0.0.1:8000' : '';
+const api = (p)=>fetch(API+p).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();});
+const apiPost = (p,b)=>fetch(API+p,{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(b)}).then(r=>r.json());
+
+let loaded={games:false,shop:false};
+
+function go(tab){
+  ['analyze','games','shop'].forEach(t=>{
+    document.getElementById('s-'+t).classList.toggle('hide',t!==tab);
+    document.getElementById('n-'+t).classList.toggle('on',t===tab);
+  });
+  if(tab==='games'&&!loaded.games){loaded.games=true;loadGames();}
+  if(tab==='shop'&&!loaded.shop){loaded.shop=true;loadShopPlayers();loadShop();}
+}
+
+// ---- Analyze ----
+async function initAnalyze(){
+  const [players,stats]=await Promise.all([api('/api/players'),api('/api/stats')]);
+  const p=document.getElementById('player');
+  players.forEach(x=>{const o=document.createElement('option');o.value=x.id;o.textContent=x.name;p.appendChild(o);});
+  const s=document.getElementById('stat');
+  stats.forEach(x=>{const o=document.createElement('option');o.value=x.key;o.textContent=x.label;s.appendChild(o);});
+}
+async function runAnalyze(){
+  const out=document.getElementById('analyze-out');
+  out.innerHTML='<div class="loading"><div class="spinner"></div>Crunching…</div>';
+  try{
+    const r=await apiPost('/api/analyze',{
+      player_id:+document.getElementById('player').value,
+      prop_type:document.getElementById('stat').value,
+      line:+document.getElementById('line').value,
+      odds_over:+document.getElementById('oo').value,
+      odds_under:+document.getElementById('uo').value});
+    if(r.detail){out.innerHTML=`<div class="card muted">${r.detail}</div>`;return;}
+    const name=document.getElementById('player').selectedOptions[0].textContent;
+    const vcls=r.is_value&&r.recommended_side===r.lean.toLowerCase()?'good':
+      (r.ev_over_pct<0&&r.ev_under_pct<0?'bad':'meh');
+    const ev=r.lean==='OVER'?r.ev_over_pct:r.ev_under_pct;
+    const vtxt=vcls==='good'?`✅ Good deal — about +${Math.abs(ev).toFixed(0)}% value over time`
+      :vcls==='bad'?`⚠️ Negative value — the price is worse than our estimate`
+      :`No clear edge — roughly fair pricing`;
+    out.innerHTML=`<div class="slip"><div class="top">
+      <div class="player">${name}</div>
+      <div class="meta">${r.prop_label} · line ${r.line}</div>
+      <div class="bignum"><span class="proj">${r.projection}</span><span class="vs">projected vs ${r.line}</span></div>
+      <span class="pick ${r.lean.toLowerCase()}">${r.lean} · ${r.win_pct}% likely</span>
+    </div><div class="verdict ${vcls}">${vtxt}</div></div>`;
+  }catch(e){out.innerHTML=`<div class="card muted">Couldn't analyze (${e.message}). The data API may still be waking up — try again.</div>`;}
+}
+
+// ---- Games ----
+async function loadGames(){
+  const out=document.getElementById('games-out');
+  try{
+    const g=await api('/api/game-lines');
+    if(!g.length){out.innerHTML='<div class="card muted">No game lines posted yet — they fill in closer to tip-off.</div>';return;}
+    out.innerHTML=g.map(x=>`<div class="gap"><div class="who">${x.matchup}
+      <small>${x.proj_margin!=null?`we project ${x.proj_margin>0?x.home:x.away} by ${Math.abs(x.proj_margin)} · ${x.p_home_win}% ${x.home}`:'projection n/a'}</small></div>
+      <div class="spread"><b>${x.spread!=null?(x.spread>0?'+':'')+x.spread:'—'}</b>
+      <small>total ${x.total??'—'}</small></div></div>`).join('');
+  }catch(e){out.innerHTML=`<div class="card muted">Couldn't load games (${e.message}).</div>`;}
+}
+
+// ---- Line shopping ----
+let shopKind='top';
+function shopMode(k){
+  shopKind=k;
+  document.getElementById('shop-top').classList.toggle('on',k==='top');
+  document.getElementById('shop-player').classList.toggle('on',k==='player');
+  document.getElementById('shop-player-pick').classList.toggle('hide',k!=='player');
+  loadShop();
+}
+async function loadShopPlayers(){
+  try{const names=await api('/api/line-shopping/players');
+    const s=document.getElementById('shop-sel');s.innerHTML='';
+    names.forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;s.appendChild(o);});
+  }catch(e){}
+}
+async function loadShop(){
+  const out=document.getElementById('shop-out');
+  out.innerHTML='<div class="loading"><div class="spinner"></div>Comparing books…</div>';
+  try{
+    let url='/api/line-shopping?limit=10';
+    if(shopKind==='player'){const who=document.getElementById('shop-sel').value;
+      if(!who){out.innerHTML='<div class="card muted">No players loaded yet.</div>';return;}
+      url='/api/line-shopping?player='+encodeURIComponent(who);}
+    const gaps=await api(url);
+    if(!gaps.length){out.innerHTML='<div class="card muted">No cross-book props posted yet, or the feed is busy. Try again in a minute.</div>';return;}
+    out.innerHTML=gaps.map(g=>`<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="who"><b>${g.player}</b><small style="color:var(--muted);display:block">${g.prop_label}</small></div>
+        <div class="spread" style="text-align:right"><b style="font-size:1.2rem;color:var(--accent2)">${g.line_spread} pt gap</b>
+        <small style="color:var(--muted);display:block">consensus ${g.consensus_line}</small></div>
+      </div>
+      <div class="books">
+        <div class="chip best">OVER ${g.best_over.line} @ ${g.best_over.odds??'—'} · <b>${g.best_over.book}</b></div>
+        <div class="chip best">UNDER ${g.best_under.line} @ ${g.best_under.odds??'—'} · <b>${g.best_under.book}</b></div>
+      </div></div>`).join('');
+  }catch(e){out.innerHTML=`<div class="card muted">Couldn't load (${e.message}).</div>`;}
+}
+
+initAnalyze();
+</script>
+</body>
+</html>
