@@ -202,6 +202,16 @@ div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:14px
     background:var(--panel); overflow:hidden; transition:border-color .14s ease; }
 div[data-testid="stExpander"]:hover { border-color:var(--line-2); }
 
+/* ---- Multiselect / selected tags: dark pill, READABLE white text ----
+   (the generic input rule was turning these white-on-white — invisible) ---- */
+span[data-baseweb="tag"] {
+    background:var(--raise) !important; color:var(--text) !important;
+    border:1px solid var(--line-2) !important; border-radius:8px !important; }
+span[data-baseweb="tag"] span { color:var(--text) !important; }
+span[data-baseweb="tag"] svg { fill:var(--text) !important; }
+/* the multiselect box itself */
+div[data-baseweb="select"] div[data-baseweb="tag"] { font-weight:600; }
+
 /* ---- Alerts ---- */
 div[data-testid="stAlert"] { border-radius:12px; border:1px solid var(--line);
     background:var(--panel) !important; }
