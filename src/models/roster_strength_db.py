@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from database import get_connection  # noqa: E402
 
 _K = 9.0
-_OFF_LO, _OFF_HI = 95.0, 125.0
+_OFF_LO, _OFF_HI = 108.0, 122.0   # realistic NBA team-points spread (rescaled)
 _DEF_LO, _DEF_HI = 104.0, 120.0
 
 
@@ -61,7 +61,7 @@ def team_strength_map(season=None):
                    SUM(CASE WHEN l.season = ? THEN 1 ELSE 0 END)   AS g_cur
             FROM player_teams pt
             JOIN player_game_logs l ON l.player_name = pt.player_name
-            WHERE l.season IN (?, ?)
+            WHERE l.season IN (?, ?) AND l.minutes > 0
             GROUP BY pt.team, pt.player_name
             """,
             (season, prev, season, prev, season, season, prev),
@@ -101,13 +101,26 @@ def team_strength_map(season=None):
                           key=lambda x: x[1], reverse=True)[:10]
         if not rotation:
             rotation = sorted(scored, key=lambda x: x[1], reverse=True)[:8]
-        off = max(_OFF_LO, min(_OFF_HI, sum(p for p, _ in rotation)))
+        raw_off = sum(p for p, _ in rotation)   # rescaled across the league below
         stk = (sum(stks) / len(stks)) if stks else 1.3
         reb = (sum(rebs) / len(rebs)) if rebs else 4.0
         deff = max(_DEF_LO, min(_DEF_HI,
                                113.0 - (stk - 1.3) * 4.0 - (reb - 4.0) * 1.2))
-        out[team] = {"off": round(off, 1), "def": round(deff, 1),
+        out[team] = {"off_raw": raw_off, "def": round(deff, 1),
                      "pace": 100.0, "players": len(scored)}
+
+    # Rescale raw rotation sums (which overshoot real team totals because the
+    # top-10 minutes exceed one game's 240) LINEARLY into a realistic team-
+    # points band, preserving the league's spread so strong/weak teams stay
+    # distinct instead of clipping together at a ceiling.
+    if out:
+        raws = [v["off_raw"] for v in out.values()]
+        lo_r, hi_r = min(raws), max(raws)
+        span = (hi_r - lo_r) or 1.0
+        for v in out.values():
+            frac = (v["off_raw"] - lo_r) / span          # 0..1 across the league
+            v["off"] = round(_OFF_LO + frac * (_OFF_HI - _OFF_LO), 1)
+            del v["off_raw"]
     return out
 
 
