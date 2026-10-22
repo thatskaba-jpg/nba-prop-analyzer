@@ -2370,13 +2370,12 @@ else:
 
             # ---- Day-by-day profile success rate (builds over the season) ----
             with st.expander("📈 Profile track record (builds day by day)"):
+                board, _sb_err = [], None
                 try:
-                    from models.profile_scoreboard import (update_scoreboard,
-                                                           get_scoreboard)
-                    update_scoreboard(_season)   # grade any new finished games
-                    board = get_scoreboard()
-                except Exception:
-                    board = []
+                    from models.profile_scoreboard import compute_live_scoreboard
+                    board = compute_live_scoreboard(_season)
+                except Exception as _e:
+                    _sb_err = str(_e)
                 if board:
                     import pandas as _pd
                     sb = _pd.DataFrame(
@@ -2387,12 +2386,13 @@ else:
                          for n, c, t, pct in board])
                     st.dataframe(sb, use_container_width=True, hide_index=True)
                     st.caption("Straight-up winner accuracy, graded from final "
-                               "scores as games finish. The list grows every "
-                               "night — small samples early, so give it time "
-                               "before trusting the ranking.")
+                               "scores as games finish. Grows every night — "
+                               "small samples early, so give it time.")
+                elif _sb_err:
+                    st.caption(f"Couldn't grade yet: {_sb_err}")
                 else:
-                    st.caption("No graded games yet — this fills in as tonight's "
-                               "(and future) games go final.")
+                    st.caption("No finished games in the feed yet — fills in as "
+                               "games go final.")
 
             # Show open (bettable) games first, then live/final ones.
             ordered = open_games + live_games

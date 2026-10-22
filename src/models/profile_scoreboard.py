@@ -134,6 +134,34 @@ def _finished_games_live(days_back=14):
     return out
 
 
+def compute_live_scoreboard(season=2026, days_back=30):
+    """Grade every profile straight from the LIVE feed, IN MEMORY — no file I/O.
+    Returns [(profile, correct, total, pct), ...] sorted best-first. This always
+    works even on a read-only filesystem (Streamlit Cloud), so the display never
+    depends on a successful JSON write."""
+    ratings = _blend_ratings(season)
+    games = _finished_games_live(days_back)
+    tally = {}
+    for gid, gdate, home, away, hp, ap in games:
+        home_won = hp > ap
+        for pname, prof in GAME_PROFILES.items():
+            proj = project_game(home, away, ratings, prof)
+            if not proj:
+                continue
+            rec = tally.setdefault(pname, [0, 0])  # [correct, total]
+            rec[1] += 1
+            if (proj["exp_margin"] > 0) == home_won:
+                rec[0] += 1
+    rows = [(n, c, t, (c / t if t else 0.0)) for n, (c, t) in tally.items()]
+    rows.sort(key=lambda x: (-x[3], -x[2]))
+    # Best-effort persist for longer history; never let a write break the view.
+    try:
+        update_scoreboard(season)
+    except Exception:
+        pass
+    return rows
+
+
 def _load():
     if _SCORE_PATH.exists():
         try:
