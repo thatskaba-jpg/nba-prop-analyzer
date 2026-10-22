@@ -75,6 +75,38 @@
   .verdict.bad{background:rgba(255,92,108,.08);color:#ffb3ba;}
   .verdict.meh{background:var(--surface2);color:var(--muted);}
 
+  /* ---- star rating + window pills ---- */
+  .stars{margin-top:10px;color:#ffc93c;font-size:1.05rem;letter-spacing:2px;}
+  .stars small{color:var(--muted);font-size:.72rem;letter-spacing:0;margin-left:6px;}
+  .wrow{display:flex;gap:7px;margin-top:12px;}
+  .wpill{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:10px;
+    padding:8px 4px;text-align:center;}
+  .wpill .wk{display:block;font-size:.66rem;color:var(--muted);letter-spacing:.08em;}
+  .wpill b{display:block;font-size:.95rem;margin:2px 0;}
+  .wpill small{font-size:.7rem;color:var(--green);font-weight:700;}
+
+  /* ---- hit-rate bar (BettingPros-style) ---- */
+  .hrwrap{margin-top:14px;}
+  .hrlabel{font-size:.72rem;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.06em;margin-bottom:6px;}
+  .hrlabel b{color:var(--text);}
+  .hrbar{display:flex;gap:4px;}
+  .hr{flex:1;text-align:center;font-size:.72rem;font-weight:700;padding:6px 0;
+    border-radius:6px;color:#0a0e14;}
+  .hr.o{background:var(--green);}
+  .hr.u{background:#39445a;color:var(--muted);}
+  /* ---- why section ---- */
+  details.why{border-top:1px solid var(--line);padding:0;}
+  details.why summary{padding:13px 18px;font-size:.85rem;font-weight:700;
+    color:var(--accent2);cursor:pointer;list-style:none;}
+  details.why summary::-webkit-details-marker{display:none;}
+  details.why summary::after{content:" ▾";color:var(--muted);}
+  details.why[open] summary::after{content:" ▴";}
+  .whyrow{display:flex;justify-content:space-between;padding:8px 18px;
+    font-size:.85rem;border-top:1px solid var(--line);}
+  .whyrow .up{color:var(--green);font-weight:700;}
+  .whyrow .dn{color:var(--red);font-weight:700;}
+
   /* ---- gap / game cards ---- */
   .gap{display:flex;justify-content:space-between;align-items:center;
     padding:14px 16px;background:var(--surface);border:1px solid var(--line);
@@ -191,12 +223,10 @@ async function runAnalyze(){
   const out=document.getElementById('analyze-out');
   out.innerHTML='<div class="loading"><div class="spinner"></div>Crunching…</div>';
   try{
-    const r=await apiPost('/api/analyze',{
-      player_id:+document.getElementById('player').value,
-      prop_type:document.getElementById('stat').value,
-      line:+document.getElementById('line').value,
-      odds_over:+document.getElementById('oo').value,
-      odds_under:+document.getElementById('uo').value});
+    const pid=+document.getElementById('player').value;
+    const stat=document.getElementById('stat').value;
+    const line=+document.getElementById('line').value;
+    const r=await api(`/api/player-card?player_id=${pid}&prop_type=${stat}&line=${line}`);
     if(r.detail){out.innerHTML=`<div class="card muted">${r.detail}</div>`;return;}
     const name=document.getElementById('player').selectedOptions[0].textContent;
     const vcls=r.is_value&&r.recommended_side===r.lean.toLowerCase()?'good':
@@ -205,12 +235,40 @@ async function runAnalyze(){
     const vtxt=vcls==='good'?`✅ Good deal — about +${Math.abs(ev).toFixed(0)}% value over time`
       :vcls==='bad'?`⚠️ Negative value — the price is worse than our estimate`
       :`No clear edge — roughly fair pricing`;
-    out.innerHTML=`<div class="slip"><div class="top">
-      <div class="player">${name}</div>
-      <div class="meta">${r.prop_label} · line ${r.line}</div>
-      <div class="bignum"><span class="proj">${r.projection}</span><span class="vs">projected vs ${r.line}</span></div>
-      <span class="pick ${r.lean.toLowerCase()}">${r.lean} · ${r.win_pct}% likely</span>
-    </div><div class="verdict ${vcls}">${vtxt}</div></div>`;
+    const dollars = r.ev_pick_pct!=null?`$${Math.abs(r.ev_pick_pct).toFixed(0)} / $100`:'';
+    // last-10 hit-rate bar (per-game)
+    const bars = (r.recent||[]).map(g=>
+      `<span class="hr ${g.over?'o':'u'}" title="${g.date} vs ${g.opp}: ${g.value}">${g.value}</span>`).join('');
+    // window pills: L5 / L10 / L15 / L25 over-win %
+    const win = r.windows||{};
+    const winPills = Object.keys(win).map(k=>
+      `<div class="wpill"><span class="wk">${k}</span><b>${win[k].hits}/${win[k].n}</b>
+       <small>${win[k].pct}%</small></div>`).join('');
+    // star rating
+    const stars = '★'.repeat(r.stars||0)+'☆'.repeat(5-(r.stars||0));
+    // collapsible why
+    const why = (r.reasons||[]).filter(x=>x.effect&&x.effect!=='no change').map(x=>
+      `<div class="whyrow"><span>${x.factor}</span>
+       <span class="${x.effect.includes('up')?'up':'dn'}">${x.effect.includes('up')?'▲':'▼'} ${x.effect}</span></div>`).join('')
+      || '<div class="muted" style="padding:4px 2px">Projection driven mainly by recent scoring.</div>';
+
+    out.innerHTML=`<div class="slip">
+      <div class="top">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+          <div><div class="player">${name}</div>
+            <div class="meta">${r.prop_label} · consensus ${r.line}</div></div>
+          <span class="pick ${r.lean.toLowerCase()}">${r.lean}</span>
+        </div>
+        <div class="bignum"><span class="proj">${r.projection}</span>
+          <span class="vs">proj · ${r.win_pct}% ${r.lean.toLowerCase()}</span></div>
+        <div class="stars" title="bet rating">${stars} <small>${r.stars}/5</small></div>
+        ${winPills?`<div class="wrow">${winPills}</div>`:''}
+        ${bars?`<div class="hrwrap"><div class="hrlabel">LAST ${r.recent_n} GAMES VS ${r.line}</div>
+          <div class="hrbar">${bars}</div></div>`:''}
+      </div>
+      <div class="verdict ${vcls}">${vtxt}${dollars?` · <b>${dollars}</b>`:''}</div>
+      <details class="why"><summary>Why this projection?</summary>${why}</details>
+    </div>`;
   }catch(e){out.innerHTML=`<div class="card muted">Couldn't analyze (${e.message}). The data API may still be waking up — try again.</div>`;}
 }
 

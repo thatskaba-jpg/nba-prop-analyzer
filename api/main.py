@@ -125,18 +125,107 @@ def analyze_prop(req: AnalyzeReq):
     ev = evaluate_prop(res["p_over"], res["p_under"],
                        int(req.odds_over), int(req.odds_under))
     lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
+
+    # ---- WHY: turn each raw adjustment into a plain sentence ----
+    import re as _re
+    reasons = []
+    for adj in (res.get("adjustments") or []):
+        name = adj.split("]")[0].lstrip("[").split(" w=")[0] if "]" in adj else adj
+        nums = _re.findall(r"\(([\d.]+) -> ([\d.]+)\)", adj)
+        before, after = (nums[-1] if nums else (None, None))
+        direction = ""
+        if before and after:
+            direction = ("nudges up" if float(after) > float(before)
+                         else "nudges down" if float(after) < float(before)
+                         else "no change")
+        reasons.append({"factor": name, "effect": direction,
+                        "from": float(before) if before else None,
+                        "to": float(after) if after else None})
+
+    # ---- HISTORY: last 10 games for this stat, vs the line ----
+    stat_col = {"points": "points", "rebounds": "rebounds", "assists": "assists",
+                "threes_made": "threes_made", "steals": "steals",
+                "blocks": "blocks", "turnovers": "turnovers"}.get(req.prop_type)
+    recent = []
+    hit_count = 0
+    if stat_col and stat_col in hist.columns:
+        tail = hist.tail(10)
+        for _, r in tail.iterrows():
+            val = r.get(stat_col)
+            if val is None:
+                continue
+            over = val > req.line
+            if over:
+                hit_count += 1
+            recent.append({"date": r.get("game_date"), "opp": r.get("opponent"),
+                           "value": float(val), "over": bool(over)})
+
+    # ---- dollar EV for the leaned side ----
+    ev_pick = ev.get("ev_over_pct") if lean == "OVER" else ev.get("ev_under_pct")
+    odds_pick = req.odds_over if lean == "OVER" else req.odds_under
     return {
         "player_id": req.player_id, "prop_type": req.prop_type,
         "prop_label": PROP_WORDS[req.prop_type], "line": req.line,
         "projection": round(res["projection"], 1),
+        "base_projection": res.get("base_projection"),
         "p_over": res["p_over"], "p_under": res["p_under"],
         "lean": lean,
         "win_pct": round((res["p_over"] if lean == "OVER" else res["p_under"]) * 100),
         "confidence": res.get("confidence", ""),
         "ev_over_pct": ev.get("ev_over_pct"), "ev_under_pct": ev.get("ev_under_pct"),
+        "ev_pick_pct": ev_pick, "odds_pick": odds_pick,
         "is_value": ev.get("is_value", False),
         "recommended_side": ev.get("recommended_side"),
+        "reasons": reasons,
+        "recent": recent,
+        "recent_hits": hit_count, "recent_n": len(recent),
     }
+
+
+def _hit_rate(hist, stat_col, line, n):
+    """Over hit-rate for the last n games of a stat vs a line."""
+    if stat_col not in hist.columns:
+        return None
+    tail = hist.tail(n)
+    vals = [v for v in tail[stat_col].tolist() if v is not None]
+    if not vals:
+        return None
+    overs = sum(1 for v in vals if v > line)
+    return {"hits": overs, "n": len(vals), "pct": round(overs / len(vals) * 100)}
+
+
+def _stars(ev_pct):
+    """0-5 bet rating from the leaned side's EV% (bigger edge = more stars)."""
+    if ev_pct is None:
+        return 0
+    e = abs(ev_pct)
+    return 5 if e >= 12 else 4 if e >= 8 else 3 if e >= 5 else 2 if e >= 2 else 1 if e > 0 else 0
+
+
+@app.get("/api/player-card")
+def player_card(player_id: int, prop_type: str, line: float):
+    """BettingPros-style single-prop analysis: projection, EV, star rating, and
+    multi-window hit-rates (L5/L10/L15/season) for one player + prop."""
+    if prop_type not in PROP_WORDS:
+        raise HTTPException(400, f"unknown prop_type '{prop_type}'")
+    hist = load_player_history(player_id)
+    if hist is None or len(hist) < 10:
+        raise HTTPException(404, "not enough history")
+    # Reuse the analyze endpoint's core via a direct call.
+    req = AnalyzeReq(player_id=player_id, prop_type=prop_type, line=line)
+    res = analyze_prop(req)
+    stat_col = {"points": "points", "rebounds": "rebounds", "assists": "assists",
+                "threes_made": "threes_made", "steals": "steals",
+                "blocks": "blocks", "turnovers": "turnovers"}.get(prop_type)
+    windows = {}
+    if stat_col:
+        for lbl, n in (("L5", 5), ("L10", 10), ("L15", 15), ("L25", 25)):
+            hr = _hit_rate(hist, stat_col, line, n)
+            if hr:
+                windows[lbl] = hr
+    res["windows"] = windows
+    res["stars"] = _stars(res.get("ev_pick_pct"))
+    return res
 
 
 @app.get("/api/line-shopping")
