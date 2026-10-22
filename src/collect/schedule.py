@@ -31,10 +31,15 @@ def upcoming_games(days_ahead: int = 8) -> list:
     Each item: {date, home, visitor} using team abbreviations. Only games still
     marked 'scheduled' (not final) are returned.
     """
-    today = date.today()
+    try:
+        from database import nba_today
+        today = date.fromisoformat(nba_today())
+    except Exception:
+        today = date.today()
     end = today + timedelta(days=days_ahead)
     out = []
     cursor = None
+    today_iso = today.isoformat()
     try:
         while True:
             params = {"seasons[]": CURRENT_SEASON, "per_page": 100,
@@ -44,10 +49,12 @@ def upcoming_games(days_ahead: int = 8) -> list:
                 params["cursor"] = cursor
             payload = _get("games", params)
             for g in payload.get("data", []):
-                if g.get("status_state") not in ("scheduled", None):
-                    # skip finished/in-progress; we only want upcoming
-                    if g.get("status_state") == "final":
-                        continue
+                gdate = (g.get("date") or "")[:10]
+                # Keep TODAY's games no matter their status (live/final) so the
+                # app can still surface tonight's matchup; for future days only
+                # keep games still scheduled.
+                if gdate != today_iso and g.get("status_state") == "final":
+                    continue
                 home = (g.get("home_team") or {}).get("abbreviation")
                 vis = (g.get("visitor_team") or {}).get("abbreviation")
                 if home and vis:
@@ -62,13 +69,36 @@ def upcoming_games(days_ahead: int = 8) -> list:
 
 
 def next_game_for_team(team_abbr: str, days_ahead: int = 8):
-    """Return (opponent_abbr, is_home) for `team_abbr`'s next scheduled game,
-    or None if there isn't one in the window."""
+    """Return (opponent_abbr, is_home) for `team_abbr`'s game.
+
+    Prefers TODAY's game (the one with props posted) even if it has already
+    tipped off or finished — bettors researching at night still mean tonight's
+    matchup, not tomorrow's. Only when the team has no game today does it roll
+    forward to the next scheduled one in the window."""
     if not team_abbr:
         return None
+    # Use the Eastern NBA day so a late-night ET session still maps to "tonight".
+    try:
+        from database import nba_today
+        today_iso = nba_today()
+    except Exception:
+        today_iso = date.today().isoformat()
+
     games = upcoming_games(days_ahead)
-    # games come back roughly date-ordered; find the first involving this team.
-    for g in sorted(games, key=lambda x: x["date"] or ""):
+    games_sorted = sorted(games, key=lambda x: x["date"] or "")
+
+    # 1) Today's game first, regardless of whether it's live/final.
+    for g in games_sorted:
+        gdate = (g["date"] or "")[:10]
+        if gdate != today_iso:
+            continue
+        if g["home"] == team_abbr:
+            return (g["visitor"], True)
+        if g["visitor"] == team_abbr:
+            return (g["home"], False)
+
+    # 2) Otherwise the next upcoming game involving this team.
+    for g in games_sorted:
         if g["home"] == team_abbr:
             return (g["visitor"], True)
         if g["visitor"] == team_abbr:

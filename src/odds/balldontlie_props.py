@@ -99,6 +99,33 @@ def _name_key(name: str) -> str:
     return "".join(ch for ch in (name or "").lower() if ch.isalnum())
 
 
+def _resolve_names_via_api(player_ids):
+    """Resolve balldontlie player_ids -> 'First Last' via the players endpoint.
+
+    The props feed carries only player_id (no name), and rookies / recent
+    call-ups have ids that aren't in our game-log DB yet — so they'd be dropped.
+    This looks those ids up directly so their posted props still surface.
+    Batched (balldontlie accepts repeated player_ids[]), best-effort: any id it
+    can't resolve is simply skipped."""
+    out = {}
+    ids = [i for i in player_ids if i is not None]
+    if not ids:
+        return out
+    # Chunk to keep each query small; the endpoint takes repeated player_ids[].
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        try:
+            rows = _get_all("v1/players",
+                            {"player_ids[]": chunk, "per_page": 100})
+        except Exception:
+            continue
+        for p in rows:
+            nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+            if p.get("id") is not None and nm:
+                out[p["id"]] = nm
+    return out
+
+
 def _todays_game_ids():
     try:
         from database import nba_today
@@ -154,10 +181,16 @@ def all_player_props():
             b["books"].add(p.get("vendor"))
 
     out = {}
+    # Resolve any prop player_ids that aren't in our game-log DB (rookies /
+    # recent call-ups) via the players endpoint, so their posted props still
+    # show up instead of being silently dropped.
+    unknown_ids = [pid for pid in acc if pid not in id_name]
+    api_names = _resolve_names_via_api(unknown_ids) if unknown_ids else {}
+
     for pid, props in acc.items():
-        name = id_name.get(pid)
+        name = id_name.get(pid) or api_names.get(pid)
         if not name:
-            continue  # player not in our DB — can't match to history
+            continue  # couldn't resolve a name at all — nothing to key on
         nk = _name_key(name)
         for prop, b in props.items():
             if not b["lines"]:

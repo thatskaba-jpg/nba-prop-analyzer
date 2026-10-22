@@ -259,11 +259,23 @@ div[role="radiogroup"] label { font-weight:600; }
 
 /* ---- Hide Streamlit chrome so it reads as a standalone app ---- */
 #MainMenu { visibility:hidden; }
-header[data-testid="stHeader"] { display:none; }
+/* Keep the header element present (its sidebar-toggle arrow lives inside it)
+   but make it transparent so it doesn't show a bar — hiding the whole header
+   previously also hid the ONLY control that reopens a collapsed sidebar. */
+header[data-testid="stHeader"] { background:transparent !important; }
 footer { display:none; }
 div[data-testid="stToolbar"] { display:none; }
 div[data-testid="stDecoration"] { display:none; }
 .stDeployButton { display:none; }
+/* The arrow that opens the sidebar (model editor) — always visible & on top. */
+div[data-testid="stSidebarCollapsedControl"],
+button[data-testid="stSidebarCollapseButton"],
+button[data-testid="baseButton-headerNoPadding"] {
+    display:flex !important; visibility:visible !important; opacity:1 !important;
+    z-index:999999 !important; color:#f4f4f5 !important; }
+div[data-testid="stSidebarCollapsedControl"] svg,
+button[data-testid="stSidebarCollapseButton"] svg {
+    fill:#f4f4f5 !important; color:#f4f4f5 !important; }
 .block-container { padding-top:0.6rem !important; }
 </style>
 """, unsafe_allow_html=True)
@@ -350,12 +362,18 @@ def hit_rate_windows(hist, prop_type, line, windows=(5, 10, 15)):
 def player_list():
     conn = get_connection()
     # One row per NAME (players can have two ids across data sources). We pick
-    # a representative id and sum games across ids so the 20-game floor counts
-    # the player's whole career, not just one source. history loads by name
-    # anyway, so any id for that name resolves the full timeline.
+    # a representative id and sum games across ids so the floor counts the
+    # player's whole career, not just one source. history loads by name anyway,
+    # so any id for that name resolves the full timeline.
+    #
+    # Floor is LOW (3 games) so active players with short histories — rookies,
+    # recent call-ups — still appear in the dropdown. The projection itself
+    # guards thin samples (it labels them "low confidence — small sample" and
+    # refuses to project with too few games), so a low floor can't produce a
+    # fake-confident number; it just stops hiding real players who are playing.
     rows = conn.execute(
         "SELECT player_name, MIN(player_id) AS pid, COUNT(*) c "
-        "FROM player_game_logs GROUP BY player_name HAVING c >= 20 "
+        "FROM player_game_logs GROUP BY player_name HAVING c >= 3 "
         "ORDER BY player_name").fetchall()
     conn.close()
     return [(r["player_name"], r["pid"]) for r in rows]
@@ -1118,10 +1136,10 @@ else:
 
         # Auto-fill real odds from the odds router (balldontlie primary).
         if sgo_has_key():
-            if st.button("🎯 Auto-fill real odds"):
-                # Reuse the cached bulk slate first (free if already fetched);
-                # only fall back to a direct single call if this player isn't in
-                # it. Keeps auto-fill from spending an API call most of the time.
+            def _pull_odds():
+                """Pull consensus odds+line for the current player/stat. Reuses
+                the cached bulk slate first (free if already fetched); only
+                falls back to a direct single call if this player isn't in it."""
                 hit = None
                 try:
                     nk = "".join(c for c in sel.lower() if c.isalnum())
@@ -1131,25 +1149,52 @@ else:
                     hit = None
                 if not hit:
                     hit = sgo_prop_odds(sel, prop_type)
+                return hit
+
+            def _stage_odds(hit):
+                """Stage pulled values under 'pending_' keys — applied to the
+                real widget keys at the TOP of the next run, before those widgets
+                are instantiated (Streamlit forbids writing a widget key after
+                its widget renders)."""
+                st.session_state["pending_over"] = hit["odds_over"] or -110
+                st.session_state["pending_under"] = hit["odds_under"] or -110
+                if hit.get("line"):
+                    st.session_state["pending_line"] = hit["line"]
+                st.session_state["sgo_msg"] = (
+                    f"Auto-filled consensus from {hit['books']} books: "
+                    f"line {hit.get('line','?')}, "
+                    f"O {hit['odds_over']} / U {hit['odds_under']}.")
+
+            # AUTO-FILL ON SELECTION: when the player or stat changes, pull the
+            # real odds once automatically (no button). A marker in session_state
+            # remembers what we last filled so this doesn't re-pull every rerun.
+            _sel_key = f"{sel}|{prop_type}"
+            if st.session_state.get("autofill_for") != _sel_key:
+                st.session_state["autofill_for"] = _sel_key
+                hit = _pull_odds()
                 if hit and (hit["odds_over"] or hit["odds_under"]):
-                    # Stage pulled values under 'pending_' keys; they are applied
-                    # to the real widget keys at the TOP of the next run, before
-                    # those widgets are instantiated (Streamlit forbids writing a
-                    # widget key after its widget renders).
-                    st.session_state["pending_over"] = hit["odds_over"] or -110
-                    st.session_state["pending_under"] = hit["odds_under"] or -110
-                    if hit.get("line"):
-                        st.session_state["pending_line"] = hit["line"]
-                    st.session_state["sgo_msg"] = (
-                        f"Pulled consensus from {hit['books']} books: "
-                        f"line {hit.get('line','?')}, "
-                        f"O {hit['odds_over']} / U {hit['odds_under']}.")
+                    _stage_odds(hit)
                     st.rerun()
                 else:
-                    st.info("No prop odds posted for this player yet (they appear "
-                            "~12-24h before tip-off). Enter odds by hand for now.")
+                    st.session_state["sgo_msg_warn"] = (
+                        "No prop odds posted for this player yet (they appear "
+                        "closer to tip-off, and a book can pull a line). Enter "
+                        "odds by hand, or tap refresh.")
+
+            # Manual refresh — for when a line was suspended and later re-posts.
+            if st.button("🎯 Refresh odds"):
+                hit = _pull_odds()
+                if hit and (hit["odds_over"] or hit["odds_under"]):
+                    _stage_odds(hit)
+                    st.rerun()
+                else:
+                    st.session_state["sgo_msg_warn"] = (
+                        "Still no prop posted for this player.")
+
             if st.session_state.get("sgo_msg"):
                 st.success(st.session_state.pop("sgo_msg"))
+            if st.session_state.get("sgo_msg_warn"):
+                st.info(st.session_state.pop("sgo_msg_warn"))
         else:
             st.caption("Tip: add a free SPORTSGAMEODDS_KEY to .env to auto-fill "
                        "real prop odds. For now, type them in.")
