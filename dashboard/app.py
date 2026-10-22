@@ -119,7 +119,7 @@ except Exception:
 from backtest.backtest import run_backtest  # noqa: E402
 
 st.set_page_config(page_title="Bomb Vegas · Prop Analyzer", page_icon="💣",
-                   layout="wide", initial_sidebar_state="expanded")
+                   layout="wide", initial_sidebar_state="collapsed")
 
 # --- Styling: MODERN MONOCHROME — near-black, layered greys, crisp white
 #     accent. Minimal, high-contrast, premium. No color, all contrast. ---
@@ -862,18 +862,10 @@ def _plain_reason(adj: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# SIDEBAR — "What should matter?"
+# MODEL BUILDER STATE  (rendered as a tab below — NOT the sidebar, which is
+# unusable on phones). Config is built from session_state so every tab sees it
+# regardless of which tab the controls live in.
 # --------------------------------------------------------------------------- #
-st.sidebar.title("🏀 Build Your Model")
-st.sidebar.write("Pick the factors that matter and how much. New here? Use the "
-                 "recommended set below — it's a solid starting point.")
-
-model_name = st.sidebar.text_input("Model name", "My First Model")
-
-simple_mode = st.sidebar.toggle("Simple weighting (recommended)", value=True,
-                                help="On: rate each factor Low / Medium / High. "
-                                     "Off: assign exact percentages that sum to "
-                                     "100.")
 
 # The recommended factor set (importance for simple mode, % for weighted).
 RECOMMENDED_SIMPLE = {
@@ -888,71 +880,67 @@ RECOMMENDED_WEIGHTED = {
     "rest_days": 7, "home_away_split": 4, "minutes_trend": 4,
 }
 
+# Friendly labels for the factor controls.
+FACTOR_LABELS = {
+    "player_last_n_avg": "Recent form",
+    "opponent_defense": "Opponent defense",
+    "opponent_defense_by_position": "Opponent defense vs position",
+    "opponent_team_rating": "Opponent team rating (def + pace)",
+    "rest_days": "Rest",
+    "home_away_split": "Home / away",
+    "minutes_trend": "Playing-time trend",
+    "player_vs_team": "History vs this opponent",
+    "teammate_injuries": "Teammate injuries (usage boost)",
+    "game_environment": "Game line (total + spread)",
+    "injury": "Injury status",
+}
+
 
 def _apply_recommended():
-    """Seed the sidebar widgets' session_state with the recommended set."""
-    rec = RECOMMENDED_SIMPLE if simple_mode else RECOMMENDED_WEIGHTED
+    """Seed the builder widgets' session_state with the recommended set."""
+    mode_simple = st.session_state.get("simple_mode", True)
+    rec = RECOMMENDED_SIMPLE if mode_simple else RECOMMENDED_WEIGHTED
     for key in FACTORS:
         st.session_state[f"on_{key}"] = key in rec
         if key in rec:
-            st.session_state[("i_" if simple_mode else "w_") + key] = rec[key]
+            st.session_state[("i_" if mode_simple else "w_") + key] = rec[key]
 
 
-# On first load — and whenever the weighting mode changes — pre-load the
-# recommended set so the app always opens on a good, ready-to-use model.
-if st.session_state.get("seeded_mode") != simple_mode:
+# Seed defaults on first load and whenever the weighting mode flips, so the app
+# always opens on a good, ready-to-use model.
+_simple_now = st.session_state.get("simple_mode", True)
+if st.session_state.get("seeded_mode") != _simple_now:
     _apply_recommended()
-    st.session_state["seeded_mode"] = simple_mode
+    st.session_state["seeded_mode"] = _simple_now
 
-if st.sidebar.button("⭐ Use recommended factors"):
-    _apply_recommended()
 
-st.sidebar.markdown("### Factors")
-chosen = {}
-for key, f in FACTORS.items():
-    label = {
-        "player_last_n_avg": "Recent form",
-        "opponent_defense": "Opponent defense",
-        "opponent_team_rating": "Opponent team rating (def + pace)",
-        "rest_days": "Rest",
-        "home_away_split": "Home / away",
-        "minutes_trend": "Playing-time trend",
-        "player_vs_team": "History vs this opponent",
-        "teammate_injuries": "Teammate injuries (usage boost)",
-        "game_environment": "Game line (total + spread)",
-    }.get(key, f.label)
-    on = st.sidebar.checkbox(label, key=f"on_{key}", help=FACTOR_HELP.get(key))
-    if on:
+def _build_config_from_state():
+    """Read the builder widgets' session_state and return (config, error).
+
+    Lives separately from the controls so every tab can get the current model
+    even though the controls render inside the Build Model tab."""
+    simple_mode = st.session_state.get("simple_mode", True)
+    model_name = st.session_state.get("model_name", "My First Model")
+    chosen = {}
+    for key in FACTORS:
+        if not st.session_state.get(f"on_{key}"):
+            continue
         if simple_mode:
-            if f"i_{key}" not in st.session_state:
-                st.session_state[f"i_{key}"] = "medium"
-            chosen[key] = st.sidebar.select_slider(
-                f"   {label} — importance",
-                options=["low", "medium", "high"],
-                format_func=lambda x: {"low": "Low", "medium": "Medium",
-                                       "high": "High"}[x],
-                key=f"i_{key}")
+            chosen[key] = st.session_state.get(f"i_{key}", "medium")
         else:
-            if f"w_{key}" not in st.session_state:
-                st.session_state[f"w_{key}"] = 20
-            chosen[key] = st.sidebar.number_input(
-                f"   {label} — weight %", 0, 100, step=5, key=f"w_{key}")
-
-if not simple_mode and chosen:
-    total = sum(int(v) for v in chosen.values())
-    ok = (total == 100)
-    st.sidebar.markdown(
-        f"Weights total **:{'green' if ok else 'red'}[{total}%]** "
-        + ("✅" if ok else "— must sum to 100%"))
-
-config, config_err = None, None
-if chosen:
+            chosen[key] = st.session_state.get(f"w_{key}", 20)
+    if not chosen:
+        return None, None
     try:
-        config = build_config(
+        cfg = build_config(
             model_name, "simple" if simple_mode else "weighted",
             {k: (v if simple_mode else int(v)) for k, v in chosen.items()})
+        return cfg, None
     except ValueError as e:
-        config_err = str(e)
+        return None, str(e)
+
+
+config, config_err = _build_config_from_state()
 
 
 # --------------------------------------------------------------------------- #
@@ -967,18 +955,81 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if config_err:
-    st.error(f"Config issue: {config_err}")
+tabM, tab1, tab5, tab6, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
+                                  "🔍 Analyze a Prop",
+                                  "🏀 Game Lines (ML + Spread)",
+                                  "🛒 Line Shopping",
+                                  "🎯 Value Scanner",
+                                  "📒 Track Record",
+                                  "📊 Backtest"])
+
+# ----------------------- Build Model (was the sidebar) ----------------------- #
+with tabM:
+    st.subheader("🏀 Build Your Model")
+    st.write("Pick the factors that matter and how much. New here? Tap "
+             "**⭐ Use recommended factors** — it's a solid starting point. "
+             "Your model applies to every tab.")
+
+    bc1, bc2 = st.columns([2, 1])
+    bc1.text_input("Model name", "My First Model", key="model_name")
+    bc2.toggle("Simple weighting (recommended)", value=True, key="simple_mode",
+               help="On: rate each factor Low / Medium / High. Off: assign "
+                    "exact percentages that sum to 100.")
+    simple_mode = st.session_state.get("simple_mode", True)
+
+    if st.button("⭐ Use recommended factors"):
+        _apply_recommended()
+        st.rerun()
+
+    st.markdown("### Factors")
+    for key, f in FACTORS.items():
+        label = FACTOR_LABELS.get(key, f.label)
+        on = st.checkbox(label, key=f"on_{key}", help=FACTOR_HELP.get(key))
+        if on:
+            if simple_mode:
+                if f"i_{key}" not in st.session_state:
+                    st.session_state[f"i_{key}"] = "medium"
+                st.select_slider(
+                    f"   {label} — importance",
+                    options=["low", "medium", "high"],
+                    format_func=lambda x: {"low": "Low", "medium": "Medium",
+                                           "high": "High"}[x],
+                    key=f"i_{key}")
+            else:
+                if f"w_{key}" not in st.session_state:
+                    st.session_state[f"w_{key}"] = 20
+                st.number_input(f"   {label} — weight %", 0, 100, step=5,
+                                key=f"w_{key}")
+
+    # Rebuild from the just-edited state so the summary below is current.
+    config, config_err = _build_config_from_state()
+    if not simple_mode and config:
+        total = sum(int(st.session_state.get(f"w_{k}", 0))
+                    for k in config.factors)
+        ok = (total == 100)
+        st.markdown(f"Weights total **:{'green' if ok else 'red'}[{total}%]** "
+                    + ("✅" if ok else "— must sum to 100%"))
+    if config_err:
+        st.error(f"Config issue: {config_err}")
+    elif config:
+        st.success(f"Model ready: **{len(config.factors)} factor"
+                   f"{'s' if len(config.factors) != 1 else ''}** active. "
+                   "Head to any tab to use it.")
+    else:
+        st.info("Select at least one factor to build your model.")
+
+if config_err and not config:
+    # A broken config (e.g. weights ≠ 100) — the analysis tabs can't run.
+    for _t in (tab1, tab5, tab6, tab4, tab3, tab2):
+        with _t:
+            st.warning("Fix your model in the **⚙️ Build Model** tab first "
+                       f"({config_err}).")
 elif not config:
-    st.info("👈 Select at least one factor to build your model. A solid start: "
-            "**Recent form** + **Opponent defense**.")
+    for _t in (tab1, tab5, tab6, tab4, tab3, tab2):
+        with _t:
+            st.info("👉 Open the **⚙️ Build Model** tab and pick at least one "
+                    "factor (or tap ⭐ Use recommended factors) to start.")
 else:
-    tab1, tab5, tab6, tab4, tab3, tab2 = st.tabs(["🔍 Analyze a Prop",
-                                      "🏀 Game Lines (ML + Spread)",
-                                      "🛒 Line Shopping",
-                                      "🎯 Value Scanner",
-                                      "📒 Track Record",
-                                      "📊 Backtest"])
 
     # ----------------------- Check a Player ----------------------- #
     with tab1:
