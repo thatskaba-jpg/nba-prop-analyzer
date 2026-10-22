@@ -535,6 +535,74 @@ def analyze(config: ModelConfig, player_id: int, prop_type: str, line: float,
         except Exception:
             pass  # never let calibration break a projection
 
+    # --- Side consistency + combo-stat confidence ---
+    # Combo stats (PTS+AST etc.) are the sum of correlated components; the
+    # per-game Poisson/NB fit and the calibration map are both unreliable for
+    # them, which is exactly where calibration flipped a clear projection to the
+    # wrong side. Two guards:
+    #   1) The probability must never contradict the projection. If proj > line,
+    #      p_over stays >= 0.5 (and vice versa) — the pick, win%, and EV all then
+    #      agree with the number we show.
+    #   2) For combo stats, pull the probability toward 0.5 (less confident) and
+    #      flag it, since we genuinely can't price them as tightly.
+    _COMBO = {"pa", "pr", "ra", "pra", "points_assists", "points_rebounds",
+              "rebounds_assists", "points_rebounds_assists"}
+    # Which raw columns each combo sums.
+    _COMBO_COLS = {
+        "pa": ["points", "assists"], "points_assists": ["points", "assists"],
+        "pr": ["points", "rebounds"], "points_rebounds": ["points", "rebounds"],
+        "ra": ["rebounds", "assists"], "rebounds_assists": ["rebounds", "assists"],
+        "pra": ["points", "rebounds", "assists"],
+        "points_rebounds_assists": ["points", "rebounds", "assists"],
+    }
+    is_combo = prop_type in _COMBO
+    combo_note = None
+    if p_over is not None and projection is not None:
+        push = probs.get("push") or 0.0
+        proj_over = projection > line
+
+        # (A) REAL combo win%: the per-game SUM of the components already
+        # contains the correlation between them, so the empirical distribution
+        # of that sum is the honest probability — no Poisson, no shrink guess.
+        if is_combo:
+            cols = _COMBO_COLS.get(prop_type, [])
+            try:
+                if (history is not None and len(history) >= 10
+                        and all(c in history.columns for c in cols)):
+                    import numpy as _np
+                    totals = history[cols].sum(axis=1).to_numpy(dtype=float)
+                    # Recency weight: use the last ~30 games (same window spirit
+                    # as the projection). Shift the empirical dist so its mean
+                    # equals OUR projection (keeps matchup/injury adjustments)
+                    # while borrowing the player's real shape/spread.
+                    recent = totals[-30:] if len(totals) > 30 else totals
+                    shifted = recent - recent.mean() + projection
+                    p_over = float((shifted > line).mean())
+                    # Guard tiny samples away from 0/1 certainty.
+                    p_over = min(max(p_over, 0.02), 0.98)
+                    p_under = max(1.0 - p_over, 0.0)
+                    combo_note = ("combo win% from this player's real game-by-"
+                                  "game totals (captures how the stats move "
+                                  "together) — more honest than a formula")
+                else:
+                    combo_note = ("combo stat — not enough history for a precise "
+                                  "win%; trust the hit-rate cards")
+            except Exception:
+                combo_note = ("combo stat — priced loosely; trust the hit-rate "
+                              "cards")
+
+        # (B) Side consistency: the probability must never land on the opposite
+        # side of the projection (applies to single AND combo stats).
+        if proj_over and p_over < 0.5:
+            p_over = max(p_over, 0.5)
+            p_under = max(1.0 - p_over - (0.0 if is_combo else push), 0.0)
+        elif (not proj_over) and p_over > 0.5:
+            p_over = min(p_over, 0.5)
+            p_under = max(1.0 - p_over - (0.0 if is_combo else push), 0.0)
+
+        p_over = round(p_over, 4)
+        p_under = round(p_under, 4)
+
     return {
         "player_id": player_id,
         "prop_type": prop_type,
@@ -546,6 +614,8 @@ def analyze(config: ModelConfig, player_id: int, prop_type: str, line: float,
         "p_under": round(p_under, 4) if p_under is not None else None,
         "p_over_raw": round(raw_over, 4) if raw_over is not None else None,
         "calibrated": calibrated,
+        "is_combo": is_combo,
+        "combo_note": combo_note,
         "push": round(probs["push"], 4) if probs["push"] is not None else None,
         "games_played_before": feats.get("games_played_before", 0),
         "confidence": confidence_label(feats),

@@ -152,6 +152,77 @@ def positional_defense_factors(stat: str, cutoff_date: str) -> dict:
     return factors
 
 
+def team_steals(cutoff_date: str) -> dict:
+    """Team steals GENERATED and ALLOWED per game, with league ranks.
+
+    {team: {'gen','gen_rank','allowed','allowed_rank','of'}}.
+      - gen     = steals the team records per game (ball pressure/gambling D).
+      - allowed = steals the OPPONENT records against this team per game
+                  (how careless/pressured ball-handlers are vs this team).
+    gen_rank 1 = most generated; allowed_rank 1 = allows the most. {} if empty.
+    """
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT opponent, matchup, game_id, steals FROM player_game_logs "
+        "WHERE steals IS NOT NULL AND game_id IS NOT NULL "
+        "AND matchup IS NOT NULL AND game_date < ?",
+        conn, params=(cutoff_date,))
+    conn.close()
+    if df.empty:
+        return {}
+    df["team"] = df["matchup"].str.split().str[0]
+    gen = df.groupby(["team", "game_id"])["steals"].sum().groupby("team").mean()
+    alw = (df.groupby(["opponent", "game_id"])["steals"].sum()
+           .groupby("opponent").mean())
+    gen_rank = gen.rank(ascending=False, method="min")
+    alw_rank = alw.rank(ascending=False, method="min")
+    n = len(gen)
+    out = {}
+    for team in gen.index:
+        out[team] = {
+            "gen": round(float(gen[team]), 1),
+            "gen_rank": int(gen_rank[team]),
+            "allowed": round(float(alw.get(team, 0)), 1),
+            "allowed_rank": int(alw_rank.get(team, n)),
+            "of": n,
+        }
+    return out
+
+
+def positional_defense_raw(stat: str, cutoff_date: str) -> dict:
+    """Like positional_defense_factors but returns the RAW number allowed and a
+    league RANK per (team, group):
+      {team: {group: {'allowed': float, 'rank': int, 'of': int}}}.
+    rank 1 = allows the MOST of this stat to that group (softest matchup).
+    Built only from games before cutoff_date. {} when no data."""
+    if stat not in ("points", "rebounds", "assists"):
+        raise ValueError("stat must be points, rebounds, or assists")
+    conn = get_connection()
+    df = pd.read_sql_query(
+        f"SELECT player_id, opponent, {stat} AS val FROM player_game_logs "
+        "WHERE game_date < ? AND opponent IS NOT NULL AND opponent != ''",
+        conn, params=(cutoff_date,))
+    conn.close()
+    if df.empty:
+        return {}
+    groups = player_groups(cutoff_date)
+    df["group"] = df["player_id"].map(groups)
+    df = df.dropna(subset=["group"])
+    if df.empty:
+        return {}
+    allowed = (df.groupby(["opponent", "group"])["val"].mean().reset_index()
+               .rename(columns={"opponent": "team"}))
+    out = {}
+    for grp, sub in allowed.groupby("group"):
+        ordered = sub.sort_values("val", ascending=False).reset_index(drop=True)
+        n = len(ordered)
+        for i, row in ordered.iterrows():
+            out.setdefault(row["team"], {})[grp] = {
+                "allowed": round(float(row["val"]), 1),
+                "rank": i + 1, "of": n}
+    return out
+
+
 if __name__ == "__main__":
     cutoff = "2024-01-01"
     stat = sys.argv[1] if len(sys.argv) > 1 else "points"

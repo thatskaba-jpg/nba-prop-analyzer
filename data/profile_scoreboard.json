@@ -1,48 +1,48 @@
 {
   "profiles": {
     "Balanced": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     },
     "Strong home court": {
-      "correct": 9,
-      "total": 16
+      "correct": 10,
+      "total": 17
     },
     "Trust the ratings (bold)": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     },
     "Cautious (toward coin flip)": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     },
     "Pace-sensitive": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     },
     "No home edge (neutral court)": {
-      "correct": 9,
-      "total": 16
+      "correct": 10,
+      "total": 17
     },
     "Road warrior (fade home)": {
-      "correct": 10,
-      "total": 16
+      "correct": 11,
+      "total": 17
     },
     "Underdog hunter": {
-      "correct": 9,
-      "total": 16
+      "correct": 10,
+      "total": 17
     },
     "Favorite slammer (chalk)": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     },
     "Slow grind (low pace)": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     },
     "Max confidence (sharp)": {
-      "correct": 8,
-      "total": 16
+      "correct": 9,
+      "total": 17
     }
   },
   "graded_game_ids": [
@@ -61,6 +61,7 @@
     21717927,
     21717928,
     21717929,
-    21717930
+    21717930,
+    21717931
   ]
 }

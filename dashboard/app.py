@@ -260,8 +260,13 @@ section[data-testid="stSidebar"] h1 { font-size:1.15rem; letter-spacing:-.02em; 
 
 /* ---- Expanders: soft card, brighter edge on hover ---- */
 div[data-testid="stExpander"] { border:1px solid var(--line); border-radius:14px;
-    background:var(--panel); overflow:hidden; transition:border-color .14s ease; }
+    background:var(--panel); overflow:hidden; transition:border-color .14s ease;
+    margin-bottom:6px; }
 div[data-testid="stExpander"]:hover { border-color:var(--line-2); }
+/* Tighten the gap between stacked expanders (e.g. the Game Lines list) so the
+   rows sit close together instead of floating far apart. */
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stExpander"]) {
+    margin-bottom:0 !important; }
 
 /* ---- Multiselect / selected tags: dark pill, READABLE white text ----
    (the generic input rule was turning these white-on-white — invisible) ---- */
@@ -487,6 +492,70 @@ def cached_polymarket(home_abbr, away_abbr):
         return None
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_opening_odds(date_iso):
+    """Opening game odds keyed by MATCHUP string ('AWAY @ HOME') for a date,
+    cached 10 min. The game-lines dict has no game_id, so we resolve game_id ->
+    matchup via the games feed and re-key. {} on error."""
+    try:
+        from odds.line_movement import opening_game_odds
+        from collect.goat_data import _get
+        by_gid = opening_game_odds(date_iso)
+        if not by_gid:
+            return {}
+        # Map game_id -> "AWAY @ HOME" from the games feed.
+        gid_to_matchup = {}
+        try:
+            r = _get("nba/v1/games", {"dates[]": date_iso, "per_page": 100})
+            for g in r.get("data", []):
+                h = (g.get("home_team") or {}).get("abbreviation")
+                a = (g.get("visitor_team") or {}).get("abbreviation")
+                if h and a:
+                    gid_to_matchup[g.get("id")] = f"{a} @ {h}"
+        except Exception:
+            return {}
+        return {gid_to_matchup[g]: v for g, v in by_gid.items()
+                if g in gid_to_matchup}
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_opening_props(game_id):
+    """Opening prop lines {(pid,prop_type): line} for a game, cached 10 min."""
+    try:
+        from odds.line_movement import opening_props_for_game
+        return opening_props_for_game(game_id)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_team_style(season, category, type_):
+    """Team playtype/tracking stats {abbr: stats}, cached an hour. {} on error."""
+    try:
+        from collect.goat_data import team_style_map
+        return team_style_map(season, category, type_)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=30)
+def cached_live_tracker():
+    """Live prop-tracking rows: join live box scores to current prop lines.
+    Cached 30s (it's LIVE). [] when nothing is in progress or on error."""
+    try:
+        from odds.live_tracker import track
+        from odds.balldontlie_props import all_player_props
+        props = all_player_props()
+        lines = {nk: {s: v.get("line") for s, v in sd.items()
+                      if v.get("line") is not None}
+                 for nk, sd in props.items()}
+        return track(lines)
+    except Exception:
+        return []
+
+
 @st.cache_data(show_spinner=False)
 def team_abbrs():
     conn = get_connection()
@@ -496,6 +565,22 @@ def team_abbrs():
     ).fetchall()
     conn.close()
     return [r["opponent"] for r in rows]
+
+
+@st.cache_data(show_spinner=False)
+def cached_pos_defense_raw(stat, cutoff):
+    """Raw stat-allowed-to-position + league rank per team, cached."""
+    from features.positional_defense import positional_defense_raw
+    if stat not in ("points", "rebounds", "assists"):
+        return {}
+    return positional_defense_raw(stat, cutoff)
+
+
+@st.cache_data(show_spinner=False)
+def cached_team_steals(cutoff):
+    """Team steals generated + allowed per game with ranks, cached."""
+    from features.positional_defense import team_steals
+    return team_steals(cutoff)
 
 
 @st.cache_data(show_spinner=False)
@@ -1015,6 +1100,7 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                                        ev["recommended_side"] == lean.lower())
                               else ("⏳" if (ev["is_value"] and _early) else ""),
                     "Books": hit.get("books", 0),
+                    "_pid": pid,
                 })
         except Exception:
             continue  # one bad player never sinks the whole scan
@@ -1159,15 +1245,57 @@ def _apply_recommended():
 
 
 # Seed defaults on FIRST load only (runs before widgets, so a direct write is
-# safe here). Mode flips are handled live by the toggle; presets stage+rerun.
+# safe here). If the URL carries a saved preset (survives Cloud reloads), load
+# THAT instead of the recommended default — so the user's choice sticks.
 if "seeded_mode" not in st.session_state:
-    _simple_now = st.session_state.get("simple_mode", True)
-    rec = RECOMMENDED_SIMPLE if _simple_now else RECOMMENDED_WEIGHTED
-    for key in FACTORS:
-        st.session_state[f"on_{key}"] = key in rec
-        if key in rec:
-            st.session_state[("i_" if _simple_now else "w_") + key] = rec[key]
-    st.session_state["seeded_mode"] = _simple_now
+    _restored = None
+    _full = None
+    try:
+        import json as _json0
+        _qpm = st.query_params.get("model")
+        if _qpm:
+            _full = _json0.loads(_qpm)
+    except Exception:
+        _full = None
+    try:
+        _qp = st.query_params.get("preset")
+        if _qp and _qp in PRESETS:
+            _restored = _qp
+    except Exception:
+        _restored = None
+    if _full and isinstance(_full, dict) and _full.get("factors"):
+        # Full saved state (any custom config) — highest priority.
+        _mode = _full.get("mode", "simple")
+        _simple = (_mode == "simple")
+        _facs = _full["factors"]
+        for key in FACTORS:
+            st.session_state[f"on_{key}"] = key in _facs
+            if key in _facs:
+                st.session_state[("i_" if _simple else "w_") + key] = _facs[key]
+        st.session_state["simple_mode"] = _simple
+        st.session_state["seeded_mode"] = _simple
+        if _full.get("name"):
+            st.session_state["model_name"] = _full["name"]
+    elif _restored:
+        _mode, _factors, _ = PRESETS[_restored]
+        _simple = (_mode == "simple")
+        for key in FACTORS:
+            st.session_state[f"on_{key}"] = key in _factors
+            if key in _factors:
+                st.session_state[("i_" if _simple else "w_") + key] = \
+                    _factors[key]
+        st.session_state["simple_mode"] = _simple
+        st.session_state["seeded_mode"] = _simple
+        st.session_state["model_name"] = (_restored.split(" ", 1)[-1]
+                                           if " " in _restored else _restored)
+    else:
+        _simple_now = st.session_state.get("simple_mode", True)
+        rec = RECOMMENDED_SIMPLE if _simple_now else RECOMMENDED_WEIGHTED
+        for key in FACTORS:
+            st.session_state[f"on_{key}"] = key in rec
+            if key in rec:
+                st.session_state[("i_" if _simple_now else "w_") + key] = rec[key]
+        st.session_state["seeded_mode"] = _simple_now
 
 
 def _build_config_from_state():
@@ -1197,6 +1325,18 @@ def _build_config_from_state():
 
 
 config, config_err = _build_config_from_state()
+
+# Persist the CURRENT model to the URL (survives Cloud reboots). Write only
+# when it changed, so we don't thrash the query string every rerun.
+if config is not None:
+    try:
+        import json as _jm
+        _cur = _jm.dumps(_current_model_dict(), separators=(",", ":"))
+        if st.session_state.get("_last_model_url") != _cur:
+            st.query_params["model"] = _cur
+            st.session_state["_last_model_url"] = _cur
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1306,11 +1446,12 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tabM, tab1, tab5, tab6, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
+tabM, tab1, tab5, tab6, tab4, tabLIVE, tab3, tab2 = st.tabs(["⚙️ Build Model",
                                   "🔍 Analyze a Prop",
                                   "🏀 Game Lines (ML + Spread)",
                                   "🛒 Line Shopping",
                                   "🎯 Value Scanner",
+                                  "🔴 Live Tracker",
                                   "📒 Track Record",
                                   "📊 Backtest"])
 
@@ -1340,6 +1481,12 @@ with tabM:
         if col.button(pname, key=f"preset_{i}", use_container_width=True):
             nm = pname.split(" ", 1)[-1] if " " in pname else pname
             _apply_factor_set(mode, factors, name=nm)
+            # Persist the choice in the URL so a Cloud reload restores it
+            # (session_state is wiped on reboot; query params survive).
+            try:
+                st.query_params["preset"] = pname
+            except Exception:
+                pass
             st.rerun()
         col.caption(desc)
 
@@ -1617,6 +1764,40 @@ else:
         if grp:
             st.caption(f"{sel} is classified as a **{grp}** — the matchup factor "
                        f"uses how {opp} defends {grp}s for this stat.")
+            # Raw number: how much of THIS stat the opponent allows to this
+            # position group, + league rank (1 = allows the most = softest).
+            if prop_type in ("points", "rebounds", "assists"):
+                try:
+                    _raw = cached_pos_defense_raw(prop_type, cutoff)
+                    _cell = (_raw.get(opp) or {}).get(grp)
+                except Exception:
+                    _cell = None
+                if _cell:
+                    _r, _of = _cell["rank"], _cell["of"]
+                    _soft = ("softest" if _r <= _of // 3
+                             else "toughest" if _r > 2 * _of // 3
+                             else "middle")
+                    st.caption(
+                        f"📊 {opp} allows **{_cell['allowed']:g} "
+                        f"{PROP_WORDS[prop_type].lower()}** per game to "
+                        f"{grp}s — **#{_r} of {_of}** ({_soft} matchup; "
+                        "#1 = gives up the most).")
+
+        # ---- Steals props: team ball-pressure matchup ----
+        if prop_type == "steals":
+            try:
+                _ts = cached_team_steals(cutoff)
+            except Exception:
+                _ts = {}
+            _o = _ts.get(opp)
+            if _o:
+                _ar, _of = _o["allowed_rank"], _o["of"]
+                _soft = ("lots of giveaways — good for steals" if _ar <= _of // 3
+                         else "protects the ball well — fewer steals"
+                         if _ar > 2 * _of // 3 else "average")
+                st.caption(
+                    f"🖐️ {opp} coughs up **{_o['allowed']:g} steals/game** to "
+                    f"opponents — **#{_ar} of {_of}** ({_soft}).")
 
         # ---- Likely primary defender (context only, not a projection factor) --
         # Who on the opponent probably guards this player (same position group),
@@ -1754,7 +1935,10 @@ else:
         if res["projection"] is None:
             st.warning("Not enough prior games for this player to project.")
         else:
-            lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
+            # Pick from PROJECTION vs line (unambiguous) — not p_over, which is
+            # miscalibrated for combo/low stats and can contradict the shown
+            # projection (same fix as the Value Scanner).
+            lean = "OVER" if res["projection"] > line else "UNDER"
             chance = res["p_over"] if lean == "OVER" else res["p_under"]
             conf = res["confidence"].split("(")[0].strip()
             conf_word = {"solid": "Reasonable confidence",
@@ -1866,6 +2050,29 @@ else:
 </div>
 """, unsafe_allow_html=True)
 
+            # --- Add this pick to MY SLIP (tracked live on the Live tab) ---
+            _slip = st.session_state.setdefault("my_slip", [])
+            _pick = {"player": sel, "stat": prop_type, "line": float(line),
+                     "side": lean,
+                     "odds": int(odds_over if lean == "OVER" else odds_under)}
+            _already = any(p["player"] == _pick["player"]
+                           and p["stat"] == _pick["stat"]
+                           and p["side"] == _pick["side"] for p in _slip)
+            bc1, bc2 = st.columns([1, 3])
+            if _already:
+                bc1.button("✓ On your slip", disabled=True, key="slip_add_btn")
+            elif bc1.button("➕ Add to my slip", key="slip_add_btn"):
+                _slip.append(_pick)
+                st.session_state["my_slip"] = _slip
+                st.rerun()
+            bc2.caption(f"Your slip has {len(_slip)} pick"
+                        f"{'s' if len(_slip) != 1 else ''} — track them live on "
+                        "the 🔴 Live Tracker tab.")
+
+            # --- Combo-stat note (now a real empirical win%) ---
+            if res.get("combo_note"):
+                st.caption("🧮 " + res["combo_note"].capitalize() + ".")
+
             # --- Hit-rate cards: how often this player beat THIS line lately ---
             hr = hit_rate_windows(hist, prop_type, line)
             if hr:
@@ -1925,12 +2132,107 @@ else:
                     st.write("• No factor had enough signal to move it "
                              "(missing opponent/venue data, or neutral).")
 
+            with st.expander("🆚 Matchup breakdown", expanded=True):
+                _season_m = int(cutoff[:4]) if cutoff else 2026
+                if _season_m < 2024:
+                    _season_m = 2024
+                _tr = goat_team_ratings(_season_m)
+                _hd = _tr.get(my_team) or {}
+                _ad = _tr.get(opp) or {}
+
+                # 1) TEAM vs TEAM — ratings + pace head to head.
+                if _hd.get("off") is not None and _ad.get("off") is not None:
+                    st.markdown(
+                        f"**Team vs team** — {my_team}: off "
+                        f"{_hd.get('off','?')} / def {_hd.get('def','?')}  ·  "
+                        f"{opp}: off {_ad.get('off','?')} / def "
+                        f"{_ad.get('def','?')}. "
+                        f"(Lower def rating = tougher D.)")
+
+                # 1b) WHAT THE OPPONENT GIVES UP — paint, fast break, rim FG%.
+                try:
+                    _ddef = cached_team_style(_season_m, "general", "defense").get(opp) or {}
+                    _drim = cached_team_style(_season_m, "tracking", "defense").get(opp) or {}
+                except Exception:
+                    _ddef, _drim = {}, {}
+                _gu = []
+                if _ddef.get("opp_pts_paint") is not None:
+                    _gu.append(f"{_ddef['opp_pts_paint']:.0f} paint pts")
+                if _ddef.get("opp_pts_fb") is not None:
+                    _gu.append(f"{_ddef['opp_pts_fb']:.0f} fast-break pts")
+                if _drim.get("def_rim_fg_pct") is not None:
+                    _gu.append(f"{_drim['def_rim_fg_pct']*100:.0f}% at the rim")
+                if _ddef.get("blk") is not None:
+                    _gu.append(f"{_ddef['blk']:.1f} blocks")
+                if _gu:
+                    st.markdown(f"**{opp} allows:** " + " · ".join(_gu)
+                                + ". (High paint/rim = soft inside — good for "
+                                  "bigs; lots of fast-break pts = transition "
+                                  "leaks.)")
+
+                # 2) PLAYER vs TEAM — this player's own history vs this opponent.
+                _vs = hist[hist["opponent"] == opp]
+                _col = prop_type if prop_type in hist.columns else None
+                if _col and len(_vs) >= 2:
+                    _va = _vs[_col].mean()
+                    _oa = hist[_col].mean()
+                    _diff = _va - _oa
+                    _lean = ("better" if _diff > 0.5 else "worse"
+                             if _diff < -0.5 else "about the same")
+                    st.markdown(
+                        f"**{sel} vs {opp}** — averages **{_va:.1f}** "
+                        f"{PROP_WORDS[prop_type].lower()} in {len(_vs)} career "
+                        f"meetings vs {_oa:.1f} overall ({_lean} than usual "
+                        f"against them).")
+                elif _col:
+                    st.caption(f"{sel} has faced {opp} fewer than 2 times on "
+                               "record — no reliable head-to-head yet.")
+
+                # 3) OPPONENT'S DEFENDER — who likely guards him.
+                try:
+                    _pd = primary_defender_note(opp, grp, _season_m)
+                except Exception:
+                    _pd = None
+                if _pd:
+                    a = _pd["adv"]
+                    st.markdown(
+                        f"**Likely defender:** {_pd['name']} ({opp}) allows "
+                        f"~{a['matchup_pts']:.1f} pts to his man"
+                        + (f", {a['matchup_fg_pct']*100:.0f}% FG"
+                           if a.get('matchup_fg_pct') else "")
+                        + ". (Likely by position — defenders switch.)")
+
+                # 4) POSITION vs TEAM — what the opp allows to this position.
+                if prop_type in ("points", "rebounds", "assists") and grp:
+                    try:
+                        _cell = (cached_pos_defense_raw(prop_type, cutoff)
+                                 .get(opp) or {}).get(grp)
+                    except Exception:
+                        _cell = None
+                    if _cell:
+                        st.markdown(
+                            f"**{opp} vs {grp}s:** allows **{_cell['allowed']:g} "
+                            f"{PROP_WORDS[prop_type].lower()}/game** to {grp}s — "
+                            f"#{_cell['rank']} of {_cell['of']} (#1 = most).")
+                if prop_type == "steals":
+                    try:
+                        _o = cached_team_steals(cutoff).get(opp)
+                    except Exception:
+                        _o = None
+                    if _o:
+                        st.markdown(
+                            f"**{opp} ball security:** gives up "
+                            f"**{_o['allowed']:g} steals/game** — "
+                            f"#{_o['allowed_rank']} of {_o['of']} (#1 = most "
+                            "careless).")
+
             with st.expander("📊 Extra context (live GOAT data)"):
                 cur_season = cutoff[:4] if cutoff else "2026"
                 try:
                     cs = int(cur_season) if int(cur_season) >= 2024 else 2024
                 except Exception:
                     cs = 2024
+                st.markdown(f"**👤 The player — {sel}**")
                 savg = goat_season_avg(pid, cs)
                 if savg:
                     st.write(f"**Official {cs}-{str(cs+1)[-2:]} season averages** "
@@ -1946,113 +2248,103 @@ else:
                 # player plays and how efficiently, beyond raw box-score totals.
                 adv = goat_adv_avg(pid, cs)
                 if adv and adv.get("usage") is not None:
-                    st.write(
-                        f"**Role & efficiency** (balldontlie advanced): "
-                        f"usage **{adv['usage']*100:.1f}%** "
-                        f"(share of the team's plays this player finishes), "
-                        f"assist rate {(adv.get('assist_pct') or 0)*100:.1f}%, "
-                        f"true-shooting {(adv.get('ts_pct') or 0)*100:.1f}%, "
-                        f"PIE {(adv.get('pie') or 0)*100:.1f}% "
-                        f"(overall impact). Higher usage = more shots/touches = "
-                        f"a higher, steadier line.")
-                    # Extra advanced detail — share of the offense + efficiency.
-                    extra = []
-                    if adv.get("pct_pts") is not None:
-                        extra.append(f"**{adv['pct_pts']*100:.0f}%** of the "
-                                     f"team's points")
-                    if adv.get("pct_fga") is not None:
-                        extra.append(f"**{adv['pct_fga']*100:.0f}%** of its shots")
-                    if adv.get("reb_pct") is not None:
-                        extra.append(f"rebound rate {adv['reb_pct']*100:.1f}%")
-                    if adv.get("efg_pct") is not None:
-                        extra.append(f"eFG {adv['efg_pct']*100:.1f}%")
-                    if adv.get("ast_to") is not None:
-                        extra.append(f"A:TO {adv['ast_to']:.2f}")
-                    if adv.get("touches") is not None:
-                        extra.append(f"~{adv['touches']:.0f} touches/game")
-                    if adv.get("pace") is not None:
-                        extra.append(f"plays at {adv['pace']:.0f} pace")
-                    if extra:
-                        st.caption("Also: " + " · ".join(extra)
-                                   + f"  (over {adv.get('games','?')} games).")
-
-                    # Matchup defense — what this player gives up on D.
-                    if adv.get("matchup_pts") is not None:
-                        mfg = adv.get("matchup_fg_pct")
-                        st.caption(
-                            f"🛡️ On defense: allows ~{adv['matchup_pts']:.1f} "
-                            f"pts to the man he guards"
-                            + (f", on {mfg*100:.0f}% shooting" if mfg
-                               else "") + ".")
-                    # Shot quality — how good his looks are.
-                    sq = []
-                    if adv.get("uncontested_fg_pct") is not None:
-                        sq.append(f"uncontested {adv['uncontested_fg_pct']*100:.0f}%")
-                    if adv.get("contested_fg_pct") is not None:
-                        sq.append(f"contested {adv['contested_fg_pct']*100:.0f}%")
-                    if adv.get("rim_fg_pct") is not None:
-                        sq.append(f"at the rim {adv['rim_fg_pct']*100:.0f}%")
-                    if sq:
-                        st.caption("🎯 Shot quality (FG%): " + " · ".join(sq))
-                    # Shot ATTEMPT volume (counts per game) — how many looks.
-                    sa = []
-                    if adv.get("uncontested_fga") is not None:
-                        sa.append(f"{adv['uncontested_fga']:.1f} uncontested")
-                    if adv.get("contested_fga") is not None:
-                        sa.append(f"{adv['contested_fga']:.1f} contested")
-                    if adv.get("rim_fga") is not None:
-                        sa.append(f"{adv['rim_fga']:.1f} at the rim")
-                    if sa:
-                        st.caption("📈 Shot attempts/game: " + " · ".join(sa))
-                    # Scoring profile — where his points come from.
-                    sp = []
+                    # ONE plain line that actually helps a bet: role + where
+                    # points come from. Everything else is tucked away.
+                    _mix = []
                     if adv.get("pct_pts_paint") is not None:
-                        sp.append(f"{adv['pct_pts_paint']*100:.0f}% in the paint")
+                        _mix.append(f"{adv['pct_pts_paint']*100:.0f}% paint")
                     if adv.get("pct_pts_3pt") is not None:
-                        sp.append(f"{adv['pct_pts_3pt']*100:.0f}% from 3")
+                        _mix.append(f"{adv['pct_pts_3pt']*100:.0f}% threes")
                     if adv.get("pct_pts_ft") is not None:
-                        sp.append(f"{adv['pct_pts_ft']*100:.0f}% from the line")
-                    if sp:
-                        st.caption("📍 Scoring mix: " + " · ".join(sp))
-                    # Playmaking volume.
-                    pm = []
-                    if adv.get("passes") is not None:
-                        pm.append(f"~{adv['passes']:.0f} passes/game")
-                    if adv.get("secondary_ast") is not None:
-                        pm.append(f"{adv['secondary_ast']:.1f} secondary assists")
-                    if pm:
-                        st.caption("🏀 Playmaking: " + " · ".join(pm))
+                        _mix.append(f"{adv['pct_pts_ft']*100:.0f}% free throws")
+                    _mix_txt = ("  ·  scores " + ", ".join(_mix)) if _mix else ""
+                    st.write(
+                        f"**Role:** usage **{adv['usage']*100:.0f}%** of the "
+                        f"team's plays{_mix_txt}. Higher usage = more "
+                        "shots/touches = a higher, steadier line.")
+
+                    with st.expander("🔬 Deep stats (optional)"):
+                        rows = []
+                        if adv.get("ts_pct") is not None:
+                            rows.append(f"True shooting {adv['ts_pct']*100:.1f}%")
+                        if adv.get("pct_pts") is not None:
+                            rows.append(f"{adv['pct_pts']*100:.0f}% of team points")
+                        if adv.get("pct_fga") is not None:
+                            rows.append(f"{adv['pct_fga']*100:.0f}% of team shots")
+                        if adv.get("touches") is not None:
+                            rows.append(f"~{adv['touches']:.0f} touches/game")
+                        if adv.get("passes") is not None:
+                            rows.append(f"~{adv['passes']:.0f} passes/game")
+                        if rows:
+                            st.caption("Involvement: " + " · ".join(rows))
+                        # Shot quality + attempt volume (noisy early season).
+                        sq = []
+                        if adv.get("uncontested_fga") is not None:
+                            sq.append(f"{adv['uncontested_fga']:.1f} open shots")
+                        if adv.get("contested_fga") is not None:
+                            sq.append(f"{adv['contested_fga']:.1f} contested")
+                        if sq:
+                            st.caption("Shot volume/game: " + " · ".join(sq))
+                        if adv.get("matchup_pts") is not None:
+                            st.caption(f"On defense: allows ~"
+                                       f"{adv['matchup_pts']:.1f} pts to his man.")
+                        # Defense & hustle — who forces TOs, blocks, fouls, etc.
+                        _dh = []
+                        if adv.get("matchup_tov") is not None:
+                            _dh.append(f"forces {adv['matchup_tov']:.1f} "
+                                       "TOs/game on his man")
+                        if adv.get("deflections") is not None:
+                            _dh.append(f"{adv['deflections']:.1f} deflections")
+                        if adv.get("contested_shots") is not None:
+                            _dh.append(f"{adv['contested_shots']:.1f} contested "
+                                       "shots")
+                        if adv.get("charges_drawn"):
+                            _dh.append(f"{adv['charges_drawn']:.1f} charges drawn")
+                        if adv.get("box_outs") is not None:
+                            _dh.append(f"{adv['box_outs']:.1f} box-outs")
+                        if _dh:
+                            st.caption("🛡️ Defense & hustle: " + " · ".join(_dh))
+                        # Foul / drawn-foul context (useful for FT-driven props).
+                        _f = []
+                        if adv.get("fouls_drawn") is not None:
+                            _f.append(f"draws {adv['fouls_drawn']:.1f} fouls/game")
+                        if adv.get("screen_ast") is not None:
+                            _f.append(f"{adv['screen_ast']:.1f} screen assists")
+                        if _f:
+                            st.caption("🤝 " + " · ".join(_f))
+
+                st.divider()
+                st.markdown(f"**🆚 The matchup — {opp}**")
                 sm = goat_standings(cs)
                 if sm and opp in sm:
                     o = sm[opp]
-                    st.write(f"**Opponent {opp} this season:** {o['wins']}-"
+                    st.write(f"**{opp} record:** {o['wins']}-"
                              f"{o['losses']} "
                              f"(conf. rank {o.get('conf_rank','?')}).")
                 # Defensive strength from OUR own data (points allowed vs league
                 # average) — reliable, no external API.
                 dsum = defense_summary(cutoff, opp)
                 if dsum:
-                    arrow = ("allows ~{:+.0f}% vs the average team"
-                             .format(dsum["pct"]))
-                    st.write(f"**{opp} defense:** {dsum['tag']} — ranked "
-                             f"**#{dsum['rank']} of {dsum['n']}** toughest "
-                             f"({arrow}). Softer defense = easier night for the "
-                             f"player.")
-                # Official balldontlie team off/def ratings (points per 100
-                # possessions). Updates as the season's games accrue.
+                    _p = dsum["pct"]
+                    if _p <= -2:
+                        _word = f"allows about {abs(_p):.0f}% FEWER than average — tougher"
+                    elif _p >= 2:
+                        _word = f"allows about {_p:.0f}% MORE than average — softer"
+                    else:
+                        _word = "right around league average"
+                    st.write(f"**{opp} defense:** ranked **#{dsum['rank']} of "
+                             f"{dsum['n']}** toughest — {_word}.")
+                # Pace only (it's the one extra thing that matters: fast = more
+                # possessions = more chances to hit an over).
                 tr = goat_team_ratings(cs)
-                if tr and opp in tr and tr[opp].get("def") is not None:
-                    o_ = tr[opp]
-                    dr = o_.get("def_rank")
-                    st.write(
-                        f"**{opp} official ratings** (balldontlie): "
-                        f"offense {o_.get('off','?')}, defense {o_.get('def','?')}"
-                        + (f" (defense ranked #{dr}/30)" if dr else "")
-                        + f", pace {o_.get('pace','?')}. "
-                        "Lower defensive rating = tougher D; higher pace = more "
-                        "possessions (more chances to hit an Over).")
-                st.caption("Context only — the projection is still built from the "
-                           "player's own game log with no look-ahead.")
+                if tr and opp in tr and tr[opp].get("pace") is not None:
+                    _pace = tr[opp]["pace"]
+                    _feel = ("fast — more possessions, helps overs" if _pace >= 101
+                             else "slow — fewer possessions, helps unders"
+                             if _pace <= 98 else "average pace")
+                    st.caption(f"{opp} plays at **{_pace:g} pace** ({_feel}).")
+                st.caption("Context only — the projection is built from the "
+                           "player's own game log, no look-ahead.")
 
             with st.expander("💡 How the value (EV) was figured"):
                 st.write(_plain_verdict(ev))
@@ -2248,6 +2540,128 @@ else:
                                    "bot says 90% but only 80% happens, it's a "
                                    "little overconfident.")
 
+    # ----------------------- Live Tracker ----------------------- #
+    with tabLIVE:
+        st.subheader("🔴 Live prop tracker")
+        st.write("Players in **live games** right now, tracked against their "
+                 "posted prop lines — current stat, whether they've cleared the "
+                 "line, and a rough on-pace estimate. Refreshes when you reopen "
+                 "the tab (data is ~30s fresh).")
+        if st.button("🔄 Refresh now", key="live_refresh"):
+            cached_live_tracker.clear()
+            st.rerun()
+        try:
+            live_rows = cached_live_tracker()
+        except Exception:
+            live_rows = []
+
+        # ---- MY SLIP: your own picks, tracked live ----
+        import json as _json
+        my_slip = st.session_state.setdefault("my_slip", [])
+        PW = {"points": "PTS", "rebounds": "REB", "assists": "AST",
+              "threes_made": "3PM", "steals": "STL", "blocks": "BLK"}
+        with st.expander(f"📋 My slip ({len(my_slip)} pick"
+                         f"{'s' if len(my_slip) != 1 else ''})", expanded=True):
+            if not my_slip:
+                st.caption("No picks yet. On the 🔍 Analyze tab, evaluate a prop "
+                           "and tap **➕ Add to my slip** to track it here.")
+            else:
+                # Index live rows by (name_key, stat) for a fast match.
+                def _nk(s):
+                    return "".join(c for c in (s or "").lower() if c.isalnum())
+                live_idx = {(_nk(r["player"]), r["stat"]): r for r in live_rows}
+                import pandas as _pd
+                table = []
+                for i, p in enumerate(my_slip):
+                    r = live_idx.get((_nk(p["player"]), p["stat"]))
+                    if r:
+                        now, mn = r["current"], r["minutes"]
+                        hit_over = r["current"] >= p["line"]
+                        if r["final"]:
+                            res = ("✅ WON" if (hit_over == (p["side"] == "OVER"))
+                                   else "❌ LOST")
+                        else:
+                            res = (f"live: {now:g} ({mn:g} min, "
+                                   f"pace {r['pace_value']:g})")
+                    else:
+                        res = "not live yet"
+                    table.append({
+                        "Player": p["player"], "Prop": PW.get(p["stat"], p["stat"]),
+                        "Side": p["side"], "Line": p["line"], "Odds": p["odds"],
+                        "Status": res,
+                    })
+                st.dataframe(_pd.DataFrame(table),
+                             use_container_width=True, hide_index=True)
+                rc1, rc2, rc3 = st.columns(3)
+                rm = rc1.selectbox("Remove a pick", ["—"] +
+                                   [f"{p['player']} {p['side']} {p['line']:g} "
+                                    f"{PW.get(p['stat'], p['stat'])}"
+                                    for p in my_slip], key="slip_rm_pick")
+                if rc1.button("Remove", key="slip_rm_btn") and rm != "—":
+                    idx = (["—"] + [f"{p['player']} {p['side']} {p['line']:g} "
+                                    f"{PW.get(p['stat'], p['stat'])}"
+                                    for p in my_slip]).index(rm) - 1
+                    my_slip.pop(idx)
+                    st.session_state["my_slip"] = my_slip
+                    st.rerun()
+                rc2.download_button(
+                    "💾 Save slip (.json)",
+                    data=_json.dumps(my_slip, indent=2),
+                    file_name="my_slip.json", mime="application/json",
+                    key="slip_dl")
+                up = rc3.file_uploader("⬆️ Load slip", type="json",
+                                       key="slip_up", label_visibility="collapsed")
+                if up is not None:
+                    try:
+                        loaded = _json.loads(up.read().decode("utf-8"))
+                        if isinstance(loaded, list):
+                            st.session_state["my_slip"] = loaded
+                            st.success(f"Loaded {len(loaded)} picks.")
+                            st.rerun()
+                    except Exception:
+                        st.error("Couldn't read that slip file.")
+
+        st.markdown("### All live props")
+        if not live_rows:
+            st.info("No live games with tracked props right now. This lights up "
+                    "once games tip off and players with posted lines are on the "
+                    "floor — check back during game time.")
+        else:
+            import pandas as _pd
+            # Group by game.
+            bygame = {}
+            for r in live_rows:
+                bygame.setdefault(r["game"], []).append(r)
+            PW = {"points": "PTS", "rebounds": "REB", "assists": "AST",
+                  "threes_made": "3PM", "steals": "STL", "blocks": "BLK"}
+            st.caption(f"{len(bygame)} live game(s) · {len(live_rows)} "
+                       "tracked player-props.")
+            for gm in sorted(bygame):
+                rows = bygame[gm]
+                status = rows[0]["status"]
+                st.markdown(f"**🏀 {gm}**  ·  _{status}_")
+                data = []
+                for r in rows:
+                    if r["final"]:
+                        prog = "✅ HIT" if r["hit"] else "❌ missed"
+                    else:
+                        prog = ("✅ already over" if r["hit"]
+                                else ("🟢 on pace" if r["on_pace"]
+                                      else "🔴 behind pace"))
+                    data.append({
+                        "Player": r["player"], "Team": r["team"],
+                        "Prop": PW.get(r["stat"], r["stat"]),
+                        "Now": r["current"], "Line": r["line"],
+                        "Min": r["minutes"],
+                        "On pace for": r["pace_value"],
+                        "Status": prog,
+                    })
+                st.dataframe(_pd.DataFrame(data),
+                             use_container_width=True, hide_index=True)
+            st.caption("'On pace for' linearly extrapolates by minutes played — "
+                       "rough (blowouts, foul trouble, benched stars all break "
+                       "it), so treat it as a glance, not a projection.")
+
     # ----------------------- Track Record ----------------------- #
     with tab3:
         st.subheader("Prediction track record")
@@ -2334,7 +2748,7 @@ else:
             # Auto-load: scan when the tab opens with settings we haven't run yet.
             # The 5-min odds cache means re-opening the tab is usually free.
             sig = (tuple(scan_stats), min_edge)
-            refresh = st.button("🔄 Refresh now")
+            refresh = st.button("🔄 Refresh now", key="scanner_refresh")
             if (refresh
                     or "scan_rows" not in st.session_state
                     or st.session_state.get("scan_sig") != sig):
@@ -2372,10 +2786,36 @@ else:
                         df["EV %"] = df["EV %"].map(lambda v: f"{v:+.1f}%")
                         df["Win %"] = df["Win %"].astype(str) + "%"
                         df["Odds"] = df["Odds"].map(lambda v: f"{int(v):+d}")
+                        if "_pid" in df.columns:
+                            df = df.drop(columns=["_pid"])
                         return df
 
+                    # Enrich ONLY the rows we're about to show with shot-attempt
+                    # volume (one cached adv-stats call per shown player — the
+                    # scan itself stays fast by not doing this for all ~65).
+                    def _with_attempts(rows_in):
+                        import datetime as _dt2
+                        out = []
+                        _yr = _dt2.date.today().year if _dt2.date.today().month >= 10 \
+                            else _dt2.date.today().year - 1
+                        for r in rows_in:
+                            r2 = dict(r)
+                            pid = r.get("_pid")
+                            att = ""
+                            if pid is not None:
+                                a = goat_adv_avg(pid, _yr if _yr >= 2024 else 2024)
+                                u, c = a.get("uncontested_fga"), a.get("contested_fga")
+                                if u is not None or c is not None:
+                                    att = (f"{(u or 0)+(c or 0):.0f} FGA "
+                                           f"({(u or 0):.0f}u/{(c or 0):.0f}c)")
+                                    if a.get("passes") is not None:
+                                        att += f", {a['passes']:.0f} pass"
+                            r2["Shots/Passes"] = att
+                            out.append(r2)
+                        return out
+
                     if view == "Ranked list":
-                        top = base[:top_n]
+                        top = _with_attempts(base[:top_n])
                         st.markdown(f"Top {len(top)} by EV:")
                         st.dataframe(_fmt(pd.DataFrame(top)),
                                      use_container_width=True, hide_index=True)
@@ -2400,6 +2840,7 @@ else:
                             # Rank this game's plays by EV, then take the top N.
                             grows = sorted(games[key],
                                            key=lambda x: -x["EV %"])[:per_game]
+                            grows = _with_attempts(grows)
                             st.markdown(f"**🏀 {labels[key]}**")
                             show = [{k: v for k, v in r.items()
                                      if k != "Matchup"} for r in grows]
@@ -2407,8 +2848,10 @@ else:
                                          use_container_width=True,
                                          hide_index=True)
                     st.caption("Ranked by EV (best first). 'Value?' ✅ = edge "
-                               "clears your bar. Always sanity-check a pick on "
-                               "the Analyze tab before trusting it.")
+                               "clears your bar. 'Shots/Passes' = that player's "
+                               "per-game shot attempts (u=uncontested, "
+                               "c=contested) and passes. Always sanity-check a "
+                               "pick on the Analyze tab before trusting it.")
                 else:
                     st.info("No priced props to evaluate right now — check back "
                             "closer to tip-off when sportsbooks post lines.")
@@ -2459,6 +2902,9 @@ else:
         ratings = blended_team_ratings(_season)
         team_inj = cached_team_injuries()  # {team: [(name, status, ppg), ...]}
         _gl_four_factors = cached_four_factors(_season)  # eFG/TOV/OREB per team
+        _gl_open_odds = cached_opening_odds(gl_date)  # {game_id: opening lines}
+        _gl_iso = cached_team_style(_season, "playtype", "isolation")
+        _gl_drives = cached_team_style(_season, "tracking", "drives")
 
         if not lines:
             st.info("No game lines posted for this date yet. Sportsbook game "
@@ -2586,10 +3032,10 @@ else:
                                          if _evs["recommended_side"] == "over"
                                          else f"{away} {-sp_h:+g}")
                     if picks:
-                        quick = "  —  ✅ Pick: " + "  +  ".join(picks)
+                        quick = " · ✅ Pick: " + " + ".join(picks)
                     else:
                         fav = home if proj["exp_margin"] > 0 else away
-                        quick = f"  —  lean {fav} (no edge)"
+                        quick = f" · lean {fav} (no edge)"
                 # (No extra text for live/final games — the FINAL/LIVE tag and,
                 #  for final games, the grade below already say the status.)
 
@@ -2605,20 +3051,24 @@ else:
                     sp_h = g.get("spread")
                     ats = None
                     if sp_h is not None:
-                        # home covers if actual_margin + spread > 0
                         home_covered = (actual_margin + sp_h) > 0
                         ats = (model_home == home_covered)
                     winner = home if home_won else away
                     model_pick = home if model_home else away
-                    mark = "✅" if su_right else "❌"
-                    # Unambiguous: name who the MODEL picked, then hit/miss.
-                    bits = [f"picked {model_pick} {mark}"]
+                    # Plain, LABELED line: who won + score attached to teams,
+                    # then whether our pick was right in words.
+                    win_txt = (f"{winner} won "
+                               f"{max(sc['home'], sc['away'])}-"
+                               f"{min(sc['home'], sc['away'])}")
+                    pick_txt = (f"we picked {model_pick} — "
+                                + ("✅ right" if su_right else "❌ wrong"))
+                    ats_txt = ""
                     if ats is not None:
-                        bits.append(("ATS ✅" if ats else "ATS ❌"))
-                    grade_title = (f"  —  {sc['away']}-{sc['home']}  ·  "
-                                   + "  ".join(bits))
+                        ats_txt = ("  ·  spread: "
+                                   + ("✅ covered" if ats else "❌ missed"))
+                    grade_title = f"  ·  {win_txt}  ·  {pick_txt}{ats_txt}"
 
-                title = f"🏀  {matchup}    {tag}{quick}{grade_title}"
+                title = f"🏀 {matchup}  ·  {tag}{quick}{grade_title}"
                 with st.expander(title, expanded=False):
                     if proj and sc and sc.get("final"):
                         actual_margin = sc["home"] - sc["away"]
@@ -2708,6 +3158,40 @@ else:
                             + f"  (24h vol ${vol:,.0f}.) A big gap vs the "
                               "sportsbook line below can flag news the book "
                               "hasn't moved on yet — a signal, not a bet.")
+
+                    # ---- Line movement: where the number OPENED vs now ----
+                    opn = _gl_open_odds.get(matchup)
+                    if opn:
+                        from odds.line_movement import movement_label
+                        mv = []
+                        mt = movement_label(opn.get("total"), g.get("total"))
+                        if mt:
+                            mv.append(f"Total {mt}")
+                        ms = movement_label(opn.get("spread_home"),
+                                            g.get("spread"), kind="spread")
+                        if ms:
+                            mv.append(f"{home} spread {ms}")
+                        if mv:
+                            st.caption(
+                                "📊 Line movement — " + "  ·  ".join(mv)
+                                + ". The move since open shows which way the "
+                                  "market (often sharp money) leaned.")
+
+                    # ---- Team style: how each side plays (context) ----
+                    def _style(abbr):
+                        iso = (_gl_iso.get(abbr) or {}).get("ppp")
+                        drv = (_gl_drives.get(abbr) or {}).get("drives")
+                        bits = []
+                        if iso is not None:
+                            bits.append(f"ISO {iso:.2f} pts/poss")
+                        if drv is not None:
+                            bits.append(f"{drv:.0f} drives/game")
+                        return f"**{abbr}** " + ", ".join(bits) if bits else None
+                    sty = [x for x in (_style(home), _style(away)) if x]
+                    if sty:
+                        st.caption("🎬 Team style: " + "  ·  ".join(sty)
+                                   + ". (ISO efficiency = points per isolation "
+                                     "possession; drives = rim pressure.)")
 
                     # ---- Each team's DEFENSE: points allowed per 100 (#rank) --
                     def _def_line(abbr):
