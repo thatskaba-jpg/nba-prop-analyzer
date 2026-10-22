@@ -1297,6 +1297,19 @@ if "seeded_mode" not in st.session_state:
                 st.session_state[("i_" if _simple_now else "w_") + key] = rec[key]
         st.session_state["seeded_mode"] = _simple_now
 
+# Restore the bet slip from the URL once per session (survives Cloud reboots).
+if "_slip_restored" not in st.session_state:
+    st.session_state["_slip_restored"] = True
+    try:
+        import json as _js
+        _qs = st.query_params.get("slip")
+        if _qs:
+            _loaded = _js.loads(_qs)
+            if isinstance(_loaded, list):
+                st.session_state["my_slip"] = _loaded
+    except Exception:
+        pass
+
 
 def _build_config_from_state():
     """Read the builder widgets' session_state and return (config, error).
@@ -1337,6 +1350,17 @@ if config is not None:
             st.session_state["_last_model_url"] = _cur
     except Exception:
         pass
+
+# Persist the bet slip to the URL too, only when it changed.
+try:
+    import json as _js2
+    _slipcur = _js2.dumps(st.session_state.get("my_slip", []),
+                          separators=(",", ":"))
+    if st.session_state.get("_last_slip_url") != _slipcur:
+        st.query_params["slip"] = _slipcur
+        st.session_state["_last_slip_url"] = _slipcur
+except Exception:
+    pass
 
 
 # --------------------------------------------------------------------------- #
