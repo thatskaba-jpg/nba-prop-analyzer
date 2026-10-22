@@ -141,10 +141,6 @@ def pregame_features(player_id: int, prop_type: str, cutoff_date: str,
         "avg_last_10": tail_mean(10),
         "avg_last_20": tail_mean(20),
         "season_avg": float(stat.mean()),
-        # Average over the player's most recent SEASON on record (the season of
-        # his latest prior game) — a stable anchor that doesn't straddle the
-        # offseason gap the way a chronological "last 5" does early in the year.
-        "recent_season_avg": None,
         "std_last_10": float(stat.tail(10).std(ddof=0)) if n >= 2 else None,
         # Full-sample spread: a more stable estimate of game-to-game volatility,
         # used by the overdispersion-aware probability model (Negative Binomial).
@@ -154,32 +150,6 @@ def pregame_features(player_id: int, prop_type: str, cutoff_date: str,
             float(stat.std(ddof=0)) if n >= 2 else None),
         "avg_minutes_last_10": float(prior["minutes"].tail(10).mean()),
     }
-
-    # recent_season_avg: average over the player's LATEST season on record.
-    # Stable anchor for early-season projections (avoids the offseason-straddling
-    # "last 5"). Falls back silently if there's no season column.
-    #
-    # Also expose the CURRENT-season sample and the PRIOR-season average so the
-    # projection can blend them transparently: 1 game into a new season we lean
-    # on the prior-season prior, and the weight shifts to this season's games as
-    # they accumulate (see project_stat's early-season blend).
-    try:
-        if "season" in prior.columns and prior["season"].notna().any():
-            _seasons = sorted(prior["season"].dropna().unique().tolist())
-            _latest = _seasons[-1]
-            _cur = prior[prior["season"] == _latest]
-            _cur_s = _stat_series(_cur, prop_type)
-            if len(_cur_s) > 0:
-                feats["recent_season_avg"] = float(_cur_s.mean())
-                feats["current_season_games"] = int(len(_cur_s))
-                feats["current_season_avg"] = float(_cur_s.mean())
-            if len(_seasons) >= 2:
-                _prev = prior[prior["season"] == _seasons[-2]]
-                _prev_s = _stat_series(_prev, prop_type)
-                if len(_prev_s) > 0:
-                    feats["prior_season_avg"] = float(_prev_s.mean())
-    except Exception:
-        pass
 
     # --- Phase 5 context features (still leak-free: all from `prior`) ---
 

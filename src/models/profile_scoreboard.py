@@ -30,55 +30,18 @@ _SCORE_PATH = Path(__file__).resolve().parents[2] / "data" / \
     "profile_scoreboard.json"
 
 
-def _roster_strength(season):
-    """{team: {off, def}} from each team's CURRENT roster (mirrors the live
-    tab's early-season logic), so the trained-model grade uses the same inputs
-    the cards show. {} on error."""
-    try:
-        import numpy as np
-        from collect.goat_data import active_players, season_average
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _minf(m):
-            s = str(m or "")
-            if ":" in s:
-                a, b = s.split(":", 1)
-                return float(int(a)) + float(int(b)) / 60.0
-            return float(s or 0)
-        ap = active_players()
-
-        def _fetch(p):
-            sa = season_average(p["id"], season)
-            if not sa or not sa.get("games_played"):
-                sa = season_average(p["id"], season - 1)
-            return (p.get("team"), sa) if sa and sa.get("games_played") else None
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            rows = [r for r in ex.map(_fetch, ap) if r]
-        byteam = {}
-        for team, sa in rows:
-            byteam.setdefault(team, []).append(sa)
-        out = {}
-        for team, lst in byteam.items():
-            sc = sorted([(float(a.get("pts") or 0), _minf(a.get("min")))
-                         for a in lst], key=lambda x: x[1], reverse=True)
-            rot = [s for s in sc if s[1] >= 10][:10]
-            off = max(95.0, min(128.0, sum(p for p, _ in rot)))
-            stk = np.mean([float(a.get("stl") or 0) + float(a.get("blk") or 0)
-                           for a in lst])
-            reb = np.mean([float(a.get("reb") or 0) for a in lst])
-            deff = max(104.0, min(120.0,
-                                  113.0 - (stk - 1.3) * 4.0 - (reb - 4.0) * 1.2))
-            out[team] = {"off": off, "def": deff, "pace": 100.0}
-        return out
-    except Exception:
-        return {}
-
-
 def _blend_ratings(season):
     """Blend this + last season team ratings (mirrors the dashboard)."""
     from collect.goat_data import team_ratings_map
-    cur = team_ratings_map(season) or {}
-    prev = team_ratings_map(season - 1) or {}
+    try:
+        from collect.local_store import get_or_refresh
+        cur = get_or_refresh(f"team_ratings_{season}",
+                             lambda: team_ratings_map(season), 12) or {}
+        prev = get_or_refresh(f"team_ratings_{season - 1}",
+                              lambda: team_ratings_map(season - 1), 12) or {}
+    except Exception:
+        cur = team_ratings_map(season) or {}
+        prev = team_ratings_map(season - 1) or {}
     if not prev:
         return cur
     if not cur:
@@ -222,11 +185,6 @@ def update_scoreboard(season=2026, use_live=True):
     data = _load()
     done = set(data.get("graded_game_ids", []))
     ratings = _blend_ratings(season)
-    rost = _roster_strength(season)   # current-roster strength for the trained model
-    try:
-        from models.game_ml_model import predict_from_features
-    except Exception:
-        predict_from_features = None
     games = (_finished_games_live() if use_live else []) \
         or _finished_games(season)
     newly = 0
@@ -244,19 +202,6 @@ def update_scoreboard(season=2026, use_live=True):
             rec["total"] += 1
             if correct:
                 rec["correct"] += 1
-        # ---- The ACTUAL current model (trained + roster strength) ----
-        if predict_from_features and rost.get(home) and rost.get(away):
-            _h = (rost[home]["off"], rost[home]["def"], 0.5, 2)
-            _a = (rost[away]["off"], rost[away]["def"], 0.5, 2)
-            _tm = predict_from_features(_h, _a)
-            if _tm:
-                picked_home = _tm["margin"] > 0
-                correct = (picked_home == home_won)
-                rec = data["profiles"].setdefault(
-                    "🤖 Trained model (live)", {"correct": 0, "total": 0})
-                rec["total"] += 1
-                if correct:
-                    rec["correct"] += 1
         done.add(gid)
         newly += 1
     data["graded_game_ids"] = sorted(done, key=str)

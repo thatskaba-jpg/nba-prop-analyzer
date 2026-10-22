@@ -1,0 +1,24 @@
+{
+  "pending": {
+    "CLE @ PHI|2026-10-22": {
+      "home": "PHI",
+      "away": "CLE",
+      "spread_home": -3.5,
+      "proj_margin": 9.2,
+      "our_side": "home"
+    },
+    "DEN @ OKC|2026-10-22": {
+      "home": "OKC",
+      "away": "DEN",
+      "spread_home": -8.5,
+      "proj_margin": 14.4,
+      "our_side": "home"
+    }
+  },
+  "record": {
+    "correct": 0,
+    "wrong": 0,
+    "push": 0
+  },
+  "graded_ids": []
+}
