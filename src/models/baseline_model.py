@@ -50,6 +50,34 @@ def project_stat(feats: dict) -> float:
     a5 = feats.get("avg_last_5")
     a10 = feats.get("avg_last_10")
     season = feats.get("season_avg")
+    cur_n = feats.get("current_season_games")
+    cur_avg = feats.get("current_season_avg")
+    prior_avg = feats.get("prior_season_avg")
+
+    # EARLY-SEASON BLEND. A new season starts with almost no games, so the
+    # chronological "last 5/10" reach back into LAST season's tail (often
+    # lower-scoring playoff games) and misstate a player's real level. Instead
+    # of silently mixing across the season boundary, blend transparently:
+    # start from last season's average (the prior) and let THIS season's games
+    # take over as they accumulate. weight_current = n / (n + K): 1 game -> ~9%
+    # this season, K(=9) games -> 50/50, ~25 games -> this season dominates.
+    # Once there's a healthy current-season sample we fall through to the
+    # normal recent-form windows below.
+    K = 9
+    if cur_avg is not None and cur_n is not None and prior_avg is not None \
+            and cur_n < 20:
+        w_cur = cur_n / (cur_n + K)
+        blended = w_cur * cur_avg + (1.0 - w_cur) * prior_avg
+        # Nudge toward very recent in-season form if we have a few games.
+        if cur_n >= 3 and a5 is not None:
+            blended = 0.80 * blended + 0.20 * a5
+        return blended
+    # No prior season on record but a thin current one: lean on the prior-years
+    # average rather than a 1-game sample.
+    if cur_avg is not None and cur_n is not None and cur_n < 5 \
+            and season is not None:
+        w_cur = cur_n / (cur_n + K)
+        return w_cur * cur_avg + (1.0 - w_cur) * season
 
     # Fall back gracefully when a window is missing (few games played).
     parts, weights = [], []

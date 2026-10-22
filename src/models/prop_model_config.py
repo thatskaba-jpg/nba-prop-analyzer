@@ -74,6 +74,11 @@ def _recent_form_factor(feats, ctx):
     season = feats.get("season_avg")
     if a5 is None or not season:
         return 1.0, None
+    # Don't treat a boundary-straddling "last 5" as current form: after a long
+    # layoff (new season), those games are from last year and the hot/cold read
+    # is meaningless. Skip the factor in that case.
+    if (feats.get("rest_days") or 0) > 10:
+        return 1.0, None
     ratio = a5 / season
     # Clamp so one wild game can't blow it up.
     ratio = max(0.80, min(1.20, ratio))
@@ -123,6 +128,10 @@ def _rest_days_factor(feats, ctx):
     """rest_days: back-to-backs drag output down; good rest nudges up."""
     rd = feats.get("rest_days")
     if rd is None:
+        return 1.0, None
+    # A huge gap (>10d) isn't "rest" — it's a season break / layoff, where the
+    # meaning flips (rust, not freshness). Treat it as neutral, not a bonus.
+    if rd > 10:
         return 1.0, None
     if rd <= 1:
         return 0.97, f"short rest ({rd}d) x0.970"

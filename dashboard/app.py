@@ -121,11 +121,17 @@ try:
         player_advanced_avg,
     )
     from collect.goat_data import expected_threes, standings  # noqa: E402
+    from collect.goat_data import current_season_logs  # noqa: E402
+    from collect.goat_data import player_logs  # noqa: E402
+    from collect.goat_data import active_players  # noqa: E402
 except Exception:
     season_average = advanced_stats = standings_map = team_ratings_map = None
     player_advanced_avg = None
     expected_threes = None
     standings = None
+    current_season_logs = None
+    player_logs = None
+    active_players = None
 try:
     from collect.fetch_injuries import current_injury  # noqa: E402
 except Exception:
@@ -415,17 +421,19 @@ def hit_rate_windows(hist, prop_type, line, windows=(5, 10, 15)):
 
 @st.cache_data(show_spinner=False)
 def player_list():
+    """The players you can analyze — API-FIRST. We list every CURRENTLY ACTIVE
+    player from balldontlie (the source of truth for who's playing), so the
+    dropdown isn't limited to whoever already has rows in the local DB. The DB
+    is only a fallback when the API is unreachable."""
+    if 'active_players' in globals() and active_players is not None:
+        try:
+            ap = active_players()
+            if ap:
+                return [(p["name"], p["id"]) for p in ap]
+        except Exception:
+            pass
+    # Fallback: local DB (offline / API down).
     conn = get_connection()
-    # One row per NAME (players can have two ids across data sources). We pick
-    # a representative id and sum games across ids so the floor counts the
-    # player's whole career, not just one source. history loads by name anyway,
-    # so any id for that name resolves the full timeline.
-    #
-    # Floor is LOW (3 games) so active players with short histories — rookies,
-    # recent call-ups — still appear in the dropdown. The projection itself
-    # guards thin samples (it labels them "low confidence — small sample" and
-    # refuses to project with too few games), so a low floor can't produce a
-    # fake-confident number; it just stops hiding real players who are playing.
     rows = conn.execute(
         "SELECT player_name, MIN(player_id) AS pid, COUNT(*) c "
         "FROM player_game_logs GROUP BY player_name HAVING c >= 3 "
@@ -466,8 +474,32 @@ def defense_summary(cutoff, team):
 
 @st.cache_data(show_spinner=False, ttl=900)
 def cached_history(pid):
-    """Player game history, cached for the session so the value scanner doesn't
-    re-read the DB for the same player on every scan. Returns the DataFrame."""
+    """Player game history — API-FIRST. balldontlie (the paid GOAT tier) is the
+    source of truth, so we pull the player's full game-by-game history straight
+    from the API every time (cached 15 min). The local SQLite DB is only a
+    FALLBACK, used when the API is unreachable or returns nothing. This means a
+    prop analyzed tonight already reflects tonight's game, and we never serve a
+    stale DB snapshot when live data is available."""
+    import pandas as _pd
+    # API first: pull a wide window of recent seasons (oldest-first).
+    if 'player_logs' in globals() and player_logs is not None:
+        try:
+            from collect.daily_update import current_season_start_year
+            cur = current_season_start_year()
+            seasons = list(range(cur, cur - 6, -1))  # this season + prior 5
+            rows = player_logs(int(pid), seasons)
+            if rows:
+                df = _pd.DataFrame(rows)
+                df = df.drop_duplicates(subset=["game_id", "game_date"]) \
+                       .sort_values("game_date").reset_index(drop=True)
+                for col in ("steals", "blocks", "turnovers", "fouls"):
+                    if col in df.columns:
+                        df[col] = df[col].fillna(0).astype(int)
+                df["pra"] = df["points"] + df["rebounds"] + df["assists"]
+                return df
+        except Exception:
+            pass
+    # Fallback: local DB (offline / API down).
     return load_player_history(pid)
 
 
@@ -558,6 +590,16 @@ def cached_live_tracker():
 
 @st.cache_data(show_spinner=False)
 def team_abbrs():
+    """Team list — API-FIRST via the current standings (every NBA team), DB
+    fallback. The DB list is whatever opponents happen to appear in game logs."""
+    if standings_map is not None:
+        try:
+            from collect.daily_update import current_season_start_year
+            sm = standings_map(current_season_start_year())
+            if sm:
+                return sorted(sm.keys())
+        except Exception:
+            pass
     conn = get_connection()
     rows = conn.execute(
         "SELECT DISTINCT opponent FROM player_game_logs "
@@ -1661,7 +1703,7 @@ else:
                              horizontal=True, key="prop_type_pick")
 
         pid = id_of[sel]
-        hist = load_player_history(pid)
+        hist = cached_history(pid)
         # Predict an UPCOMING game: cutoff = the day AFTER the last game on
         # record, so every game to date is used (and nothing in the future —
         # there is nothing after it yet). This makes the card a true forward
