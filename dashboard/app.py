@@ -279,15 +279,28 @@ PROP_WORDS = {
 }
 # Friendly one-line descriptions for each factor (shown under its checkbox).
 FACTOR_HELP = {
-    "player_last_n_avg": "Is the player hot or cold lately?",
-    "opponent_defense": "Is the other team easy or hard to score on?",
+    "player_last_n_avg": "Hot or cold lately? Compares the last 5 games to the "
+                         "player's season average and leans the projection "
+                         "toward whichever way they're trending.",
+    "opponent_defense": "How good is tonight's opponent at defense overall? A "
+                        "weak defense nudges the projection up; a tough one "
+                        "nudges it down.",
+    "opponent_defense_by_position": "How well does the opponent defend THIS "
+                                    "player's position? Sharper than overall "
+                                    "defense — a team can lock up guards but get "
+                                    "torched by bigs.",
     "opponent_team_rating": "Official team numbers: a weaker defense (gives up "
                             "more points) and a faster pace (more possessions) "
                             "both make a bigger night more likely.",
-    "rest_days": "Is the player tired (played yesterday) or well-rested?",
-    "home_away_split": "Does the player do better at home or away?",
-    "minutes_trend": "Is the player getting more or less playing time?",
-    "player_vs_team": "How has the player done against this team before?",
+    "rest_days": "Tired or fresh? Played yesterday (back-to-back) nudges down; "
+                 "a few days off nudges up.",
+    "home_away_split": "Does the player put up better numbers at home or on the "
+                       "road? Leans toward their split for tonight's venue.",
+    "minutes_trend": "Is the player's role growing or shrinking? More minutes "
+                     "lately means more chances to pile up stats (nudge up); "
+                     "fewer means the opposite.",
+    "player_vs_team": "How has the player done against this specific opponent "
+                      "before? A small, weak signal — kept gentle on purpose.",
     "teammate_injuries": "Are the player's teammates hurt? If a teammate sits, "
                          "this player usually gets more shots and minutes, so "
                          "their line nudges up. This is game-day news that "
@@ -297,6 +310,39 @@ FACTOR_HELP = {
                         "means a grind (lean down). A huge spread means likely "
                         "blowout — stars rest in the 4th, capping their stats.",
 }
+
+
+# Combo stats are summed from base columns; singles map straight through.
+_HITRATE_COMBO = {
+    "pra": ("points", "rebounds", "assists"),
+    "pr": ("points", "rebounds"),
+    "pa": ("points", "assists"),
+    "ra": ("rebounds", "assists"),
+    "stocks": ("steals", "blocks"),
+}
+
+
+def hit_rate_windows(hist, prop_type, line, windows=(5, 10, 15)):
+    """How often the player went OVER `line` for this stat in their last N
+    games. Returns [(N, hits, n, over_pct, avg), ...] — real games only, so a
+    short career just reports fewer windows. None if the stat isn't countable
+    from the game log."""
+    if hist is None or len(hist) == 0:
+        return []
+    cols = _HITRATE_COMBO.get(prop_type, (prop_type,))
+    if any(c not in hist.columns for c in cols):
+        return []
+    series = hist[list(cols)].sum(axis=1).dropna()
+    if series.empty:
+        return []
+    out = []
+    for n in windows:
+        last = series.tail(n)
+        if len(last) == 0:
+            continue
+        hits = int((last > line).sum())
+        out.append((len(last), hits, hits / len(last), float(last.mean())))
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -1235,6 +1281,46 @@ else:
   {ev_strip}
 </div>
 """, unsafe_allow_html=True)
+
+            # --- Hit-rate cards: how often this player beat THIS line lately ---
+            hr = hit_rate_windows(hist, prop_type, line)
+            if hr:
+                st.markdown(
+                    '<div style="color:#93a1b5;font-size:.8rem;'
+                    'text-transform:uppercase;letter-spacing:.05em;'
+                    'margin:2px 0 6px 2px;">Hit rate — times this player went '
+                    f'OVER {line:g} {PROP_WORDS[prop_type].lower()}</div>',
+                    unsafe_allow_html=True)
+                cards = []
+                for n, hits, pct, avg in hr:
+                    p = int(round(pct * 100))
+                    # Green when history agrees with the OVER lean (or UNDER
+                    # with a low rate); grey when it's a coin flip.
+                    if p >= 60:
+                        col, foot = "#22c55e", "leans Over"
+                    elif p <= 40:
+                        col, foot = "#ef4444", "leans Under"
+                    else:
+                        col, foot = "#93a1b5", "coin flip"
+                    cards.append(
+                        f'<div style="flex:1;background:#141926;'
+                        f'border:1px solid #2a3142;border-radius:12px;'
+                        f'padding:12px 10px;text-align:center;">'
+                        f'<div style="color:#6b7688;font-size:.72rem;'
+                        f'text-transform:uppercase;letter-spacing:.05em;">'
+                        f'Last {n}</div>'
+                        f'<div style="font-size:1.6rem;font-weight:800;'
+                        f'color:{col};line-height:1.1;margin:2px 0;">{p}%</div>'
+                        f'<div style="color:#e6e9ef;font-size:.8rem;">'
+                        f'{hits}/{n} over</div>'
+                        f'<div style="color:#6b7688;font-size:.72rem;'
+                        f'margin-top:2px;">avg {avg:.1f} · {foot}</div>'
+                        f'</div>')
+                st.markdown(
+                    '<div style="display:flex;gap:10px;margin:0 0 14px 0;">'
+                    + "".join(cards) + '</div>', unsafe_allow_html=True)
+                st.caption("Past performance vs this exact line — not a "
+                           "prediction. Small samples swing fast.")
 
             if st.button("📒 Log this prediction to my track record"):
                 log_prediction(
