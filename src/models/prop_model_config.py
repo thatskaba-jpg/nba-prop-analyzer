@@ -44,6 +44,7 @@ from features.features import pregame_features, load_player_history  # noqa: E40
 from features.opponent_defense import defense_factors  # noqa: E402
 from models.baseline_model import (  # noqa: E402
     project_stat,
+    project_stat_rate,
     over_under_probabilities,
     confidence_label,
 )
@@ -221,6 +222,11 @@ def _confirmed_lineup_factor(feats, ctx):
     status = (ctx.get("lineup_status") or "").strip().lower()
     if status not in ("starter", "bench"):
         return 1.0, None
+    # Avoid double-counting: if the rate model is already adjusting projected
+    # MINUTES for this role change (minutes_override present), don't also apply
+    # the flat multiplier — the minutes override is the more precise mechanism.
+    if ctx.get("minutes_override") is not None:
+        return 1.0, None
     usually_starts = bool(ctx.get("usually_starts"))
     if status == "bench":
         if usually_starts:
@@ -232,6 +238,77 @@ def _confirmed_lineup_factor(feats, ctx):
         return 1.10, ("confirmed STARTING tonight (usually a reserve) — "
                       "more minutes/usage expected")
     return 1.0, None
+
+
+# Opportunity-driven stats: these scale with how many shots/possessions a player
+# gets, so usage and pace matter. Pure-efficiency or defensive stats don't, so
+# the factor is a no-op for them.
+_OPPORTUNITY_STATS = {
+    "points", "threes_made", "threes_att", "fgm", "fga", "ftm", "fta",
+    "pra", "pr", "pa", "assists", "rebounds",
+}
+_LEAGUE_USAGE = 0.20   # a league-average player uses ~20% of possessions.
+_LEAGUE_PACE = 100.0   # ~100 possessions/48 is a rough league-average pace.
+_LEAGUE_TS = 0.56      # ~0.56 true-shooting is a rough league-average mark.
+
+
+def _usage_and_pace_factor(feats, ctx):
+    """usage_and_pace: value the ADVANCED role signals we already fetch.
+
+    A high-usage player on a fast team gets more shots, touches and trips down
+    the floor than his raw average implies; a low-usage player on a slow team
+    gets fewer. ctx['player_adv'] carries the player's season advanced averages
+    (from balldontlie V2): usage (0-1 share of possessions) and pace
+    (possessions/48). We nudge opportunity-driven stats by how far each sits
+    from the league baseline, blended and capped so it refines, never dominates.
+
+    Deliberately conservative: usage is the stronger signal (direct share of
+    the offense), pace the weaker (team tempo). Combined move is capped at
+    +/-12%. No advanced data, or a non-opportunity stat -> no-op."""
+    prop = (ctx.get("_prop_type") or "").lower()
+    if prop and prop not in _OPPORTUNITY_STATS:
+        return 1.0, None
+    adv = ctx.get("player_adv") or {}
+    usage = adv.get("usage")
+    pace = adv.get("pace")
+    if usage is None and pace is None:
+        return 1.0, None
+
+    # Each component is a ratio vs league baseline, softened (half-weight) so a
+    # 25%-usage star doesn't get a full +25% — role already shows up in his raw
+    # average; this only captures the MARGINAL opportunity effect.
+    mult = 1.0
+    bits = []
+    if usage is not None and usage > 0:
+        u_ratio = usage / _LEAGUE_USAGE
+        u_adj = 1.0 + 0.5 * (u_ratio - 1.0)          # half-weight
+        u_adj = max(0.90, min(1.12, u_adj))
+        mult *= u_adj
+        bits.append(f"usage {usage*100:.0f}%")
+    if pace is not None and pace > 0:
+        p_ratio = pace / _LEAGUE_PACE
+        p_adj = 1.0 + 0.3 * (p_ratio - 1.0)          # weaker signal
+        p_adj = max(0.95, min(1.06, p_adj))
+        mult *= p_adj
+        bits.append(f"pace {pace:.0f}")
+    # Per-stat V2 EFFICIENCY: for MADE-shot stats, true shooting% refines the
+    # projection beyond pure volume — the same attempts convert more or less
+    # often. Only applied to makes (points/fgm/ftm/threes_made), never to
+    # attempts/volume. Half-weighted vs a ~0.56 league TS baseline, capped.
+    _MAKES = {"points", "fgm", "ftm", "threes_made"}
+    ts = adv.get("ts_pct")
+    if prop in _MAKES and ts is not None and ts > 0:
+        ts_adj = 1.0 + 0.5 * (ts / _LEAGUE_TS - 1.0)
+        ts_adj = max(0.93, min(1.08, ts_adj))
+        mult *= ts_adj
+        bits.append(f"TS {ts*100:.0f}%")
+    # Final clamp on the combined move.
+    mult = max(0.85, min(1.15, mult))
+    if abs(mult - 1.0) < 1e-3:
+        return 1.0, None
+    direction = "more" if mult > 1.0 else "fewer"
+    return mult, (f"role/tempo ({', '.join(bits)}) — {direction} "
+                  f"opportunities x{mult:.3f}")
 
 
 def _game_environment_factor(feats, ctx):
@@ -418,6 +495,11 @@ FACTORS: Dict[str, Factor] = {
         _confirmed_lineup_factor,
         needs="tonight's confirmed lineup (starter/bench, from the balldontlie "
               "lineups feed) + whether the player usually starts"),
+    "usage_and_pace": Factor(
+        "usage_and_pace", "Usage, Pace & Efficiency (advanced)", "Player",
+        _usage_and_pace_factor,
+        needs="the player's advanced season averages (usage% + pace, plus true-"
+              "shooting% for made-shot stats, from the balldontlie V2 feed)"),
     "game_environment": Factor(
         "game_environment", "Game Line (total + spread)", "Matchup",
         _game_environment_factor,
@@ -499,6 +581,59 @@ def build_config(name: str, mode: str, factors: Dict[str, object],
                        prop_types=prop_types or ["points"])
 
 
+# League-average two-team game total (points). A game's betting TOTAL above this
+# implies a faster/higher-scoring game than the teams' season pace alone says.
+_LEAGUE_TOTAL = 230.0
+
+
+def _projected_game_pace(ctx: dict):
+    """Per-game projected pace (possessions/48), or None if we can't estimate.
+
+    Combines two signals, both leak-free and already in ctx:
+      1. The two teams' SEASON pace (balldontlie team ratings) — the baseline.
+      2. Tonight's betting TOTAL vs a league-average total — the market's own
+         per-game read on tempo/scoring. A 240 total means a faster night than
+         either team's season average; a 210 total, slower.
+
+    We take the season two-team average, then tilt it by the total's deviation
+    from league average (half-weighted, capped), so pace becomes GAME-SPECIFIC
+    instead of a flat season number. Missing total -> season pace only; missing
+    both -> None (the rate model then skips the pace term)."""
+    tr = ctx.get("team_ratings_map") or {}
+    my_team = (ctx.get("current_team") or "").upper()
+    opp = (ctx.get("opponent_abbr") or "").upper()
+
+    # TRUE recent pace (last-N games per team) takes priority over season pace
+    # when present. ctx['recent_pace_map'] is {team_abbr: recent_pace} supplied
+    # by the dashboard from the team_game_pace collector.
+    rpm = ctx.get("recent_pace_map") or {}
+    recent = [rpm[t] for t in (my_team, opp) if rpm.get(t)]
+    season_paces = [tr[t].get("pace") for t in (my_team, opp)
+                    if t in tr and tr[t].get("pace")]
+    # Prefer recent pace; fill any missing side from season pace.
+    pace_vals = recent if len(recent) == 2 else (
+        recent + season_paces if recent else season_paces)
+    season_pace = sum(pace_vals) / len(pace_vals) if pace_vals else None
+
+    total = None
+    gl = ctx.get("game_line") or {}
+    if isinstance(gl, dict):
+        total = gl.get("total")
+
+    if season_pace is None and total is None:
+        return None
+    if total is None:
+        return season_pace
+    # Total-implied tempo ratio vs league average, half-weighted and capped so a
+    # single number can't swing pace wildly.
+    ratio = 1.0 + 0.5 * (float(total) / _LEAGUE_TOTAL - 1.0)
+    ratio = max(0.90, min(1.10, ratio))
+    if season_pace is None:
+        # No team pace: scale the league-average pace by the total signal.
+        return 100.0 * ratio
+    return season_pace * ratio
+
+
 def _apply_weight(factor_multiplier: float, weight: float) -> float:
     """Scale a factor's nudge by its weight.
 
@@ -522,6 +657,11 @@ def analyze(config: ModelConfig, player_id: int, prop_type: str, line: float,
     no-op (and the breakdown says so by omitting it) — never a crash.
     """
     ctx = context or {}
+    # Let factors know which stat they're adjusting (e.g. usage/pace only moves
+    # opportunity-driven stats). Non-destructive copy so the caller's dict is
+    # untouched across a multi-prop loop.
+    ctx = dict(ctx)
+    ctx["_prop_type"] = prop_type
     if history is None:
         history = load_player_history(player_id)
     feats = pregame_features(player_id, prop_type, cutoff_date, history,
@@ -535,6 +675,38 @@ def analyze(config: ModelConfig, player_id: int, prop_type: str, line: float,
             "p_under": None, "confidence": "none (no prior games)",
             "adjustments": [], "config": config.name,
         }
+
+    # --- Deeper RATE model: per-minute x projected-minutes x pace ------------
+    # Blend the totals projection with a rate projection so a change in ROLE
+    # (minutes) or TEMPO (pace) is valued explicitly, not hidden inside the
+    # totals average. The rate path is noisier (minutes vary), so by default it
+    # gets a MINORITY weight and only applies to opportunity-driven stats.
+    # ctx flags (all optional): use_rate_model (default True), rate_blend (0..1,
+    # default 0.35), minutes_override (lineup/injury-adjusted minutes).
+    base_desc = None
+    _RATE_STATS = {"points", "threes_made", "threes_att", "fgm", "fga",
+                   "ftm", "fta", "rebounds", "assists", "pra", "pr", "pa",
+                   "ra", "steals", "blocks", "turnovers", "stocks"}
+    if ctx.get("use_rate_model", True) and prop_type in _RATE_STATS:
+        # Per-game projected pace: two-team season pace tilted by tonight's
+        # betting total (the market's tempo read). None -> no pace adjustment.
+        pace = _projected_game_pace(ctx)
+        rate_base = project_stat_rate(
+            feats, pace=pace, minutes_override=ctx.get("minutes_override"))
+        if rate_base is not None and rate_base > 0:
+            blend = ctx.get("rate_blend", 0.35)
+            blend = max(0.0, min(1.0, float(blend)))
+            blended = (1 - blend) * base + blend * rate_base
+            _mo = ctx.get("minutes_override")
+            _eff_min = _mo if _mo is not None else feats.get("proj_minutes", 0)
+            base_desc = (f"rate model {rate_base:.1f} (per-min "
+                         f"{feats.get('per_min_rate', 0):.3f} x "
+                         f"{_eff_min:.0f} min"
+                         + (" [confirmed-role minutes]" if _mo is not None else "")
+                         + (f" x pace {pace:.0f}" if pace else "")
+                         + f") blended {blend:.0%} with totals {base:.1f} "
+                         f"-> {blended:.1f}")
+            base = blended
 
     weights = config.normalized_weights()
     projection = base
@@ -649,6 +821,7 @@ def analyze(config: ModelConfig, player_id: int, prop_type: str, line: float,
         "line": line,
         "cutoff_date": cutoff_date,
         "base_projection": round(base, 2),
+        "base_desc": base_desc,
         "projection": projection,
         "p_over": round(p_over, 4) if p_over is not None else None,
         "p_under": round(p_under, 4) if p_under is not None else None,

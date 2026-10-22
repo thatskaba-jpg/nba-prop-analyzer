@@ -30,7 +30,25 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 sys.path.append(str(Path(__file__).resolve().parent))
 
 from database import get_connection, init_schema, DB_PATH  # noqa: E402
-from balldontlie_client import iter_pages, BallDontLieError, RATE_NOTE  # noqa: E402
+from balldontlie_client import iter_pages, BallDontLieError, RATE_NOTE, _get  # noqa: E402
+
+
+def _load_team_abbr_map():
+    """{team_id: abbreviation} from the free /teams endpoint, fetched once so
+    the collector can name each game's opponent. {} on failure (opponent then
+    stays None rather than guessed)."""
+    try:
+        data = _get("teams")
+        out = {}
+        for t in (data.get("data") or []):
+            if t.get("id") is not None and t.get("abbreviation"):
+                out[t["id"]] = t["abbreviation"]
+        return out
+    except Exception:
+        return {}
+
+
+_TEAM_ABBR = _load_team_abbr_map()
 
 # Checkpoints let a stopped download resume instead of starting the season over.
 CKPT_DIR = Path(__file__).resolve().parents[2] / "data" / "checkpoints"
@@ -97,7 +115,20 @@ def _store_rows(conn, rows, season) -> int:
         is_home = None
         if home_id is not None and player_team_id is not None:
             is_home = 1 if player_team_id == home_id else 0
-        matchup = team_abbr or ""
+        # Opponent = the game's OTHER team. Previously left None, which silently
+        # broke the player-vs-opponent history factor for all current-season
+        # games. Derive the opponent id, map it to an abbreviation, and store a
+        # full "TEAM vs OPP" / "TEAM @ OPP" matchup.
+        vis_id = game.get("visitor_team_id")
+        opp_id = None
+        if player_team_id is not None and home_id is not None and vis_id is not None:
+            opp_id = vis_id if player_team_id == home_id else home_id
+        opp_abbr = _TEAM_ABBR.get(opp_id) if opp_id is not None else None
+        if team_abbr and opp_abbr:
+            matchup = (f"{team_abbr} vs {opp_abbr}" if is_home
+                       else f"{team_abbr} @ {opp_abbr}")
+        else:
+            matchup = team_abbr or ""
 
         # Defensive field lookup: balldontlie uses stl/blk/pf and (historically)
         # either 'turnover' or 'turnovers'. Try the known aliases so we never
@@ -114,14 +145,16 @@ def _store_rows(conn, rows, season) -> int:
             INSERT OR REPLACE INTO player_game_logs
             (player_id, player_name, game_id, game_date, season, matchup,
              is_home, opponent, minutes, points, rebounds, assists, threes_made,
-             steals, blocks, turnovers, fouls)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             threes_att, fgm, fga, ftm, fta, steals, blocks, turnovers, fouls)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 int(player_id), name, game_id, game_date, str(season), matchup,
-                is_home, None, _minutes_to_float(r.get("min")),
+                is_home, opp_abbr, _minutes_to_float(r.get("min")),
                 int(g("pts") or 0), int(g("reb") or 0),
                 int(g("ast") or 0), int(g("fg3m") or 0),
+                int(g("fg3a") or 0), int(g("fgm") or 0), int(g("fga") or 0),
+                int(g("ftm") or 0), int(g("fta") or 0),
                 int(g("stl") or 0), int(g("blk") or 0),
                 int(g("turnover", "turnovers", "to") or 0), int(g("pf") or 0),
             ),

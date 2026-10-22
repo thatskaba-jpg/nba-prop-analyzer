@@ -8,7 +8,8 @@ One command that keeps the system current. Run it daily (by hand, or from cron):
 It does three things, in order, each safe to repeat:
   1. Pulls new games for the CURRENT season from balldontlie (resumable; picks
      up where it left off, respects the trial's rate limit).
-  2. Backfills opponent + home/away on any new rows.
+  2. Backfills opponent + home/away on any new rows, refreshes injuries
+     (balldontlie + ESPN), rosters, and per-game team pace.
   3. Grades every pending prediction whose game has now been played, updating
      the live prediction-tracking record.
 
@@ -86,6 +87,32 @@ def run():
         fetch_rosters()
     except Exception as e:
         print(f"  Roster refresh skipped ({e}).")
+
+    # 2c-pace) Refresh per-game team pace (for the rate model's TRUE recent
+    #          pace). Pulls this season (and last season early on, when this
+    #          season's sample is thin). Best-effort — never blocks the run.
+    print("\n[2c-pace] Refreshing per-game team pace...")
+    try:
+        from fetch_team_pace import fetch_team_pace
+        fetch_team_pace(season)
+        # Early in the season, also keep last season fresh so recent-pace has
+        # enough games to average.
+        if date.today().month in (10, 11):
+            fetch_team_pace(season - 1)
+    except Exception as e:
+        print(f"  Team-pace refresh skipped ({e}).")
+
+    # 2c-adv) Refresh per-player advanced averages (PIE/usage/def rating) so
+    #         team strength is built from how good the PLAYERS are, not just
+    #         season box-score ratings. Best-effort.
+    print("\n[2c-adv] Refreshing player advanced stats...")
+    try:
+        from fetch_player_advanced import fetch_player_advanced
+        fetch_player_advanced(season)
+        if date.today().month in (10, 11):
+            fetch_player_advanced(season - 1)
+    except Exception as e:
+        print(f"  Player-advanced refresh skipped ({e}).")
 
     # 2d) Capture today's REAL prop lines and grade any settled stored lines.
     #      This is how we accumulate a real-line results set for honest

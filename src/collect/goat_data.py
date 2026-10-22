@@ -30,7 +30,10 @@ def _get_all(path, params):
     params = dict(params or {})
     params.setdefault("per_page", 100)
     rows = []
-    for _ in range(100):  # hard cap against a bad cursor
+    # Hard cap purely as a runaway guard against a bad cursor; the real stop is
+    # meta.next_cursor going empty below. A full season of per-player V2 rows is
+    # ~250 pages, so 1000 leaves headroom without being unbounded.
+    for _ in range(1000):
         try:
             payload = _get(path, params)
         except BallDontLieError:

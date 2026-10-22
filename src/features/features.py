@@ -30,6 +30,11 @@ STAT_COLUMNS = {
     "rebounds": "rebounds",
     "assists": "assists",
     "threes_made": "threes_made",
+    "threes_att": "threes_att",
+    "fgm": "fgm",
+    "fga": "fga",
+    "ftm": "ftm",
+    "fta": "fta",
     "steals": "steals",
     "blocks": "blocks",
     "turnovers": "turnovers",
@@ -69,11 +74,22 @@ def load_player_history(player_id: int) -> pd.DataFrame:
         conn.close()
         return pd.DataFrame()
     name = name_row["player_name"]
+    # Build the column list defensively: attempts columns (threes_att/fga/fta)
+    # may not exist yet on a DB created before this migration ran. Select them
+    # only when present, and synthesize 0-filled columns otherwise, so the app
+    # keeps working between the code deploy and the backfill/restart.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(player_game_logs)")}
+    optional = [c for c in ("threes_att", "fgm", "fga", "ftm", "fta")
+                if c in have]
+    select_cols = (
+        "game_date, season, is_home, opponent, matchup, game_id, "
+        "minutes, points, rebounds, assists, threes_made, "
+        "steals, blocks, turnovers, fouls"
+        + ("".join(f", {c}" for c in optional))
+    )
     df = pd.read_sql_query(
-        """
-        SELECT game_date, season, is_home, opponent, matchup, game_id,
-               minutes, points, rebounds, assists, threes_made,
-               steals, blocks, turnovers, fouls
+        f"""
+        SELECT {select_cols}
         FROM player_game_logs
         WHERE player_name = ?
         ORDER BY game_date ASC
@@ -81,6 +97,11 @@ def load_player_history(player_id: int) -> pd.DataFrame:
         conn, params=(name,),
     )
     conn.close()
+    # Backfill any missing optional column with 0 so downstream code (STAT_COLUMNS
+    # for threes_att/fga/fta) finds the column regardless of DB age.
+    for c in ("threes_att", "fgm", "fga", "ftm", "fta"):
+        if c not in df.columns:
+            df[c] = 0
     if not df.empty:
         # The two sources can both hold the same game (overlap around 2024);
         # de-dupe on game_id + date so one game isn't counted twice.
@@ -93,9 +114,10 @@ def load_player_history(player_id: int) -> pd.DataFrame:
         # over/under probabilities, and the backtest alike.
         df = df[df["minutes"].fillna(0) > 0].reset_index(drop=True)
     if not df.empty:
-        for col in ("steals", "blocks", "turnovers", "fouls"):
+        for col in ("steals", "blocks", "turnovers", "fouls",
+                    "threes_att", "fgm", "fga", "ftm", "fta"):
             if col in df.columns:
-                df[col] = df[col].fillna(0).astype(int)
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
         df["pra"] = df["points"] + df["rebounds"] + df["assists"]
     return df
 
@@ -158,6 +180,37 @@ def pregame_features(player_id: int, prop_type: str, cutoff_date: str,
         "avg_minutes_last_10": float(prior["minutes"].tail(10).mean()),
     }
 
+    # --- Rate-model features (per-minute production + projected minutes) ------
+    # A deeper projection path: stat = per-minute rate x projected minutes x
+    # pace. Here we compute the player's own pieces (leak-free, from `prior`);
+    # the pace multiplier is applied later from game context.
+    #   per_min_rate : recent stat per minute, weighted toward recent games but
+    #                  computed as total_stat/total_minutes (not a mean of
+    #                  ratios) so garbage-time minutes don't distort it.
+    #   proj_minutes : expected minutes tonight = recent minutes, nudged by the
+    #                  minutes trend (rising/falling role). This is how we
+    #                  explicitly VALUE minutes in the projection.
+    try:
+        mins = prior["minutes"].astype(float)
+        # Weighted per-minute rate: last-5 (0.5), last-10 (0.3), season (0.2),
+        # each as total_stat/total_minutes over that window.
+        def _rate(k):
+            m = mins.tail(k).sum()
+            s = stat.tail(k).sum()
+            return (float(s) / float(m)) if m > 0 else None
+        r5, r10, rseason = _rate(5), _rate(10), _rate(n)
+        parts = [(r5, 0.5), (r10, 0.3), (rseason, 0.2)]
+        parts = [(v, w) for v, w in parts if v is not None]
+        if parts:
+            tw = sum(w for _, w in parts)
+            feats["per_min_rate"] = sum(v * w for v, w in parts) / tw
+        else:
+            feats["per_min_rate"] = None
+        # Projected minutes: recent-10 minutes as the base.
+        feats["proj_minutes"] = float(mins.tail(10).mean())
+    except Exception:
+        feats["per_min_rate"] = None
+        feats["proj_minutes"] = None
     # --- Trade-aware team context (leak-free: all from `prior`) ---------------
     # The per-game `matchup` string starts with the player's OWN team for that
     # game (e.g. "CLE vs NYK" -> "CLE"), so we can tell which team each prior

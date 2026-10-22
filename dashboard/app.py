@@ -23,6 +23,13 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 from database import get_connection  # noqa: E402
+# Apply non-destructive schema migrations (ADD COLUMN) on startup so new stat
+# columns (e.g. threes_att/fga/fta) exist before any read. Safe + idempotent.
+try:
+    from database import init_schema as _init_schema  # noqa: E402
+    _init_schema()
+except Exception:
+    pass
 from features.features import load_player_history  # noqa: E402
 from features.opponent_defense import defense_factors  # noqa: E402
 from models.prop_model_config import FACTORS, build_config, analyze  # noqa: E402
@@ -323,6 +330,11 @@ button[data-testid="stSidebarCollapseButton"] svg {
 PROP_WORDS = {
     "points": "Points", "rebounds": "Rebounds", "assists": "Assists",
     "threes_made": "3-Pointers Made",
+    "threes_att": "3-Point Attempts",
+    "fgm": "Field Goals Made",
+    "fga": "Field-Goal Attempts",
+    "ftm": "Free Throws Made",
+    "fta": "Free-Throw Attempts",
     "steals": "Steals", "blocks": "Blocks", "turnovers": "Turnovers",
     "pra": "Pts + Reb + Ast (PRA)",
     "pr": "Pts + Reb", "pa": "Pts + Ast", "ra": "Reb + Ast",
@@ -550,6 +562,29 @@ def team_abbrs():
     return [r["opponent"] for r in rows]
 
 
+def _h2h_vs_opponent(hist, opp, stat, cutoff=None):
+    """(avg, games) for how this player has done in `stat` vs opponent `opp`,
+    using only games strictly BEFORE cutoff (leak-free) when cutoff is given.
+    Returns (None, 0) when the column/opponent is missing or too few meetings.
+    Feeds the player_vs_team factor, which was dormant because nothing computed
+    this and (until the collector fix) opponent was never stored."""
+    try:
+        if hist is None or opp is None or stat not in hist.columns:
+            return None, 0
+        df = hist
+        if "opponent" not in df.columns:
+            return None, 0
+        if cutoff is not None and "game_date" in df.columns:
+            df = df[df["game_date"].astype(str) < str(cutoff)]
+        vs = df[df["opponent"] == opp]
+        n = int(len(vs))
+        if n < 3:
+            return None, n
+        return float(vs[stat].mean()), n
+    except Exception:
+        return None, 0
+
+
 @st.cache_data(show_spinner=False)
 def cached_pos_defense_raw(stat, cutoff):
     """Raw stat-allowed-to-position + league rank per team, cached."""
@@ -651,23 +686,103 @@ def goat_season_avg(pid, season):
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def goat_team_ratings(season):
-    """Team off/def/net ratings + pace from balldontlie (advanced team season
-    averages). Fetched from the API ONCE, then served from the on-disk store
-    for 12h so we don't re-pull the same ratings on every page load (which
-    wasted calls and tripped 429s). Falls back to a stale copy if a refresh
-    fails, and to an empty dict only if we've never stored it."""
-    if team_ratings_map is None:
-        return {}
-    try:
-        from collect.local_store import get_or_refresh
-        return get_or_refresh(f"team_ratings_{season}",
-                              lambda: team_ratings_map(season),
-                              max_age_hours=12) or {}
-    except Exception:
+    """Team off/def/net ratings + pace, roster-strength FIRST.
+
+    The balldontlie team-ratings API feed is unreliable early in a season
+    (compressed/flat, missing teams). So every surface that asks for team
+    ratings now gets the DB-first, trade-aware ROSTER strength (current roster x
+    player advanced stats) overlaid on top of the API feed — the roster numbers
+    win for any team they cover, the API feed fills the rest. Served from the
+    12h disk store; empty dict only if nothing is available at all."""
+    api = {}
+    if team_ratings_map is not None:
         try:
-            return team_ratings_map(season)
+            from collect.local_store import get_or_refresh
+            api = get_or_refresh(f"team_ratings_{season}",
+                                 lambda: team_ratings_map(season),
+                                 max_age_hours=12) or {}
         except Exception:
+            try:
+                api = team_ratings_map(season) or {}
+            except Exception:
+                api = {}
+    # Overlay roster-based strength (primary). One place, so prop factors, the
+    # analyze tab and the game-lines tab all agree.
+    try:
+        from models.roster_strength_db import team_strength_map
+        roster = team_strength_map(season) or {}
+        return _blend_roster_api(roster, api)
+    except Exception:
+        return api
+
+
+# Games-played handoff: how many API games before the API feed is trusted ~50%.
+# Below this the roster-based strength dominates (early-season the API ratings
+# are compressed/flat); past it the API's real game data takes over. K=8 means
+# the API is already the majority source by ~8-10 games (a couple weeks), not
+# dragging out across the whole season.
+_RATINGS_HANDOFF_K = 8.0
+
+
+def _blend_roster_api(roster, api):
+    """Per-team blend of roster strength and the API ratings feed, weighted by
+    how many games the API has logged for that team. Early season (few games)
+    leans on roster strength; as games accumulate the API feed takes over.
+    A team only in one source uses that source."""
+    teams = set(roster) | set(api)
+    out = {}
+    for ab in teams:
+        r = roster.get(ab)
+        a = api.get(ab)
+        if not r:
+            out[ab] = dict(a); continue
+        if not a or a.get("off") is None or a.get("def") is None:
+            out[ab] = {"off": r["off"], "def": r["def"],
+                       "pace": r.get("pace", 100.0)}
+            continue
+        n = a.get("games") or 0
+        w_api = max(0.0, min(1.0, n / (n + _RATINGS_HANDOFF_K)))  # API weight
+        b = dict(a)
+        for f in ("off", "def"):
+            b[f] = round(w_api * a[f] + (1 - w_api) * r[f], 1)
+        b["pace"] = a.get("pace") or r.get("pace", 100.0)
+        out[ab] = b
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_team_form(teams_tuple, cutoff, n=10):
+    """{team: {recent_margin, rest_days}} for the game model — recent form +
+    rest, reconstructed leak-free from local game logs (no API). Cached 30 min;
+    tuple key so Streamlit can hash it. Empty on error (model falls back)."""
+    try:
+        from models.team_form import team_form_map
+        return team_form_map([t for t in teams_tuple if t], cutoff, n)
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def recent_pace_map(teams_tuple, cutoff, n=10):
+    """{team_abbr: recent_pace} for the given teams, from the per-game pace
+    collector (team_game_pace). Leak-free: averages each team's last n games
+    before `cutoff`. Empty for teams with no stored pace, so the rate model
+    cleanly falls back to season pace. Cached 30 min; a tuple key so Streamlit
+    can hash it."""
+    try:
+        from collect.fetch_team_pace import recent_team_pace, _table_ready
+        if not _table_ready():
             return {}
+        out = {}
+        for t in teams_tuple:
+            if not t:
+                continue
+            rp = recent_team_pace(t, cutoff, n)
+            if rp:
+                out[t.upper()] = rp
+        return out
+    except Exception:
+        return {}
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -1083,6 +1198,40 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
             inj = current_injury(pid)
             _early = season_games_count(hist) < MIN_SEASON_GAMES_FOR_VALUE
 
+            # Confirmed starting lineup (tonight) — cached per team, so this is
+            # one feed hit per team no matter how many of its players we scan.
+            # 'usually_starts' is proxied by recent minutes (a rotation starter
+            # plays ~24+ mpg); only an explicit starter/bench slot moves the
+            # projection (see the confirmed_lineup factor).
+            scan_lineup_status = None
+            scan_usually_starts = False
+            scan_min_override = None
+            try:
+                _lu = cached_team_lineup(my_team) if my_team else None
+                if _lu and _lu.get("starters"):
+                    _last = name.split()[-1]
+                    if any(_last in s for s in _lu["starters"]):
+                        scan_lineup_status = "starter"
+                    elif any(_last in b for b in _lu.get("bench", [])):
+                        scan_lineup_status = "bench"
+                    _rm = float(hist["minutes"].tail(10).mean())
+                    scan_usually_starts = _rm >= 24.0
+                    # Role-change minutes override (mirrors the Analyze tab).
+                    if scan_lineup_status == "starter" and not scan_usually_starts:
+                        scan_min_override = max(_rm, 28.0)
+                    elif scan_lineup_status == "bench" and scan_usually_starts:
+                        scan_min_override = min(_rm, 16.0)
+            except Exception:
+                scan_lineup_status = None
+
+            # Advanced role (usage% + pace) — cached per player-season.
+            scan_adv = None
+            try:
+                _sc = int(cutoff[:4])
+                scan_adv = goat_adv_avg(pid, _sc if _sc >= 2024 else 2024)
+            except Exception:
+                scan_adv = None
+
             for stat in stats:
                 hit = player_props.get(stat)
                 if not hit or not hit.get("line"):
@@ -1099,6 +1248,19 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                     "team_ratings_map": shared_team_ratings,
                     "current_team": my_team,
                 }
+                ctx.update(_rate_ctx())  # rate-model toggle + blend
+                ctx["recent_pace_map"] = recent_pace_map((my_team, opp), cutoff)
+                _s_h2h_avg, _s_h2h_n = _h2h_vs_opponent(hist, opp, stat, cutoff)
+                if _s_h2h_avg is not None:
+                    ctx["h2h_avg"] = _s_h2h_avg
+                    ctx["h2h_games"] = _s_h2h_n
+                if scan_lineup_status:
+                    ctx["lineup_status"] = scan_lineup_status
+                    ctx["usually_starts"] = scan_usually_starts
+                    if scan_min_override is not None:
+                        ctx["minutes_override"] = scan_min_override
+                if scan_adv:
+                    ctx["player_adv"] = scan_adv
                 if inj:
                     ctx["injury_status"] = inj[0]
                 mates_out = shared_out_teammates.get(pid)
@@ -1119,6 +1281,18 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                 # miscalibrated for very low lines (e.g. 0.5 blocks/steals).
                 lean = "OVER" if res["projection"] > line else "UNDER"
                 ev_pick = ev["ev_over_pct"] if lean == "OVER" else ev["ev_under_pct"]
+                # Compact 'why' for the scanner table — same honest logic as the
+                # Analyze why-box, condensed to one line.
+                _edge = res["projection"] - line
+                _sc_season = int(cutoff[:4]) if cutoff else 2026
+                if _sc_season < 2024:
+                    _sc_season = 2024
+                _sc_weak = _opp_weakness_note(opp, _sc_season, stat)
+                _sc_hr = hit_rate_windows(hist, stat, line)
+                _sc_bits, _ = _why_take_it(res, lean, _edge, line, stat, opp,
+                                           _sc_hr, opp_weak=_sc_weak)
+                # Strip markdown bold for the table cell.
+                _why_txt = " ".join(b.replace("**", "") for b in _sc_bits)
                 rows.append({
                     "Player": name,
                     "Matchup": f"{my_team} {'vs' if is_home else '@'} {opp}",
@@ -1134,6 +1308,7 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                                        ev["recommended_side"] == lean.lower())
                               else ("⏳" if (ev["is_value"] and _early) else ""),
                     "Books": hit.get("books", 0),
+                    "Why": _why_txt,
                     "_pid": pid,
                 })
         except Exception:
@@ -1206,6 +1381,100 @@ def _plain_reason(adj: str) -> str:
     return f"**{name}** — {why}."
 
 
+def _opp_weakness_note(opp, season, prop_type):
+    """A short 'what this opponent gives up' line, tailored to the prop type,
+    from the team-style defense tables. Returns '' when no data (so the why-box
+    just omits it rather than guessing)."""
+    try:
+        ddef = cached_team_style(season, "general", "defense").get(opp) or {}
+        drim = cached_team_style(season, "tracking", "defense").get(opp) or {}
+    except Exception:
+        return ""
+    bits = []
+    paint = ddef.get("opp_pts_paint")
+    rim = drim.get("def_rim_fg_pct")
+    fb = ddef.get("opp_pts_fb")
+    # Scoring/makes props care about paint + rim; everything else still benefits
+    # from the paint read, which is the most interpretable single number.
+    if prop_type in ("points", "fgm", "fga", "rebounds", "threes_made"):
+        if paint is not None:
+            bits.append(f"{paint:.0f} paint pts/g allowed")
+        if rim is not None:
+            bits.append(f"{rim*100:.0f}% allowed at the rim")
+        if fb is not None and prop_type == "points":
+            bits.append(f"{fb:.0f} fast-break pts/g")
+    else:
+        if paint is not None:
+            bits.append(f"{paint:.0f} paint pts/g allowed")
+    return " · ".join(bits[:3])
+
+
+def _why_take_it(res, lean, edge, line, prop_type, opp, hr, opp_weak=""):
+    """Plain-English 'why this is the pick' — built ONLY from what the model
+    actually produced (projection vs line, the factor that moved it most, the
+    matchup, recent hit-rate). Never fabricates a reason: if the edge is thin or
+    nothing drove it, it says so. Returns (headline, bullets, honest_caveat)."""
+    word = PROP_WORDS.get(prop_type, prop_type).lower()
+    proj = res.get("projection")
+    bullets = []
+
+    # 1) The core: projection vs the line.
+    if proj is not None:
+        gap = abs(edge)
+        if lean == "OVER":
+            bullets.append(
+                f"The model projects **{proj} {word}** — {gap:.1f} above the "
+                f"{line:g} line, so it leans **OVER**.")
+        else:
+            bullets.append(
+                f"The model projects **{proj} {word}** — {gap:.1f} below the "
+                f"{line:g} line, so it leans **UNDER**.")
+
+    # 2) The single biggest matchup/form driver (from the real adjustments).
+    adjs = res.get("adjustments") or []
+    if adjs:
+        import re as _re
+        def _mag(a):
+            n = _re.findall(r"\(([\d.]+) -> ([\d.]+)\)", a)
+            if not n:
+                return 0.0
+            b, af = n[-1]
+            return abs(float(af) - float(b))
+        top = max(adjs, key=_mag)
+        if _mag(top) > 0.05:
+            bullets.append("Biggest factor: " + _plain_reason(top).lstrip("• "))
+
+    # 2b) Opponent's specific defensive weakness (paint / rim / fast break).
+    if opp_weak:
+        bullets.append(f"Matchup: **{opp}** gives up {opp_weak}.")
+
+    # 3) Recent hit-rate vs THIS line (if computed).
+    if hr:
+        n, hits, pct, _avg = hr[0]
+        p = int(round(pct * 100))
+        agree = ((lean == "OVER" and p >= 60) or (lean == "UNDER" and p <= 40))
+        if agree:
+            bullets.append(
+                f"History agrees: he went {'over' if lean=='OVER' else 'under'} "
+                f"this line in {hits}/{n} of his last {n} games.")
+        else:
+            bullets.append(
+                f"Note: recent hit-rate ({hits}/{n} over last {n}) doesn't "
+                f"strongly back this lean — the edge is coming from the "
+                f"projection, not the streak.")
+
+    # Honest confidence read.
+    conf = (res.get("confidence") or "").lower()
+    thin = abs(edge) < 1.0 or "low" in conf or "early" in conf
+    if thin:
+        caveat = ("⚠️ Thin edge — treat this as lean, not a lock. Small samples "
+                  "and early-season noise can flip it.")
+    else:
+        caveat = ("This is the model's read from form + matchup, not a "
+                  "guarantee. Always sanity-check injuries and the posted line.")
+    return bullets, caveat
+
+
 # --------------------------------------------------------------------------- #
 # MODEL BUILDER STATE  (rendered as a tab below — NOT the sidebar, which is
 # unusable on phones). Config is built from session_state so every tab sees it
@@ -1216,15 +1485,15 @@ def _plain_reason(adj: str) -> str:
 RECOMMENDED_SIMPLE = {
     "player_last_n_avg": "high", "opponent_defense_by_position": "high",
     "opponent_team_rating": "medium", "teammate_injuries": "medium",
-    "confirmed_lineup": "medium",
+    "confirmed_lineup": "medium", "usage_and_pace": "medium",
     "game_environment": "medium",
     "rest_days": "medium", "home_away_split": "low", "minutes_trend": "low",
 }
 RECOMMENDED_WEIGHTED = {
-    "player_last_n_avg": 28, "opponent_defense_by_position": 20,
-    "opponent_team_rating": 12, "teammate_injuries": 10,
-    "confirmed_lineup": 8, "game_environment": 10,
-    "rest_days": 6, "home_away_split": 3, "minutes_trend": 3,
+    "player_last_n_avg": 26, "opponent_defense_by_position": 18,
+    "opponent_team_rating": 11, "teammate_injuries": 9,
+    "confirmed_lineup": 8, "usage_and_pace": 9, "game_environment": 8,
+    "rest_days": 5, "home_away_split": 3, "minutes_trend": 3,
 }
 
 # Friendly labels for the factor controls.
@@ -1239,6 +1508,7 @@ FACTOR_LABELS = {
     "player_vs_team": "History vs this opponent",
     "teammate_injuries": "Teammate injuries (usage boost)",
     "confirmed_lineup": "Confirmed starting lineup",
+    "usage_and_pace": "Usage & pace (advanced role)",
     "game_environment": "Game line (total + spread)",
     "injury": "Injury status",
 }
@@ -1374,6 +1644,16 @@ def _build_config_from_state():
         return None, str(e)
 
 
+def _rate_ctx():
+    """Rate-model settings from the builder widgets, as ctx keys. Shared by the
+    Analyze tab and the Value Scanner so both honor the same toggle/slider."""
+    use = st.session_state.get("use_rate_model", True)
+    return {
+        "use_rate_model": use,
+        "rate_blend": st.session_state.get("rate_blend_pct", 35) / 100.0,
+    }
+
+
 config, config_err = _build_config_from_state()
 
 # Persist the CURRENT model to the URL (survives Cloud reboots). Write only
@@ -1413,56 +1693,29 @@ except Exception:
 # Each preset: (mode, factors, one-line description). Simple mode unless noted.
 PRESETS = {
     "⭐ Balanced (recommended)": ("simple", dict(RECOMMENDED_SIMPLE),
-        "A bit of everything — the solid all-purpose default."),
+        "A bit of everything — every factor on, sensibly weighted. The solid "
+        "all-purpose default."),
     "🔥 Trusts recent form": ("simple", {
         "player_last_n_avg": "high", "minutes_trend": "high",
-        "rest_days": "medium"},
-        "Leans hard on how the player's been playing lately."),
+        "usage_and_pace": "medium", "rest_days": "medium",
+        "home_away_split": "low"},
+        "Leans on how the player's been playing lately — form, minutes and "
+        "role, with a nod to home/away and rest."),
     "🛡️ Focuses on the matchup": ("simple", {
         "opponent_defense_by_position": "high", "opponent_team_rating": "high",
-        "player_last_n_avg": "medium", "game_environment": "medium"},
-        "Weights who they're facing — opponent defense and pace."),
+        "player_vs_team": "medium", "player_last_n_avg": "medium",
+        "game_environment": "medium", "opponent_defense": "low"},
+        "Weights who they're facing — opponent defense by position, team "
+        "rating/pace, and the player's own history vs this opponent."),
     "🩹 Chases injury news": ("simple", {
-        "teammate_injuries": "high", "player_last_n_avg": "high",
-        "minutes_trend": "medium", "opponent_defense_by_position": "medium"},
-        "Boosts players whose teammates are out (extra usage)."),
-    "🏃 Likes fast, high-scoring games": ("simple", {
-        "game_environment": "high", "opponent_team_rating": "high",
-        "player_last_n_avg": "medium"},
-        "Favors high totals and fast pace — more chances to score."),
-    "😴 Weighs rest & fatigue": ("simple", {
-        "rest_days": "high", "minutes_trend": "high",
-        "player_last_n_avg": "medium", "game_environment": "low"},
-        "Downgrades tired legs (back-to-backs), rewards fresh ones."),
-    "🏠 Cares about home vs away": ("simple", {
-        "home_away_split": "high", "player_last_n_avg": "high",
-        "opponent_defense_by_position": "medium", "rest_days": "low"},
-        "Leans on how the player does at home vs on the road."),
-    "🎯 All-around sharp pick": ("simple", {
-        "player_last_n_avg": "high", "opponent_defense_by_position": "high",
-        "teammate_injuries": "high", "opponent_team_rating": "medium",
-        "rest_days": "low"},
-        "Form + matchup + injury news, the three that matter most."),
-    "📈 Follows rising minutes": ("simple", {
-        "minutes_trend": "high", "player_last_n_avg": "high",
-        "teammate_injuries": "medium"},
-        "Backs players whose playing time is trending up."),
-    "🧊 Avoids tough defenses": ("simple", {
-        "opponent_defense_by_position": "high", "opponent_team_rating": "high",
-        "game_environment": "medium", "rest_days": "low",
-        "player_last_n_avg": "low"},
-        "Pulls projections down hard against stingy defenses."),
-    "📊 Uses every factor": ("simple", {
-        "player_last_n_avg": "high", "opponent_defense_by_position": "high",
-        "opponent_team_rating": "medium", "teammate_injuries": "medium",
-        "game_environment": "medium", "rest_days": "medium",
-        "home_away_split": "low", "minutes_trend": "low"},
-        "Turns everything on — the most thorough, least focused."),
-    "⚖️ Exact-percent (advanced)": ("weighted", {
-        "player_last_n_avg": 28, "opponent_defense_by_position": 24,
-        "teammate_injuries": 16, "opponent_team_rating": 12,
-        "game_environment": 10, "rest_days": 6, "minutes_trend": 4},
-        "Precise percentage weights that add up to 100 (power users)."),
+        "teammate_injuries": "high", "usage_and_pace": "high",
+        "confirmed_lineup": "high", "player_last_n_avg": "medium",
+        "injury": "medium", "minutes_trend": "medium"},
+        "Backs opportunity — teammates out, confirmed lineups and a usage "
+        "bump, on top of the player's recent production and injury status."),
+    "⚖️ Exact-percent (advanced)": ("weighted", dict(RECOMMENDED_WEIGHTED),
+        "Precise percentage weights across every factor that add up to 100 "
+        "(power users)."),
 }
 
 
@@ -1623,6 +1876,30 @@ with tabM:
 
     # Rebuild from the just-edited state so the summary below is current.
     config, config_err = _build_config_from_state()
+
+    # ---- Deeper projection: rate model (per-minute x minutes x pace) --------
+    st.markdown("### Deeper projection")
+    st.checkbox(
+        "Use the rate model (per-minute × projected minutes × pace)",
+        key="use_rate_model",
+        value=st.session_state.get("use_rate_model", True),
+        help="On top of the recent/season-form blend, projects "
+             "per-minute production × expected minutes × game pace, then "
+             "blends the two. Values minutes and tempo directly. Applies to "
+             "volume stats (points, threes, attempts, rebounds, assists, …).")
+    if st.session_state.get("use_rate_model", True):
+        st.slider(
+            "Rate-model blend (how much weight the rate projection gets)",
+            min_value=0, max_value=100, step=5,
+            key="rate_blend_pct",
+            value=st.session_state.get("rate_blend_pct", 35),
+            help="0% = pure recent/season totals. 100% = pure rate model. "
+                 "35% is a balanced default — the rate path is more reactive "
+                 "to minutes/pace but noisier, so it gets a minority weight.")
+        st.caption(f"Base projection = "
+                   f"{100 - st.session_state.get('rate_blend_pct', 35)}% totals "
+                   f"+ {st.session_state.get('rate_blend_pct', 35)}% rate model.")
+
     if not simple_mode and config:
         total = sum(int(st.session_state.get(f"w_{k}", 0))
                     for k in config.factors)
@@ -1831,6 +2108,15 @@ else:
             "team_ratings_map": goat_team_ratings(_rs if _rs >= 2024 else 2024),
             "current_team": my_team,
         }
+        ctx.update(_rate_ctx())  # rate-model toggle + blend from the builder
+        # True recent pace (last-10 games) for both teams, if the collector has
+        # run; falls back to season pace inside the model when absent.
+        ctx["recent_pace_map"] = recent_pace_map((my_team, opp), cutoff)
+        # Head-to-head vs this opponent (leak-free) for the player_vs_team factor.
+        _h2h_avg, _h2h_n = _h2h_vs_opponent(hist, opp, prop_type, cutoff)
+        if _h2h_avg is not None:
+            ctx["h2h_avg"] = _h2h_avg
+            ctx["h2h_games"] = _h2h_n
         # Confirmed starting lineup (tonight) -> minutes/usage signal. We feed
         # the role only when the lineup is actually posted. "Usually starts" is
         # proxied by recent minutes (a rotation starter plays ~24+ mpg), so a
@@ -1838,10 +2124,29 @@ else:
         if lineup_status:
             ctx["lineup_status"] = lineup_status
             try:
-                usually = float(hist["minutes"].tail(10).mean()) >= 24.0
+                recent_min = float(hist["minutes"].tail(10).mean())
             except Exception:
-                usually = False
+                recent_min = 0.0
+            usually = recent_min >= 24.0
             ctx["usually_starts"] = usually
+            # Drive projected MINUTES from the confirmed role when it DIFFERS
+            # from his recent norm (the rate model then scales output by these
+            # minutes). A surprise starter gets starter minutes; a benched usual
+            # starter gets bench minutes. No override when the role matches his
+            # norm — his recent minutes are already right. Starter baseline ~28,
+            # bench baseline ~16 (conservative; we never claim exact minutes).
+            STARTER_MIN, BENCH_MIN = 28.0, 16.0
+            if lineup_status == "starter" and not usually:
+                ctx["minutes_override"] = max(recent_min, STARTER_MIN)
+            elif lineup_status == "bench" and usually:
+                ctx["minutes_override"] = min(recent_min, BENCH_MIN)
+        # Advanced role signals (usage% + pace) for the usage_and_pace factor.
+        try:
+            _adv = goat_adv_avg(pid, _rs if _rs >= 2024 else 2024)
+            if _adv:
+                ctx["player_adv"] = _adv
+        except Exception:
+            pass
         # Injury status (from the GOAT injuries snapshot, if fetched).
         inj = current_injury(pid)
         if inj:
@@ -2192,6 +2497,21 @@ else:
 </div>
 """, unsafe_allow_html=True)
 
+            # --- Why you should (or shouldn't) take this prop ---------------
+            _hr_for_why = hit_rate_windows(hist, prop_type, line)
+            _why_season = int(cutoff[:4]) if cutoff else 2026
+            if _why_season < 2024:
+                _why_season = 2024
+            _why_opp_weak = _opp_weakness_note(opp, _why_season, prop_type)
+            _why_bullets, _why_caveat = _why_take_it(
+                res, lean, edge, line, prop_type, opp, _hr_for_why,
+                opp_weak=_why_opp_weak)
+            with st.expander("💡 Why take this prop? — matchup check",
+                             expanded=True):
+                for _b in _why_bullets:
+                    st.markdown("• " + _b)
+                st.caption(_why_caveat)
+
             # --- Add this pick to MY SLIP (tracked live on the Live tab) ---
             _slip = st.session_state.setdefault("my_slip", [])
             _pick = {"player": sel, "stat": prop_type, "line": float(line),
@@ -2267,6 +2587,8 @@ else:
                 st.write(f"Base projection (recent + season form): "
                          f"**{res['base_projection']}**. Your selected factors "
                          f"then adjusted it:")
+                if res.get("base_desc"):
+                    st.caption("📐 " + res["base_desc"])
                 if res["adjustments"]:
                     for a_ in res["adjustments"]:
                         st.write("• " + _plain_reason(a_))
@@ -2506,6 +2828,13 @@ else:
                                horizontal=True)
             scope = g2.radio("Which games", ["Most recent",
                                              f"Vs {opp} only"], horizontal=True)
+            if scope.startswith("Vs"):
+                st.caption(
+                    f"Only {sel}'s games against {opp}. Teams meet just a few "
+                    "times a season (2-4), and those dates can cluster — so a "
+                    "short list or a calendar-year gap is the NBA schedule, not "
+                    "missing data. Use the Season column to read each game's "
+                    "season; switch to **Most recent** for the full log.")
 
             log = hist.copy()
             # Only games the player actually played in (exclude DNPs / 0-min
@@ -2515,13 +2844,23 @@ else:
                 log = log[log["opponent"] == opp]
                 if log.empty:
                     st.info(f"No games played against {opp} for {sel}.")
-            cols_all = ["game_date", "opponent", "is_home", "minutes",
+            cols_all = ["game_date", "season", "opponent", "is_home", "minutes",
                         "points", "rebounds", "assists", "threes_made",
                         "steals", "blocks", "turnovers", "fouls"]
             recent = log.tail(n_games)[cols_all].copy()
             if not recent.empty:
                 recent["is_home"] = recent["is_home"].map(
                     {1: "Home", 0: "Away"}).fillna("?")
+                # Season label: a game dated 2026-01-28 belongs to the 2025-26
+                # season. Show "'25-26" so the date↔season offset is never
+                # confusing (NBA seasons span two calendar years).
+                def _season_lbl(s):
+                    try:
+                        y = int(s)
+                        return f"'{y % 100:02d}-{(y + 1) % 100:02d}"
+                    except Exception:
+                        return ""
+                recent["season"] = recent["season"].map(_season_lbl)
                 # Add the combo columns for convenience.
                 recent["PRA"] = (recent["points"] + recent["rebounds"]
                                  + recent["assists"])
@@ -2529,7 +2868,8 @@ else:
                 recent["PA"] = recent["points"] + recent["assists"]
                 recent["RA"] = recent["rebounds"] + recent["assists"]
                 recent = recent.rename(columns={
-                    "game_date": "Date", "opponent": "Opp", "is_home": "Site",
+                    "game_date": "Date", "season": "Season",
+                    "opponent": "Opp", "is_home": "Site",
                     "minutes": "Min", "points": "Pts", "rebounds": "Reb",
                     "assists": "Ast", "threes_made": "3PM", "steals": "Stl",
                     "blocks": "Blk", "turnovers": "TO", "fouls": "PF"})
@@ -2538,6 +2878,10 @@ else:
                     hide_index=True,
                     column_config={
                         "Date": st.column_config.Column(help="Game date"),
+                        "Season": st.column_config.Column(
+                            help="NBA season this game belongs to (spans two "
+                                 "calendar years, e.g. a Jan-2026 game is "
+                                 "the '25-26 season)"),
                         "Opp": st.column_config.Column(help="Opponent team"),
                         "Site": st.column_config.Column(help="Home or Away"),
                         "Min": st.column_config.Column(help="Minutes played"),
@@ -2841,7 +3185,14 @@ else:
                         top = _with_attempts(base[:top_n])
                         st.markdown(f"Top {len(top)} by EV:")
                         st.dataframe(_fmt(pd.DataFrame(top)),
-                                     use_container_width=True, hide_index=True)
+                                     use_container_width=True, hide_index=True,
+                                     column_config={
+                                         "Why": st.column_config.Column(
+                                             "Why take it", width="large",
+                                             help="Projection vs line, biggest "
+                                                  "factor, opponent weakness, "
+                                                  "and whether recent history "
+                                                  "agrees.")})
                     else:
                         # Group by GAME. A player's Matchup is team-relative
                         # ("DEN @ OKC" vs "OKC vs DEN" for the same game), so key
@@ -2869,7 +3220,10 @@ else:
                                      if k != "Matchup"} for r in grows]
                             st.dataframe(_fmt(pd.DataFrame(show)),
                                          use_container_width=True,
-                                         hide_index=True)
+                                         hide_index=True,
+                                         column_config={
+                                             "Why": st.column_config.Column(
+                                                 "Why take it", width="large")})
                     st.caption("Ranked by EV (best first). 'Value?' ✅ = edge "
                                "clears your bar. 'Shots/Passes' = that player's "
                                "per-game shot attempts (u=uncontested, "
@@ -2930,25 +3284,59 @@ else:
         except Exception:
             _season = 2025
         ratings = blended_team_ratings(_season)
-        # Early season the API ratings feed is often missing teams (why the
-        # cards said "Missing team ratings"). Fill any gap from the DB-first,
-        # TRADE-AWARE roster strength: current roster (player_teams) x blended
-        # this/last-season scoring — stats fall back to last season, the team
-        # never does. Zero API, ~90ms for all 30 teams.
+        # Team strength source. The API team-ratings feed is unreliable early
+        # in a season (compressed/flat numbers, missing teams), which made a
+        # loaded team like PHI read as merely average. The DB-first, TRADE-AWARE
+        # roster strength (current roster x player advanced stats: PIE, def
+        # rating) is far more trustworthy now, so it is the PRIMARY source; the
+        # API feed only fills teams the roster map somehow lacks. Zero API,
+        # ~90ms for all 30 teams.
         try:
             from models.roster_strength_db import team_strength_map
             _dbm = team_strength_map(_season)
             if _dbm:
-                ratings = dict(ratings or {})
-                for _ab, _v in _dbm.items():
-                    if _ab not in ratings or not ratings.get(_ab):
-                        ratings[_ab] = {"off": _v["off"], "def": _v["def"],
-                                        "pace": _v.get("pace", 100.0)}
+                merged = dict(ratings or {})          # API feed as the base
+                for _ab, _v in _dbm.items():          # roster strength WINS
+                    merged[_ab] = {"off": _v["off"], "def": _v["def"],
+                                   "pace": _v.get("pace", 100.0)}
+                ratings = merged
         except Exception:
             pass
         team_inj = cached_team_injuries()  # {team: [(name, status, ppg), ...]}
         _gl_four_factors = cached_four_factors(_season)  # eFG/TOV/OREB per team
+        # Recent form + rest for every team with a line tonight — feeds the game
+        # model so projections build on recent play, not just season ratings.
+        _gl_cut = (gl_date.isoformat() if hasattr(gl_date, "isoformat")
+                   else str(gl_date))
+        _gl_team_form = cached_team_form(tuple(sorted((lines or {}).keys())),
+                                         _gl_cut)
+        # Play-type matchup map: each key play type's team table + def ratings,
+        # so the game model can value post-ups/PnR/iso/handoff/spot-up vs the
+        # opponent's defense. Cached hourly inside cached_team_style.
+        _gl_playtype = {
+            "postup": cached_team_style(_season, "playtype", "postup"),
+            "prballhandler": cached_team_style(_season, "playtype", "prballhandler"),
+            "isolation": cached_team_style(_season, "playtype", "isolation"),
+            "handoff": cached_team_style(_season, "playtype", "handoff"),
+            "spotup": cached_team_style(_season, "playtype", "spotup"),
+            "def": {t: (v.get("def") if isinstance(v, dict) else None)
+                    for t, v in (ratings or {}).items()},
+        }
         _gl_open_odds = cached_opening_odds(gl_date)  # {game_id: opening lines}
+        # Custom positional-defense map {stat: {team: {group: factor}}} — the
+        # SAME leak-free stat the prop model uses, now fed into game lines too.
+        _gl_positional = {s: positional_map(s, _gl_cut)
+                          for s in ("points", "rebounds", "assists")}
+        # Games played this season so far — the market anchor leans on the book
+        # when this is small and shifts to our model as it grows.
+        try:
+            _gconn = get_connection()
+            _gl_games_played = _gconn.execute(
+                "SELECT COUNT(DISTINCT game_id) FROM player_game_logs "
+                "WHERE season = ?", (str(_season),)).fetchone()[0] or 0
+            _gconn.close()
+        except Exception:
+            _gl_games_played = 0
         _gl_iso = cached_team_style(_season, "playtype", "isolation")
         _gl_drives = cached_team_style(_season, "tracking", "drives")
 
@@ -3012,16 +3400,52 @@ else:
                     _sb_err = str(_e)
                 if board:
                     import pandas as _pd
+                    # Convert calibration (Brier, lower=better) to a plain
+                    # 0-100 "accuracy score" (higher=better) so it reads simply.
+                    def _acc_score(br):
+                        if br is None:
+                            return None
+                        return max(0, round((1.0 - br) * 100))
+                    # Best model = lowest Brier (best calibrated) among those
+                    # with a score; mark it so the user sees ONE clear answer.
+                    _scored = [(r[0], r[4]) for r in board if r[4] is not None]
+                    _best = min(_scored, key=lambda x: x[1])[0] if _scored else None
+                    # Sort by accuracy score (lowest Brier = best) first, so the
+                    # most accurate model is always on top; rows without a score
+                    # fall to the bottom.
+                    _board = sorted(
+                        board,
+                        key=lambda r: (r[4] if r[4] is not None else 1e9))
                     sb = _pd.DataFrame(
-                        [{"Profile": n,
+                        [{"Profile": ("⭐ " + n if n == _best else n),
                           "Record": f"{c}-{t-c}",
-                          "Win %": f"{pct*100:.0f}%",
+                          "Accuracy score": (f"{_acc_score(br)}/100"
+                                             if br is not None else "—"),
                           "Games": t}
-                         for n, c, t, pct in board])
+                         for n, c, t, pct, br in _board])
                     st.dataframe(sb, use_container_width=True, hide_index=True)
-                    st.caption("Straight-up winner accuracy, graded from final "
-                               "scores as games finish. Grows every night — "
-                               "small samples early, so give it time.")
+                    _best_txt = (f"⭐ **{_best}** is the most accurate model so "
+                                 f"far. " if _best else "")
+                    st.caption(
+                        "Ranked by **Accuracy score** — how well-calibrated each "
+                        "model's confidence is (100 = perfect), rewarding being "
+                        "confident when right and cautious when unsure. "
+                        "(**Record** is its straight-up win-loss.) " + _best_txt
+                        + "Small samples early, so give it time to settle.")
+                    # Export: per-game, per-preset picks so you can see exactly
+                    # what each profile selected and whether it hit.
+                    try:
+                        from models.profile_scoreboard import scoreboard_detail
+                        _det = scoreboard_detail(_season)
+                        if _det:
+                            _csv = _pd.DataFrame(_det).to_csv(index=False)
+                            st.download_button(
+                                "⬇️ Export moneyline picks (CSV)", _csv,
+                                file_name=f"moneyline_picks_{_season}.csv",
+                                mime="text/csv",
+                                key="dl_ml_picks")
+                    except Exception as _de:
+                        st.caption(f"(Export unavailable: {_de})")
                 elif _sb_err:
                     st.caption(f"Couldn't grade yet: {_sb_err}")
                 else:
@@ -3034,6 +3458,7 @@ else:
                 try:
                     from models.spread_scoreboard import (grade_finished,
                                                           get_record,
+                                                          get_detail,
                                                           pending_count)
                     from models.profile_scoreboard import _finished_games_live
                     # Grade any captured games that are now final. Re-key the
@@ -3060,6 +3485,16 @@ else:
                                    "This board is forward-only (we don't store "
                                    "old spreads, so we never fake a backfill); "
                                    "it fills in as tonight's games finish.")
+                    # Export: every ATS pick (graded + pending) — what the model
+                    # selected vs the book's line, with the result.
+                    _sdet = get_detail()
+                    if _sdet:
+                        import pandas as _pd2
+                        _scsv = _pd2.DataFrame(_sdet).to_csv(index=False)
+                        st.download_button(
+                            "⬇️ Export ATS picks (CSV)", _scsv,
+                            file_name="spread_ats_picks.csv",
+                            mime="text/csv", key="dl_ats_picks")
                 except Exception as _e:
                     st.caption(f"Spread board unavailable: {_e}")
 
@@ -3080,14 +3515,45 @@ else:
                 else:
                     tag = f"🔴 LIVE ({status})" if status else "🔴 LIVE"
                 g = lines.get(home) or {}
+                # Early-season market anchor: de-vig the book's two-way ML into
+                # an implied home win prob, and count games played so the model
+                # leans on the market now and on itself as the season fills in.
+                _mkt_ph = None
+                try:
+                    _mlh = g.get("moneyline")
+                    _mla = (lines.get(away) or {}).get("moneyline")
+                    if _mlh is not None and _mla is not None:
+                        def _imp0(o):
+                            o = int(o)
+                            return (100.0/(o+100.0) if o > 0 else -o/(-o+100.0))
+                        _ihh, _iaa = _imp0(_mlh), _imp0(_mla)
+                        if _ihh + _iaa > 0:
+                            _mkt_ph = _ihh / (_ihh + _iaa)
+                except Exception:
+                    _mkt_ph = None
+                try:
+                    _games_played = _gl_games_played
+                except NameError:
+                    _games_played = 0
+                # Ratings projection: V2-advanced-driven roster strength +
+                # custom positional stat, four factors, form, playtype, injuries.
                 try:
                     proj = project_game(home, away, ratings, gprofile, team_inj,
-                                        four_factors=_gl_four_factors)
+                                        four_factors=_gl_four_factors,
+                                        team_form=_gl_team_form,
+                                        playtype=_gl_playtype,
+                                        positional=_gl_positional,
+                                        market_p_home=_mkt_ph,
+                                        games_played=_games_played)
                 except TypeError:
                     try:
-                        proj = project_game(home, away, ratings, gprofile, team_inj)
+                        proj = project_game(home, away, ratings, gprofile, team_inj,
+                                            four_factors=_gl_four_factors)
                     except TypeError:
-                        proj = project_game(home, away, ratings)  # old signature
+                        try:
+                            proj = project_game(home, away, ratings, gprofile, team_inj)
+                        except TypeError:
+                            proj = project_game(home, away, ratings)  # old sig
 
                 # ---- ATS capture: store our spread pick on OPEN games so the
                 # separate spread track record can grade it after the final.
@@ -3100,36 +3566,94 @@ else:
                                           g.get("spread"), proj["exp_margin"])
                     except Exception:
                         pass
+                # ---- Market-prob snapshot: store the de-vigged book prob at
+                # bet-time so the moneyline backtest can replay the SAME market
+                # anchor the live card used (forward-only; first capture wins).
+                if proj and is_open and _mkt_ph is not None:
+                    try:
+                        from models.profile_scoreboard import capture_market_prob
+                        capture_market_prob(str(gl_date), home, away,
+                                            _mkt_ph, _games_played)
+                    except Exception:
+                        pass
 
                 # ---- QUICK PICK for the collapsed title: who we'd back ----
                 # Only on OPEN games — a pick on a live/final game isn't
                 # bettable, so we don't flash a ✅ you can't act on.
                 quick = ""
+                pick_block = ""
                 if proj and is_open:
                     ml_h = g.get("moneyline")
                     ml_a = (lines.get(away) or {}).get("moneyline")
                     sp_h = g.get("spread")
-                    picks = []
+                    ml_pick = None    # moneyline value pick (or None)
+                    sp_pick = None    # spread value pick (or None)
                     if ml_h is not None and ml_a is not None:
                         _ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
                                             int(ml_h), int(ml_a),
                                             edge_threshold=ev_bar / 100.0)
                         if _ev.get("is_value"):
-                            picks.append((home if _ev["recommended_side"] == "over"
-                                          else away) + " to win")
+                            _ml_side = (home if _ev["recommended_side"] == "over"
+                                        else away)
+                            # The model's actual favorite (by projected margin).
+                            _fav = home if proj["exp_margin"] > 0 else away
+                            # A value bet on the model's UNDERDOG is a price/EV
+                            # edge, NOT a prediction they win — label it so.
+                            if _ml_side == _fav:
+                                ml_pick = f"{_ml_side} to win"
+                            else:
+                                _ml_odds = ml_a if _ml_side == away else ml_h
+                                ml_pick = (f"{_ml_side} {int(_ml_odds):+d} "
+                                           f"(underdog value)")
                     if sp_h is not None:
                         _ph, _pa = cover_probability(proj["exp_margin"], sp_h, _mstd)
                         _evs = evaluate_prop(_ph, _pa, -110, -110,
                                              edge_threshold=ev_bar / 100.0)
                         if _evs.get("is_value"):
-                            picks.append(f"{home} {sp_h:+g}"
-                                         if _evs["recommended_side"] == "over"
-                                         else f"{away} {-sp_h:+g}")
-                    if picks:
-                        quick = " · ✅ Pick: " + " + ".join(picks)
+                            sp_pick = (f"{home} {sp_h:+g}"
+                                       if _evs["recommended_side"] == "over"
+                                       else f"{away} {-sp_h:+g}")
+                    # Build two CLEARLY SEPARATE lines so ML and Spread never
+                    # blur together. Each shows its own bet type or 'no edge'.
+                    _fav = home if proj["exp_margin"] > 0 else away
+                    # ---- Market-disagreement check FIRST ----------------
+                    # If our win prob is far from the book's implied prob, the
+                    # "value" is almost certainly OUR thin-data error, not a
+                    # real edge. In that case we SUPPRESS the ✅ (don't show a
+                    # green check we're telling you to ignore) and explain why.
+                    _mkt_gap = None
+                    if ml_h is not None and ml_a is not None:
+                        def _implied(o):
+                            o = int(o)
+                            return (100.0 / (o + 100.0) if o > 0
+                                    else -o / (-o + 100.0))
+                        ih, ia = _implied(ml_h), _implied(ml_a)
+                        _tot = ih + ia
+                        if _tot > 0:
+                            _book_home = ih / _tot
+                            _mkt_gap = abs(proj["p_home_win"] - _book_home) * 100
+                    _suppress = _mkt_gap is not None and _mkt_gap >= 12
+
+                    if _suppress:
+                        # Don't flash ✅ we distrust — show the model lean, muted.
+                        quick = " · ⚠️ low confidence"
+                        pick_block = (
+                            f"⚠️ **Skip — model disagrees with the market by "
+                            f"{_mkt_gap:.0f} pts** (we say {home} "
+                            f"{proj['p_home_win']*100:.0f}%, the book says "
+                            f"~{_book_home*100:.0f}%). Early-season our data is "
+                            f"thin, so a gap this big is our miss, not an edge. "
+                            f"The model leans **{_fav}**, but there's no "
+                            f"trustworthy bet here yet.")
                     else:
-                        fav = home if proj["exp_margin"] > 0 else away
-                        quick = f" · lean {fav} (no edge)"
+                        _any = ml_pick or sp_pick
+                        quick = " · ✅ value" if _any else " · no edge"
+                        pick_block = (
+                            "💰 **Moneyline:** "
+                            + (f"✅ {ml_pick}" if ml_pick
+                               else f"— no edge (model leans {_fav})")
+                            + "  \n📊 **Spread:** "
+                            + (f"✅ {sp_pick}" if sp_pick else "— no edge"))
                 # (No extra text for live/final games — the FINAL/LIVE tag and,
                 #  for final games, the grade below already say the status.)
 
@@ -3164,6 +3688,8 @@ else:
 
                 title = f"🏀 {matchup}  ·  {tag}{quick}{grade_title}"
                 with st.expander(title, expanded=False):
+                    if pick_block:
+                        st.markdown(pick_block)
                     if proj and sc and sc.get("final"):
                         actual_margin = sc["home"] - sc["away"]
                         model_home = proj["exp_margin"] > 0
@@ -3204,10 +3730,18 @@ else:
                                    "the season).")
                         continue
                     c1, c2 = st.columns(2)
-                    c1.metric(f"{home} (home) projected",
-                              f"{proj['exp_home_pts']:.0f}")
-                    c2.metric(f"{away} (away) projected",
-                              f"{proj['exp_away_pts']:.0f}")
+                    # Reconcile displayed points with the ADJUSTED margin. The
+                    # raw exp_home/away_pts are pre-adjustment (ratings only);
+                    # the final margin folds in home edge, form, four factors,
+                    # playtype and the TOV battle. Re-split the projected TOTAL
+                    # by the final margin so the two numbers can never disagree
+                    # about who's favored (total stays fixed, margin honored).
+                    _tot = proj["exp_total"]
+                    _mgn = proj["exp_margin"]           # +ve => home favored
+                    _disp_home = (_tot + _mgn) / 2.0
+                    _disp_away = (_tot - _mgn) / 2.0
+                    c1.metric(f"{home} (home) projected", f"{_disp_home:.0f}")
+                    c2.metric(f"{away} (away) projected", f"{_disp_away:.0f}")
                     fav = home if proj["exp_margin"] > 0 else away
                     st.write(f"**Our projection:** {fav} by "
                              f"**{abs(proj['exp_margin']):.1f}** "
@@ -3381,9 +3915,10 @@ else:
                     if g.get("total") is not None:
                         st.caption(f"Game total (O/U): **{g['total']:g}**. "
                                    f"Our projected total: {proj['exp_total']:.0f}.")
-            st.caption("⚠️ Game-side projections come from team ratings + home "
-                       "court — a transparent baseline, not a simulation. Treat "
-                       "a ✅ as 'worth a look', and remember sides are efficiently "
-                       "priced; your edge is a soft/stale line, not out-guessing "
-                       "the market.")
+            st.caption("⚠️ Game-side projections blend a rotation Monte Carlo "
+                       "sim (who plays × their usage/efficiency, averaged over "
+                       "thousands of runs) with the team-ratings baseline + home "
+                       "court. Treat a ✅ as 'worth a look', and remember sides "
+                       "are efficiently priced; your edge is a soft/stale line, "
+                       "not out-guessing the market.")
 

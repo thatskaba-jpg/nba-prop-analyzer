@@ -120,8 +120,16 @@ def get_connection():
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     _ensure_db_present()
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: wait up to 30s for a competing write lock instead of raising
+    # 'database is locked' immediately (the dashboard and a collector can run
+    # at the same time). WAL mode lets readers and a single writer coexist.
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return conn
 
 
@@ -148,6 +156,11 @@ def init_schema():
             rebounds       INTEGER,
             assists        INTEGER,
             threes_made    INTEGER,
+            threes_att     INTEGER,             -- 3-point attempts (fg3a)
+            fgm            INTEGER,             -- field goals made
+            fga            INTEGER,             -- field-goal attempts
+            ftm            INTEGER,             -- free throws made
+            fta            INTEGER,             -- free-throw attempts
             steals         INTEGER,
             blocks         INTEGER,
             turnovers      INTEGER,
@@ -160,7 +173,8 @@ def init_schema():
     # created before these columns existed. ALTER TABLE ADD COLUMN is safe and
     # non-destructive (existing rows get NULL until a reload fills them).
     existing = {r[1] for r in conn.execute("PRAGMA table_info(player_game_logs)")}
-    for col in ("steals", "blocks", "turnovers", "fouls"):
+    for col in ("steals", "blocks", "turnovers", "fouls",
+                "threes_att", "fgm", "fga", "ftm", "fta"):
         if col not in existing:
             conn.execute(f"ALTER TABLE player_game_logs ADD COLUMN {col} INTEGER")
 

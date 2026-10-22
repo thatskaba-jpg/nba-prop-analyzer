@@ -123,6 +123,44 @@ def project_stat(feats: dict) -> float:
     return sum(p * w for p, w in zip(parts, weights)) / total_w
 
 
+# Rough league-average pace (possessions per 48). Used to normalize the pace
+# multiplier so an average-tempo game leaves the rate projection unchanged.
+_LEAGUE_PACE = 100.0
+
+
+def project_stat_rate(feats: dict, pace: float = None,
+                      minutes_override: float = None) -> float:
+    """Deeper projection: per-minute rate x projected minutes x pace.
+
+    WHY THIS EXISTS
+      The blend in project_stat() works on game TOTALS, so it can't tell a
+      change in ROLE (minutes) apart from a change in PRODUCTION (per-minute
+      output). This path separates them:
+
+        projection = per_min_rate  x  projected_minutes  x  (pace / league_pace)
+
+      * per_min_rate      how much of the stat the player produces per minute
+                          (recent-weighted; from features).
+      * projected_minutes how many minutes we expect tonight (recent minutes,
+                          or an override when a lineup/injury changes the role).
+      * pace              game possessions/48; more pace = more opportunities.
+                          Normalized by league pace so an average game is x1.
+
+    This is how minutes and tempo get VALUED directly. Falls back to None when
+    we lack the rate or minutes (caller then uses the totals blend instead), so
+    it never fabricates a projection from missing data.
+    """
+    rate = feats.get("per_min_rate")
+    minutes = minutes_override if minutes_override is not None else \
+        feats.get("proj_minutes")
+    if rate is None or minutes is None or minutes <= 0:
+        return None
+    proj = rate * minutes
+    if pace and pace > 0:
+        proj *= pace / _LEAGUE_PACE
+    return proj
+
+
 def over_under_probabilities(projection: float, line: float,
                              std: float = None) -> dict:
     """P(over) and P(under) for a count stat, honest about its UNCERTAINTY.

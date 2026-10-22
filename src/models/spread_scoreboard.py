@@ -34,12 +34,16 @@ _PATH = Path(__file__).resolve().parents[2] / "data" / "spread_scoreboard.json"
 def _load():
     if _PATH.exists():
         try:
-            return json.loads(_PATH.read_text())
+            data = json.loads(_PATH.read_text())
+            # Backfill the detail list for older stores that predate it.
+            data.setdefault("graded_detail", [])
+            return data
         except Exception:
             pass
-    # pending: {game_id: {...capture...}}; graded: list of results; record.
+    # pending: {game_id: {...capture...}}; graded_detail: per-game results;
+    # record: running totals; graded_ids: dedupe guard.
     return {"pending": {}, "record": {"correct": 0, "wrong": 0, "push": 0},
-            "graded_ids": []}
+            "graded_ids": [], "graded_detail": []}
 
 
 def _save(data):
@@ -92,14 +96,30 @@ def grade_finished(finished_games):
         edge = actual_margin + cap["spread_home"]    # >0 home covered
         if abs(edge) < 1e-9:
             data["record"]["push"] += 1
+            _result = "push"
+            _covered = "push"
         else:
             home_covered = edge > 0
             covered_side = "home" if home_covered else "away"
+            _covered = covered_side
             if cap["our_side"] == covered_side:
                 data["record"]["correct"] += 1
+                _result = "win"
             else:
                 data["record"]["wrong"] += 1
+                _result = "loss"
         data["graded_ids"].append(gid)
+        data.setdefault("graded_detail", []).append({
+            "game_id": gid,
+            "matchup": f"{away} @ {home}",
+            "home": home, "away": away,
+            "spread_home": cap["spread_home"],
+            "our_side": cap["our_side"],
+            "proj_margin": round(cap["proj_margin"], 1),
+            "actual_margin": actual_margin,
+            "covered_side": _covered,
+            "result": _result,
+        })
         del data["pending"][gid]
         moved = True
     if moved:
@@ -121,3 +141,23 @@ def get_record():
 
 def pending_count():
     return len(_load().get("pending", {}))
+
+
+def get_detail():
+    """Per-game ATS detail for export: graded picks (with result) plus the
+    still-pending captures. Returns a flat list of dicts sorted graded-first."""
+    data = _load()
+    rows = list(data.get("graded_detail", []))
+    for gid, cap in data.get("pending", {}).items():
+        rows.append({
+            "game_id": gid,
+            "matchup": f"{cap.get('away')} @ {cap.get('home')}",
+            "home": cap.get("home"), "away": cap.get("away"),
+            "spread_home": cap.get("spread_home"),
+            "our_side": cap.get("our_side"),
+            "proj_margin": round(cap.get("proj_margin", 0), 1),
+            "actual_margin": None,
+            "covered_side": None,
+            "result": "pending",
+        })
+    return rows
