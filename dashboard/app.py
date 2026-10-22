@@ -2250,13 +2250,20 @@ else:
                  "odds give you an edge. Same honest EV math as the prop tools.")
 
         from models.game_model import project_game, cover_probability
-        # Profiles were added later; import defensively so an older/cached
-        # game_model (e.g. before a redeploy) can't blank the whole tab — fall
-        # back to a single Balanced profile baked in here.
+        # Reload game_model so a module cached from before the profiles were
+        # added (stale Streamlit process) refreshes to the current version —
+        # otherwise the selector can show only the fallback's single profile.
         try:
-            from models.game_model import (GAME_PROFILES, DEFAULT_PROFILE,
-                                            GAME_PROFILE_DESC)
-        except ImportError:
+            import importlib
+            import models.game_model as _gm
+            importlib.reload(_gm)
+            GAME_PROFILES = _gm.GAME_PROFILES
+            DEFAULT_PROFILE = _gm.DEFAULT_PROFILE
+            GAME_PROFILE_DESC = getattr(_gm, "GAME_PROFILE_DESC", {})
+            project_game = _gm.project_game
+            cover_probability = _gm.cover_probability
+        except Exception:
+            # Last-resort fallback so the tab still renders.
             GAME_PROFILES = {"Balanced": {"home_edge": 2.5, "margin_std": 12.0,
                                           "net_scale": 1.0, "pace_gain": 1.0}}
             DEFAULT_PROFILE = "Balanced"
@@ -2432,10 +2439,12 @@ else:
                         home_covered = (actual_margin + sp_h) > 0
                         ats = (model_home == home_covered)
                     winner = home if home_won else away
+                    model_pick = home if model_home else away
                     mark = "✅" if su_right else "❌"
-                    bits = [f"{mark} winner ({winner})"]
+                    # Unambiguous: name who the MODEL picked, then hit/miss.
+                    bits = [f"picked {model_pick} {mark}"]
                     if ats is not None:
-                        bits.append(("✅" if ats else "❌") + " ATS")
+                        bits.append(("ATS ✅" if ats else "ATS ❌"))
                     grade_title = (f"  —  {sc['away']}-{sc['home']}  ·  "
                                    + "  ".join(bits))
 
