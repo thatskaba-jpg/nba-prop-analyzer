@@ -2371,7 +2371,8 @@ else:
                 st.caption(f"**{prof_name}:** {_desc}")
 
             # ---- Day-by-day profile success rate (builds over the season) ----
-            with st.expander("📈 Profile track record (builds day by day)"):
+            with st.expander("📈 Moneyline track record — profile winner "
+                             "accuracy (builds day by day)"):
                 board, _sb_err = [], None
                 try:
                     from models.profile_scoreboard import compute_live_scoreboard
@@ -2396,6 +2397,41 @@ else:
                     st.caption("No finished games in the feed yet — fills in as "
                                "games go final.")
 
+            # ---- Separate SPREAD (ATS) track record -------------------- #
+            with st.expander("🎯 Spread track record — ATS (our pick vs the "
+                             "book's line)"):
+                try:
+                    from models.spread_scoreboard import (grade_finished,
+                                                          get_record,
+                                                          pending_count)
+                    from models.profile_scoreboard import _finished_games_live
+                    # Grade any captured games that are now final. Re-key the
+                    # finished feed to our matchup|date ids so captures match.
+                    _fin = _finished_games_live(30)
+                    _fin_keyed = [(f"{a} @ {h}|{gd}", gd, h, a, hp, ap)
+                                  for (gid, gd, h, a, hp, ap) in _fin]
+                    grade_finished(_fin_keyed)
+                    _c, _w, _p, _pct = get_record()
+                    _decided = _c + _w
+                    if _decided:
+                        st.metric("ATS record (our side covered)",
+                                  f"{_c}-{_w}"
+                                  + (f"-{_p} push" if _p else ""),
+                                  f"{_pct*100:.0f}% vs 52.4% break-even")
+                        st.caption("This is the REAL edge test: our projected "
+                                   "margin vs the book's posted spread — did "
+                                   "our side cover? Beating 52.4% over a big "
+                                   "sample is a genuine edge; a small sample is "
+                                   "noise.")
+                    else:
+                        st.caption(f"No graded spread picks yet — {pending_count()}"
+                                   " game(s) captured and waiting to go final. "
+                                   "This board is forward-only (we don't store "
+                                   "old spreads, so we never fake a backfill); "
+                                   "it fills in as tonight's games finish.")
+                except Exception as _e:
+                    st.caption(f"Spread board unavailable: {_e}")
+
             # Show open (bettable) games first, then live/final ones.
             ordered = open_games + live_games
             for matchup in ordered:
@@ -2417,6 +2453,18 @@ else:
                     proj = project_game(home, away, ratings, gprofile, team_inj)
                 except TypeError:
                     proj = project_game(home, away, ratings)  # old signature
+
+                # ---- ATS capture: store our spread pick on OPEN games so the
+                # separate spread track record can grade it after the final.
+                # Keyed by matchup+date (no game_id in the lines map). Honest &
+                # forward-only — we never backfill a made-up spread.
+                if proj and is_open and g.get("spread") is not None:
+                    try:
+                        from models.spread_scoreboard import capture_open_game
+                        capture_open_game(f"{matchup}|{gl_date}", home, away,
+                                          g.get("spread"), proj["exp_margin"])
+                    except Exception:
+                        pass
 
                 # ---- QUICK PICK for the collapsed title: who we'd back ----
                 # Only on OPEN games — a pick on a live/final game isn't
