@@ -33,16 +33,69 @@ LEAGUE_RTG = 113.0       # points per 100 possessions, league average
 MARGIN_STD = 12.0        # NBA final-margin spread, for win-prob conversion
 
 
+# Switchable GAME-MODEL profiles. Each dict overrides the model's knobs, so the
+# SAME team ratings produce DIFFERENT ML/spread picks under different profiles.
+#   home_edge  : home-court points added to the margin
+#   margin_std : spread of outcomes (lower = more confident win probs)
+#   net_scale  : how hard a rating gap is pushed into the margin (1.0 = default;
+#                >1 trusts rating gaps more, <1 shrinks toward a coin flip)
+#   pace_gain  : sensitivity to pace vs league-average (1.0 = default)
+GAME_PROFILES = {
+    "Balanced": {"home_edge": 2.5, "margin_std": 12.0, "net_scale": 1.0,
+                 "pace_gain": 1.0},
+    "Strong home court": {"home_edge": 4.0, "margin_std": 12.0,
+                          "net_scale": 1.0, "pace_gain": 1.0},
+    "Trust the ratings (bold)": {"home_edge": 2.5, "margin_std": 10.0,
+                                 "net_scale": 1.35, "pace_gain": 1.0},
+    "Cautious (toward coin flip)": {"home_edge": 2.0, "margin_std": 14.0,
+                                    "net_scale": 0.7, "pace_gain": 1.0},
+    "Pace-sensitive": {"home_edge": 2.5, "margin_std": 12.0, "net_scale": 1.0,
+                       "pace_gain": 1.6},
+}
+DEFAULT_PROFILE = "Balanced"
+
+
 def _norm_cdf(x):
     """Standard normal CDF via erf — no scipy dependency."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def project_game(home_abbr, away_abbr, ratings):
+def _star_tax_points(out_list):
+    """Total point-value a team loses from its OUT/DOUBTFUL players.
+
+    Each absent player's spread value ≈ ppg × 0.20, clamped to 1-7 points (a
+    ~25-ppg star ≈ 5, a bench player ≈ 1), which matches the market's rule of
+    thumb that a top star is worth 4-7 points to the spread. DOUBTFUL counts
+    half (the player might suit up). Returns (points, [reasons])."""
+    if not out_list:
+        return 0.0, []
+    total, reasons = 0.0, []
+    for entry in out_list:
+        nm = entry[0]
+        status = (entry[1] if len(entry) > 1 else "out") or ""
+        ppg = entry[2] if len(entry) > 2 else 0.0
+        s = status.lower()
+        if "doubtful" in s:
+            weight = 0.5
+        elif "out" in s:
+            weight = 1.0
+        else:
+            continue
+        val = max(1.0, min(7.0, (ppg or 0.0) * 0.20)) * weight
+        total += val
+        reasons.append(f"{nm} {('DOUBTFUL' if weight < 1 else 'OUT')} "
+                       f"(-{val:.1f})")
+    return round(total, 1), reasons
+
+
+def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None):
     """Return a dict with expected margin, win probs, and the inputs used.
 
     ratings: {abbr: {off, def, pace}} from team_ratings_map. Returns None if
-    either team's ratings are missing."""
+    either team's ratings are missing. `profile` is an optional dict of knobs
+    (see GAME_PROFILES). `injuries` is an optional {team_abbr: [(name, status,
+    ppg), ...]} map — present teams get a 'Star Tax' margin deduction for their
+    OUT/DOUBTFUL players, like the books do when a star is ruled out."""
     h = ratings.get(home_abbr)
     a = ratings.get(away_abbr)
     if not h or not a:
@@ -51,17 +104,36 @@ def project_game(home_abbr, away_abbr, ratings):
         if t.get("off") is None or t.get("def") is None:
             return None
 
-    pace = ((h.get("pace") or LEAGUE_PACE) + (a.get("pace") or LEAGUE_PACE)) / 2.0
+    prof = dict(GAME_PROFILES[DEFAULT_PROFILE])
+    if isinstance(profile, dict):
+        prof.update(profile)
+    home_edge = prof["home_edge"]
+    margin_std = prof["margin_std"]
+    net_scale = prof["net_scale"]
+    pace_gain = prof["pace_gain"]
+
+    # Pace: amplify/dampen the game's distance from league average by pace_gain.
+    raw_pace = ((h.get("pace") or LEAGUE_PACE)
+                + (a.get("pace") or LEAGUE_PACE)) / 2.0
+    pace = LEAGUE_PACE + (raw_pace - LEAGUE_PACE) * pace_gain
     poss = pace / 100.0
 
     # Expected points = average of (my offense) and (opponent defense allows),
     # scaled to the game's pace.
     home_pts = ((h["off"] + a["def"]) / 2.0) * poss
     away_pts = ((a["off"] + h["def"]) / 2.0) * poss
-    margin = (home_pts - away_pts) + HOME_EDGE   # + = home favored
+    # net_scale controls how hard the rating gap is trusted.
+    raw_margin = (home_pts - away_pts) * net_scale
+    margin = raw_margin + home_edge   # + = home favored
 
-    # Win probability from margin via a normal model.
-    p_home = _norm_cdf(margin / MARGIN_STD)
+    # ---- Star Tax: injuries shift the margin like the market does ----
+    inj = injuries or {}
+    home_tax, home_reasons = _star_tax_points(inj.get(home_abbr))
+    away_tax, away_reasons = _star_tax_points(inj.get(away_abbr))
+    # A team losing players gives up margin; the opponent gains it.
+    margin += (away_tax - home_tax)
+
+    p_home = _norm_cdf(margin / margin_std)
     return {
         "home": home_abbr, "away": away_abbr,
         "exp_home_pts": round(home_pts, 1), "exp_away_pts": round(away_pts, 1),
@@ -70,16 +142,19 @@ def project_game(home_abbr, away_abbr, ratings):
         "p_home_win": round(p_home, 4),
         "p_away_win": round(1 - p_home, 4),
         "pace": round(pace, 1),
+        "margin_std": margin_std,
+        "home_injury_tax": home_tax, "away_injury_tax": away_tax,
+        "home_injury_reasons": home_reasons,
+        "away_injury_reasons": away_reasons,
     }
 
 
-def cover_probability(exp_margin, spread_home):
+def cover_probability(exp_margin, spread_home, margin_std=MARGIN_STD):
     """P(home covers its spread). spread_home is the home line (negative =
-    favored, e.g. -6.5). Home covers when actual margin > -spread_home."""
-    # Need actual_margin + spread_home > 0  ->  actual_margin > -spread_home.
+    favored, e.g. -6.5). Home covers when actual margin > -spread_home.
+    margin_std defaults to the league value but a profile can pass its own."""
     threshold = -spread_home
-    # P(margin > threshold) under Normal(exp_margin, MARGIN_STD).
-    z = (exp_margin - threshold) / MARGIN_STD
+    z = (exp_margin - threshold) / margin_std
     p_home_cover = _norm_cdf(z)
     return round(p_home_cover, 4), round(1 - p_home_cover, 4)
 

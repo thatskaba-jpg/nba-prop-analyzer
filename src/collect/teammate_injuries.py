@@ -140,6 +140,55 @@ def build_out_teammates_map():
     return out_map
 
 
+def out_players_by_team():
+    """{team_abbr: [(name, status, ppg), ...]} of players currently OUT/DOUBTFUL
+    on each team. Reuses the same roster + injuries join as the teammate map, so
+    the game-model Star Tax and the prop usage-boost see the SAME OUT set."""
+    conn = get_connection()
+    has_inj = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='injuries'"
+    ).fetchone()
+    if not has_inj:
+        conn.close()
+        return {}
+    rows = conn.execute(
+        """
+        SELECT player_name, matchup, is_home
+        FROM player_game_logs l
+        WHERE game_date = (
+            SELECT MAX(game_date) FROM player_game_logs
+            WHERE player_name = l.player_name)
+        """).fetchall()
+    team_of = {}
+    for r in rows:
+        team = _team_from_matchup(r["matchup"], r["is_home"])
+        if team:
+            team_of.setdefault(r["player_name"], team)
+    out_by_name = {}
+    for r in conn.execute("SELECT player_name, status FROM injuries"):
+        st = (r["status"] or "").strip().lower()
+        if any(s in st for s in _OUT_STATUSES):
+            out_by_name[r["player_name"]] = r["status"]
+    ppg_by_name = {}
+    if out_by_name:
+        ph = ",".join("?" * len(out_by_name))
+        for r in conn.execute(
+                f"""SELECT player_name, AVG(points) ppg FROM (
+                      SELECT player_name, points FROM player_game_logs
+                      WHERE player_name IN ({ph}) AND minutes > 0
+                      ORDER BY game_date DESC)
+                    GROUP BY player_name""", list(out_by_name)):
+            ppg_by_name[r["player_name"]] = r["ppg"] or 0.0
+    conn.close()
+    out = {}
+    for nm, status in out_by_name.items():
+        team = team_of.get(nm)
+        if team:
+            out.setdefault(team, []).append(
+                (nm, status, ppg_by_name.get(nm, 0.0)))
+    return out
+
+
 if __name__ == "__main__":
     m = build_out_teammates_map()
     print(f"Players with OUT teammates: {len(m)}")
