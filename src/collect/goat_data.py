@@ -116,6 +116,23 @@ def player_logs(player_id: int, seasons) -> list:
     return out
 
 
+def injury_map() -> dict:
+    """All currently listed injuries, LIVE from the API, keyed by player_id ->
+    (status, description). One call covers the whole league. {} on error."""
+    try:
+        rows = _get_all("player_injuries", {})
+    except Exception:
+        return {}
+    out = {}
+    for r in rows:
+        pl = r.get("player") or {}
+        pid = pl.get("id") if isinstance(pl, dict) else r.get("player_id")
+        if pid is None:
+            continue
+        out[int(pid)] = (r.get("status"), r.get("description"))
+    return out
+
+
 def active_players() -> list:
     """All CURRENTLY ACTIVE NBA players, LIVE from the API. Returns a list of
     {id, name, team} dicts sorted by name. [] on error. This is the source of

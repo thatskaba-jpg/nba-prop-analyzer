@@ -124,6 +124,7 @@ try:
     from collect.goat_data import current_season_logs  # noqa: E402
     from collect.goat_data import player_logs  # noqa: E402
     from collect.goat_data import active_players  # noqa: E402
+    from collect.goat_data import injury_map  # noqa: E402
 except Exception:
     season_average = advanced_stats = standings_map = team_ratings_map = None
     player_advanced_avg = None
@@ -132,6 +133,7 @@ except Exception:
     current_season_logs = None
     player_logs = None
     active_players = None
+    injury_map = None
 try:
     from collect.fetch_injuries import current_injury  # noqa: E402
 except Exception:
@@ -472,7 +474,7 @@ def defense_summary(cutoff, team):
     return {"rank": rank, "n": n, "factor": factor, "pct": pct, "tag": tag}
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=3600)
 def cached_history(pid):
     """Player game history — API-FIRST. balldontlie (the paid GOAT tier) is the
     source of truth, so we pull the player's full game-by-game history straight
@@ -481,12 +483,15 @@ def cached_history(pid):
     prop analyzed tonight already reflects tonight's game, and we never serve a
     stale DB snapshot when live data is available."""
     import pandas as _pd
-    # API first: pull a wide window of recent seasons (oldest-first).
+    # API first. The projection blend needs THIS season + LAST season (current
+    # form + the prior anchor) plus recent-game windows — all satisfied by two
+    # seasons. Pulling only two keeps it fast (one API round-trip, ~0.5-1s)
+    # instead of dragging six seasons per player.
     if 'player_logs' in globals() and player_logs is not None:
         try:
             from collect.daily_update import current_season_start_year
             cur = current_season_start_year()
-            seasons = list(range(cur, cur - 6, -1))  # this season + prior 5
+            seasons = [cur, cur - 1]  # this season + prior (the blend's inputs)
             rows = player_logs(int(pid), seasons)
             if rows:
                 df = _pd.DataFrame(rows)
@@ -843,6 +848,49 @@ def cached_out_teammates():
 
 
 @st.cache_data(show_spinner=False, ttl=900)
+def cached_injury_map():
+    """{player_id: (status, description)} for the whole league, LIVE from the
+    API in ONE call. Replaces per-player DB injury lookups during a scan."""
+    if injury_map is None:
+        return {}
+    try:
+        return injury_map()
+    except Exception:
+        return {}
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_team_form():
+    """{team_abbr: (off, def, winrate, rest)} — each team's current rolling
+    form, used by the TRAINED game model. Built from reconstructed recent
+    games. {} on error."""
+    try:
+        import numpy as _np
+        from models.game_ml_model import _reconstruct_games, _team_timeline
+        import datetime as _d
+        conn = get_connection()
+        games = _reconstruct_games(conn)
+        conn.close()
+        if games.empty:
+            return {}
+        tl = _team_timeline(games)
+        today = _d.date.today().isoformat()
+        out = {}
+        for team, rows in tl.items():
+            prior = [x for x in rows if x[0] < today]
+            if len(prior) < 5:
+                continue
+            recent = prior[-10:]
+            off = float(_np.mean([x[1] for x in recent]))
+            dfn = float(_np.mean([x[2] for x in recent]))
+            wr = float(_np.mean([x[3] for x in recent]))
+            out[team] = (off, dfn, wr, 2)
+        return out
+    except Exception:
+        return {}
+
+
+
+@st.cache_data(show_spinner=False, ttl=900)
 def cached_team_injuries():
     """{team: [(name, status, ppg), ...]} of OUT/DOUBTFUL players per team, for
     the game-model Star Tax. Cached 15 min, deadline-bounded like the rest."""
@@ -1043,6 +1091,29 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
     # Only scan players we have history for AND who have props posted today.
     roster = [(name, pid) for (name, pid) in player_list() if _nk(name) in props]
 
+    # Warm EVERY per-player cache IN PARALLEL before the scan loop. Each of
+    # these (history, team, position group, injury) is its own API/DB round
+    # trip; doing them serially for dozens of players is the whole slowness.
+    # GOAT tier allows ~500 req/min, so 16 workers is comfortably safe. After
+    # this, the loop below hits warm caches and flies.
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        _pids = list({pid for _, pid in roster})
+
+        def _warm(p):
+            try:
+                cached_history(p)
+                player_team(p)
+            except Exception:
+                pass
+        with ThreadPoolExecutor(max_workers=16) as _ex:
+            list(_ex.map(_warm, _pids))
+    except Exception:
+        pass
+
+    # League injuries in ONE API call (not one DB hit per player).
+    shared_injuries = cached_injury_map()
+
     # PERF: the opponent-defense maps cost ~0.4s each to build. They're keyed by
     # cutoff date, and every player is predicting the SAME upcoming slate, so we
     # compute them ONCE for a single shared cutoff (today) instead of per player
@@ -1089,7 +1160,7 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
             auto = next_opponent(my_team)
             opp, is_home = (auto if auto else (hist.iloc[-1]["opponent"], True))
             grp = player_group(pid, cutoff)
-            inj = current_injury(pid)
+            inj = shared_injuries.get(pid)
             _early = season_games_count(hist) < MIN_SEASON_GAMES_FOR_VALUE
 
             for stat in stats:
@@ -3075,6 +3146,28 @@ else:
                         proj = project_game(home, away, ratings, gprofile, team_inj)
                     except TypeError:
                         proj = project_game(home, away, ratings)  # old signature
+
+                # Blend in the TRAINED game model (65% OOS accuracy, AUC 0.705)
+                # when we have form for both teams. It's the better predictor,
+                # so it leads the win probability; the ratings model still
+                # supplies margin/structure and is the fallback.
+                if proj:
+                    try:
+                        from models.game_ml_model import predict_from_features
+                        _form = cached_team_form()
+                        _hf, _af = _form.get(home), _form.get(away)
+                        if _hf and _af:
+                            _tm = predict_from_features(_hf, _af)
+                            if _tm:
+                                proj["p_home_win"] = round(
+                                    0.60 * _tm["p_home_win"]
+                                    + 0.40 * proj["p_home_win"], 4)
+                                proj["p_away_win"] = round(
+                                    1.0 - proj["p_home_win"], 4)
+                                proj["trained_margin"] = round(_tm["margin"], 1)
+                                proj["trained"] = True
+                    except Exception:
+                        pass
 
                 # ---- QUICK PICK for the collapsed title: who we'd back ----
                 # Only on OPEN games — a pick on a live/final game isn't
