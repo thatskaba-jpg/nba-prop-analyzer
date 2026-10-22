@@ -33,8 +33,15 @@ _SCORE_PATH = Path(__file__).resolve().parents[2] / "data" / \
 def _blend_ratings(season):
     """Blend this + last season team ratings (mirrors the dashboard)."""
     from collect.goat_data import team_ratings_map
-    cur = team_ratings_map(season) or {}
-    prev = team_ratings_map(season - 1) or {}
+    try:
+        from collect.local_store import get_or_refresh
+        cur = get_or_refresh(f"team_ratings_{season}",
+                             lambda: team_ratings_map(season), 12) or {}
+        prev = get_or_refresh(f"team_ratings_{season - 1}",
+                              lambda: team_ratings_map(season - 1), 12) or {}
+    except Exception:
+        cur = team_ratings_map(season) or {}
+        prev = team_ratings_map(season - 1) or {}
     if not prev:
         return cur
     if not cur:

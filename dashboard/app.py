@@ -541,13 +541,22 @@ def goat_season_avg(pid, season):
 @st.cache_data(show_spinner=False, ttl=3600)
 def goat_team_ratings(season):
     """Team off/def/net ratings + pace from balldontlie (advanced team season
-    averages), cached an hour. Refreshes as the season's games accrue."""
+    averages). Fetched from the API ONCE, then served from the on-disk store
+    for 12h so we don't re-pull the same ratings on every page load (which
+    wasted calls and tripped 429s). Falls back to a stale copy if a refresh
+    fails, and to an empty dict only if we've never stored it."""
     if team_ratings_map is None:
         return {}
     try:
-        return team_ratings_map(season)
+        from collect.local_store import get_or_refresh
+        return get_or_refresh(f"team_ratings_{season}",
+                              lambda: team_ratings_map(season),
+                              max_age_hours=12) or {}
     except Exception:
-        return {}
+        try:
+            return team_ratings_map(season)
+        except Exception:
+            return {}
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -2292,6 +2301,22 @@ else:
         except Exception:
             _season = 2025
         ratings = blended_team_ratings(_season)
+        # Early season the API ratings feed is often missing teams (why the
+        # cards said "Missing team ratings"). Fill any gap from the DB-first,
+        # TRADE-AWARE roster strength: current roster (player_teams) x blended
+        # this/last-season scoring — stats fall back to last season, the team
+        # never does. Zero API, ~90ms for all 30 teams.
+        try:
+            from models.roster_strength_db import team_strength_map
+            _dbm = team_strength_map(_season)
+            if _dbm:
+                ratings = dict(ratings or {})
+                for _ab, _v in _dbm.items():
+                    if _ab not in ratings or not ratings.get(_ab):
+                        ratings[_ab] = {"off": _v["off"], "def": _v["def"],
+                                        "pace": _v.get("pace", 100.0)}
+        except Exception:
+            pass
         team_inj = cached_team_injuries()  # {team: [(name, status, ppg), ...]}
 
         if not lines:
