@@ -1,0 +1,53 @@
+{
+  "profiles": {
+    "Balanced": {
+      "correct": 1,
+      "total": 3
+    },
+    "Strong home court": {
+      "correct": 1,
+      "total": 3
+    },
+    "Trust the ratings (bold)": {
+      "correct": 1,
+      "total": 3
+    },
+    "Cautious (toward coin flip)": {
+      "correct": 1,
+      "total": 3
+    },
+    "Pace-sensitive": {
+      "correct": 1,
+      "total": 3
+    },
+    "No home edge (neutral court)": {
+      "correct": 1,
+      "total": 3
+    },
+    "Road warrior (fade home)": {
+      "correct": 2,
+      "total": 3
+    },
+    "Underdog hunter": {
+      "correct": 1,
+      "total": 3
+    },
+    "Favorite slammer (chalk)": {
+      "correct": 1,
+      "total": 3
+    },
+    "Slow grind (low pace)": {
+      "correct": 1,
+      "total": 3
+    },
+    "Max confidence (sharp)": {
+      "correct": 1,
+      "total": 3
+    }
+  },
+  "graded_game_ids": [
+    "21717855",
+    "21717856",
+    "21717857"
+  ]
+}
