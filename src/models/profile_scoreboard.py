@@ -83,6 +83,50 @@ def _finished_games(season):
     return out
 
 
+def _finished_games_live(days_back=14):
+    """Finished games from the LIVE balldontlie feed over the last `days_back`
+    days: [(game_id, date, home, away, home_pts, away_pts), ...]. This updates
+    the SAME NIGHT a game goes final — no dependency on the DB log ingestion /
+    re-upload. Falls back to [] on any API hiccup."""
+    try:
+        from collect.balldontlie_client import _get
+        from datetime import date, timedelta
+    except Exception:
+        return []
+    try:
+        from database import nba_today
+        end = date.fromisoformat(nba_today())
+    except Exception:
+        end = date.today()
+    start = end - timedelta(days=days_back)
+    out = []
+    cursor = None
+    try:
+        while True:
+            params = {"start_date": start.isoformat(),
+                      "end_date": end.isoformat(), "per_page": 100}
+            if cursor:
+                params["cursor"] = cursor
+            payload = _get("games", params)
+            for g in payload.get("data", []):
+                if str(g.get("status") or "").strip().lower()[:5] != "final":
+                    continue
+                h = (g.get("home_team") or {}).get("abbreviation")
+                a = (g.get("visitor_team") or {}).get("abbreviation")
+                hp = g.get("home_team_score")
+                ap = g.get("visitor_team_score")
+                if not (h and a) or hp is None or ap is None or (hp + ap) == 0:
+                    continue
+                out.append((g.get("id"), (g.get("date") or "")[:10], h, a,
+                            int(hp), int(ap)))
+            cursor = (payload.get("meta") or {}).get("next_cursor")
+            if not cursor:
+                break
+    except Exception:
+        return out
+    return out
+
+
 def _load():
     if _SCORE_PATH.exists():
         try:
@@ -97,14 +141,19 @@ def _save(data):
     _SCORE_PATH.write_text(json.dumps(data, indent=2))
 
 
-def update_scoreboard(season=2026):
+def update_scoreboard(season=2026, use_live=True):
     """Grade any not-yet-scored finished games against every profile and persist.
-    Returns the updated scoreboard dict. Safe to call repeatedly."""
+    Returns the updated scoreboard dict. Safe to call repeatedly.
+
+    Grades from the LIVE scores feed by default (updates the same night a game
+    goes final); falls back to the DB game logs if the feed returns nothing."""
     data = _load()
     done = set(data.get("graded_game_ids", []))
     ratings = _blend_ratings(season)
+    games = (_finished_games_live() if use_live else []) \
+        or _finished_games(season)
     newly = 0
-    for gid, gdate, home, away, hp, ap in _finished_games(season):
+    for gid, gdate, home, away, hp, ap in games:
         if gid in done:
             continue
         home_won = hp > ap
@@ -120,7 +169,7 @@ def update_scoreboard(season=2026):
                 rec["correct"] += 1
         done.add(gid)
         newly += 1
-    data["graded_game_ids"] = sorted(done)
+    data["graded_game_ids"] = sorted(done, key=str)
     if newly:
         _save(data)
     return data
