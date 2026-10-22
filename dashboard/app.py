@@ -865,25 +865,156 @@ def cached_team_form():
     games. {} on error."""
     try:
         import numpy as _np
-        from models.game_ml_model import _reconstruct_games, _team_timeline
+        from collect.goat_data import _get_all
         import datetime as _d
-        conn = get_connection()
-        games = _reconstruct_games(conn)
-        conn.close()
-        if games.empty:
-            return {}
-        tl = _team_timeline(games)
-        today = _d.date.today().isoformat()
-        out = {}
-        for team, rows in tl.items():
-            prior = [x for x in rows if x[0] < today]
-            if len(prior) < 5:
+        import pandas as _pd
+        # Rolling form needs only each team's recent games, so pull a short
+        # DATE WINDOW (last ~45 days) instead of whole seasons. One or two
+        # pages, ~1s — this is what fixes the slow Game Lines load.
+        today = _d.date.today()
+        start = (today - _d.timedelta(days=45)).isoformat()
+        rows = _get_all("games", {"start_date": start,
+                                   "end_date": today.isoformat()})
+        recs = []
+        for g in rows:
+            if g.get("status") != "Final":
                 continue
-            recent = prior[-10:]
-            off = float(_np.mean([x[1] for x in recent]))
-            dfn = float(_np.mean([x[2] for x in recent]))
-            wr = float(_np.mean([x[3] for x in recent]))
-            out[team] = (off, dfn, wr, 2)
+            hs, vs = g.get("home_team_score"), g.get("visitor_team_score")
+            if hs is None or vs is None:
+                continue
+            ht = (g.get("home_team") or {}).get("abbreviation")
+            at = (g.get("visitor_team") or {}).get("abbreviation")
+            if not ht or not at:
+                continue
+            recs.append((str(g.get("date"))[:10], ht, at, int(hs), int(vs)))
+        if len(recs) < 10:
+            # Early season / thin window — fall back to the 2-season pull.
+            from models.game_ml_model import _reconstruct_games, _team_timeline
+            _cur = today.year if today.month >= 10 else today.year - 1
+            games = _reconstruct_games(seasons=[_cur, _cur - 1])
+            if games.empty:
+                return {}
+            tl = _team_timeline(games)
+            out = {}
+            for team, grows in tl.items():
+                prior = [x for x in grows if x[0] < today.isoformat()]
+                if len(prior) < 5:
+                    continue
+                rec = prior[-10:]
+                out[team] = (float(_np.mean([x[1] for x in rec])),
+                             float(_np.mean([x[2] for x in rec])),
+                             float(_np.mean([x[3] for x in rec])), 2)
+            return out
+        # Build per-team timeline from the short window.
+        tl = {}
+        for date, ht, at, hs, vs in recs:
+            tl.setdefault(ht, []).append((date, hs, vs, 1 if hs > vs else 0))
+            tl.setdefault(at, []).append((date, vs, hs, 1 if vs > hs else 0))
+        out = {}
+        for team, grows in tl.items():
+            grows.sort(key=lambda x: x[0])
+            rec = grows[-10:]
+            if not rec:
+                continue
+            out[team] = (float(_np.mean([x[1] for x in rec])),
+                         float(_np.mean([x[2] for x in rec])),
+                         float(_np.mean([x[3] for x in rec])), 2)
+        return out
+    except Exception:
+        return {}
+
+
+def _cached_team_form_unused():
+    return {}
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_roster_stats(team):
+    """[(player_name, season_avg_dict)] for a team's active players, LIVE from
+    the API. Uses this season's averages, falling back to last season when a
+    player has no games yet (early-season). OUT players dropped. [] on error."""
+    if active_players is None or season_average is None:
+        return []
+    try:
+        import datetime as _d
+        from concurrent.futures import ThreadPoolExecutor
+        cur = _d.date.today().year
+        cur = cur if _d.date.today().month >= 10 else cur - 1
+        ap = active_players()
+        im = cached_injury_map()
+        # Candidate players: on the team and not ruled OUT.
+        cands = [p for p in ap if p.get("team") == team
+                 and not (im.get(p["id"]) and im[p["id"]][0] == "Out")]
+
+        def _fetch(p):
+            sa = season_average(p["id"], cur)
+            if not sa or not sa.get("games_played"):
+                sa = season_average(p["id"], cur - 1)   # last-season fallback
+            if sa and sa.get("games_played"):
+                inj = im.get(p["id"])
+                # Flag questionable/doubtful so the sim can trim their minutes.
+                return (p["name"], dict(sa, _inj=(inj[0] if inj else None)))
+            return None
+
+        # Fetch all players' averages IN PARALLEL (each is one API call).
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            results = list(ex.map(_fetch, cands))
+        return [r for r in results if r]
+    except Exception:
+        return []
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_team_form_rich():
+    """{team: {off, deff, std, pace}} — richer form for the Monte Carlo sim.
+    off/deff = recent points for/against per game, std = game-to-game scoring
+    spread (how streaky), pace left at league default. {} on error."""
+    try:
+        import numpy as _np
+        from collect.goat_data import _get_all
+        import datetime as _d
+        today = _d.date.today()
+        start = (today - _d.timedelta(days=45)).isoformat()
+        rows = _get_all("games", {"start_date": start,
+                                   "end_date": today.isoformat()})
+        pts_for, pts_against = {}, {}
+        for g in rows:
+            if g.get("status") != "Final":
+                continue
+            hs, vs = g.get("home_team_score"), g.get("visitor_team_score")
+            if hs is None or vs is None:
+                continue
+            ht = (g.get("home_team") or {}).get("abbreviation")
+            at = (g.get("visitor_team") or {}).get("abbreviation")
+            if not ht or not at:
+                continue
+            pts_for.setdefault(ht, []).append(hs)
+            pts_against.setdefault(ht, []).append(vs)
+            pts_for.setdefault(at, []).append(vs)
+            pts_against.setdefault(at, []).append(hs)
+        # Thin window early in the season -> widen to 2 seasons.
+        if sum(len(v) for v in pts_for.values()) < 30:
+            from models.game_ml_model import _reconstruct_games, _team_timeline
+            _cur = today.year if today.month >= 10 else today.year - 1
+            games = _reconstruct_games(seasons=[_cur, _cur - 1])
+            if not games.empty:
+                tl = _team_timeline(games)
+                pts_for, pts_against = {}, {}
+                for team, grows in tl.items():
+                    rec = sorted(grows, key=lambda x: x[0])[-15:]
+                    pts_for[team] = [x[1] for x in rec]
+                    pts_against[team] = [x[2] for x in rec]
+        out = {}
+        for team, pf in pts_for.items():
+            if len(pf) < 3:
+                continue
+            pa = pts_against.get(team, [])
+            out[team] = {
+                "off": float(_np.mean(pf[-10:])),
+                "deff": float(_np.mean(pa[-10:])) if pa else 112.0,
+                "std": float(_np.std(pf[-15:])) if len(pf) >= 3 else 12.0,
+                "pace": None,
+            }
         return out
     except Exception:
         return {}
@@ -3166,6 +3297,14 @@ else:
                                     1.0 - proj["p_home_win"], 4)
                                 proj["trained_margin"] = round(_tm["margin"], 1)
                                 proj["trained"] = True
+                                # Trained TOTAL leads the displayed total (the
+                                # old pace formula was the weaker estimate).
+                                if _tm.get("total") is not None:
+                                    _old_total = proj.get("exp_total")
+                                    proj["exp_total"] = round(
+                                        0.70 * _tm["total"]
+                                        + 0.30 * (_old_total or _tm["total"]), 1)
+                                    proj["trained_total"] = round(_tm["total"], 1)
                     except Exception:
                         pass
 
@@ -3283,6 +3422,92 @@ else:
                              f"pace {proj['pace']:.0f}). Win odds: "
                              f"{home} {proj['p_home_win']*100:.0f}% / "
                              f"{away} {proj['p_away_win']*100:.0f}%.")
+
+                    # ---- Monte Carlo: simulate the game 10,000 times ----
+                    try:
+                        from models.game_sim import simulate_game
+                        _rf = cached_team_form_rich()
+                        _hr, _ar = _rf.get(home), _rf.get(away)
+                        if _hr and _ar:
+                            _sp = g.get("spread")
+                            _tl = g.get("total")
+                            _sim = simulate_game(
+                                _hr, _ar, n_sims=10000,
+                                spread_home=(float(_sp) if _sp is not None
+                                             else None),
+                                total_line=(float(_tl) if _tl is not None
+                                            else None))
+                            if _sim:
+                                _msg = (f"🎲 Simulated 10,000× — {home} wins "
+                                        f"{_sim['home_win_prob']*100:.0f}% / "
+                                        f"{away} {_sim['away_win_prob']*100:.0f}%. "
+                                        f"Likely margin {home} "
+                                        f"{_sim['median_margin']:+.0f} "
+                                        f"(range {_sim['margin_p10']:+.0f} to "
+                                        f"{_sim['margin_p90']:+.0f}). "
+                                        f"Total usually {_sim['total_p10']:.0f}–"
+                                        f"{_sim['total_p90']:.0f}.")
+                                if _sim.get("home_cover_prob") is not None:
+                                    _msg += (f" Cover ({home} {_sp}): "
+                                             f"{_sim['home_cover_prob']*100:.0f}%.")
+                                if _sim.get("over_prob") is not None:
+                                    _msg += (f" Over {_tl}: "
+                                             f"{_sim['over_prob']*100:.0f}%.")
+                                st.caption(_msg)
+                    except Exception:
+                        pass
+
+                    # ---- 🎮 SimCast: play ONE game to a FULL BOX SCORE ----
+                    try:
+                        from models.box_sim import simulate_box
+                        _simkey = f"simcast_{away}_{home}"
+                        if st.button(f"🎮 Sim this game ({away} @ {home})",
+                                     key=f"simbtn_{away}_{home}"):
+                            import random as _rnd
+                            _hros = cached_roster_stats(home)
+                            _aros = cached_roster_stats(away)
+                            st.session_state[_simkey] = simulate_box(
+                                _hros, _aros, seed=_rnd.randint(1, 10**9))
+                        _box = st.session_state.get(_simkey)
+                        if _box:
+                            _w = home if _box["winner_is_home"] else away
+                            st.markdown(f"### 🏀 {away} {_box['away_pts']} — "
+                                        f"{home} {_box['home_pts']}")
+                            st.caption(f"**{_w} wins by {_box['margin']}** · one "
+                                       f"simulated game from live season stats — "
+                                       f"sim again for a fresh box score.")
+                            import pandas as _pd
+
+                            def _boxdf(lines):
+                                def _nm(p):
+                                    _i = p.get("inj")
+                                    if _i and "doubt" in str(_i).lower():
+                                        return p["name"] + " (D)"
+                                    if _i:
+                                        return p["name"] + " (Q)"
+                                    return p["name"]
+                                return _pd.DataFrame([{
+                                    "Player": _nm(p), "MIN": p["min"],
+                                    "PTS": p["pts"], "REB": p["reb"],
+                                    "AST": p["ast"], "STL": p["stl"],
+                                    "BLK": p["blk"], "TO": p["to"],
+                                    "FG": f"{p['fgm']}/{p['fga']}",
+                                    "3P": f"{p['fg3m']}/{p['fg3a']}",
+                                    "FT": f"{p['ftm']}/{p['fta']}",
+                                } for p in lines])
+                            _c1, _c2 = st.columns(2)
+                            with _c1:
+                                st.markdown(f"**{away}**")
+                                st.dataframe(_boxdf(_box["away"]),
+                                             use_container_width=True,
+                                             hide_index=True)
+                            with _c2:
+                                st.markdown(f"**{home}**")
+                                st.dataframe(_boxdf(_box["home"]),
+                                             use_container_width=True,
+                                             hide_index=True)
+                    except Exception:
+                        pass
 
                     # ---- Four Factors: eFG% edge folded into the margin ----
                     ffp = proj.get("four_factor_pts")

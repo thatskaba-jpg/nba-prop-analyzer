@@ -155,7 +155,7 @@ def _form_before(timeline, team, date):
 def _build_matrix(games: pd.DataFrame):
     """Assemble (X, y_win, y_margin, dates) with leak-free features."""
     tl = _team_timeline(games)
-    X, yw, ym, dates = [], [], [], []
+    X, yw, ym, yt, dates = [], [], [], [], []
     for _, r in games.iterrows():
         hf = _form_before(tl, r["home_team"], r["game_date"])
         af = _form_before(tl, r["away_team"], r["game_date"])
@@ -174,9 +174,10 @@ def _build_matrix(games: pd.DataFrame):
         ])
         yw.append(int(r["home_win"]))
         ym.append(float(r["margin"]))
+        yt.append(float(r["home_pts"] + r["away_pts"]))   # game total
         dates.append(r["game_date"])
     return (np.array(X, dtype=float), np.array(yw), np.array(ym),
-            np.array(dates))
+            np.array(yt), np.array(dates))
 
 
 _FEATURES = ["home_off", "home_def", "home_wr", "home_rest",
@@ -205,22 +206,24 @@ def train(save: bool = True) -> dict:
         print("not enough games to train:", len(games))
         return None
 
-    X, yw, ym, dates = _build_matrix(games)
+    X, yw, ym, yt, dates = _build_matrix(games)
     print(f"training rows (leak-free, >= {_MIN_PRIOR} prior games): {len(X)}")
 
     # Time-ordered split: newest ~20% is the out-of-sample test set.
     order = np.argsort(dates)
-    X, yw, ym, dates = X[order], yw[order], ym[order], dates[order]
+    X, yw, ym, yt, dates = X[order], yw[order], ym[order], yt[order], dates[order]
     cut = int(len(X) * 0.80)
     Xtr, Xte = X[:cut], X[cut:]
     ywtr, ywte = yw[:cut], yw[cut:]
     ymtr, ymte = ym[:cut], ym[cut:]
+    yttr, ytte = yt[:cut], yt[cut:]
 
     scaler = StandardScaler().fit(Xtr)
     Xtr_s, Xte_s = scaler.transform(Xtr), scaler.transform(Xte)
 
     win = LogisticRegression(max_iter=1000, C=1.0).fit(Xtr_s, ywtr)
     marg = Ridge(alpha=1.0).fit(Xtr_s, ymtr)
+    tot = Ridge(alpha=1.0).fit(Xtr_s, yttr)
 
     # Honest out-of-sample metrics.
     p_te = win.predict_proba(Xte_s)[:, 1]
@@ -235,6 +238,8 @@ def train(save: bool = True) -> dict:
     mae = float(np.mean(np.abs(m_pred - ymte)))
     # Spread direction: does predicted margin sign beat always-home?
     spread_acc = float(np.mean((m_pred > 0).astype(int) == ywte))
+    t_pred = tot.predict(Xte_s)
+    total_mae = float(np.mean(np.abs(t_pred - ytte)))
 
     print(f"\n=== OUT-OF-SAMPLE (newest {len(Xte)} games) ===")
     print(f"moneyline accuracy : {acc:.3f}   (majority baseline {base:.3f})")
@@ -242,6 +247,7 @@ def train(save: bool = True) -> dict:
     print(f"log loss           : {ll:.4f}")
     print(f"margin MAE         : {mae:.2f} pts")
     print(f"margin-sign acc    : {spread_acc:.3f}")
+    print(f"total MAE          : {total_mae:.2f} pts  (avg total {ytte.mean():.0f})")
 
     fit = {
         "features": _FEATURES,
@@ -251,10 +257,13 @@ def train(save: bool = True) -> dict:
         "win_intercept": float(win.intercept_[0]),
         "margin_coef": marg.coef_.tolist(),
         "margin_intercept": float(marg.intercept_),
+        "total_coef": tot.coef_.tolist(),
+        "total_intercept": float(tot.intercept_),
         "roll": _ROLL,
         "min_prior": _MIN_PRIOR,
         "metrics": {"ml_accuracy": acc, "ml_auc": auc, "log_loss": ll,
                     "margin_mae": mae, "margin_sign_acc": spread_acc,
+                    "total_mae": total_mae,
                     "majority_baseline": base, "test_games": int(len(Xte)),
                     "train_games": int(len(Xtr))},
     }
@@ -299,8 +308,11 @@ def predict_from_features(home_form, away_form) -> dict:
     logit = _apply_linear(fit, x, "win_coef", "win_intercept")
     p_home = 1.0 / (1.0 + math.exp(-logit))
     margin = _apply_linear(fit, x, "margin_coef", "margin_intercept")
-    return {"p_home_win": p_home, "p_away_win": 1.0 - p_home,
-            "margin": margin, "trained": True}
+    result = {"p_home_win": p_home, "p_away_win": 1.0 - p_home,
+              "margin": margin, "trained": True}
+    if "total_coef" in fit:
+        result["total"] = _apply_linear(fit, x, "total_coef", "total_intercept")
+    return result
 
 
 if __name__ == "__main__":
