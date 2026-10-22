@@ -1298,10 +1298,9 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tabM, tab1, tab5, tab6, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
+tabM, tab1, tab5, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
                                   "🔍 Analyze a Prop",
                                   "🏀 Game Lines (ML + Spread)",
-                                  "🛒 Line Shopping",
                                   "🎯 Value Scanner",
                                   "📒 Track Record",
                                   "📊 Backtest"])
@@ -1426,12 +1425,12 @@ with tabM:
 
 if config_err and not config:
     # A broken config (e.g. weights ≠ 100) — the analysis tabs can't run.
-    for _t in (tab1, tab5, tab6, tab4, tab3, tab2):
+    for _t in (tab1, tab5, tab4, tab3, tab2):
         with _t:
             st.warning("Fix your model in the **⚙️ Build Model** tab first "
                        f"({config_err}).")
 elif not config:
-    for _t in (tab1, tab5, tab6, tab4, tab3, tab2):
+    for _t in (tab1, tab5, tab4, tab3, tab2):
         with _t:
             st.info("👉 Open the **⚙️ Build Model** tab and pick at least one "
                     "factor (or tap ⭐ Use recommended factors) to start.")
@@ -2872,121 +2871,3 @@ else:
                        "priced; your edge is a soft/stale line, not out-guessing "
                        "the market.")
 
-    # ----------------------- Line Shopping ----------------------- #
-    with tab6:
-        st.subheader("Line shopping — best price across every sportsbook")
-        st.write("This is your **real edge**. Our model can't out-guess the "
-                 "books' consensus — but the books don't all post the same "
-                 "number. When one book is slow or soft, the same player's prop "
-                 "sits at a different line there. You take the **Over at the "
-                 "book with the lowest line** and the **Under at the book with "
-                 "the highest line** — buying the best number the market itself "
-                 "is already offering. The wider the gap between books, the "
-                 "bigger the opportunity.")
-
-        @st.cache_data(show_spinner="Comparing lines across all books… "
-                       "(first load pulls every game, ~15-30s)", ttl=900)
-        def _cached_shop():
-            # ONE heavy pull (every prop, every book, paginated), cached 15 min.
-            # Both the Top-10 view and the per-player lookup read from this same
-            # result — so after the first load, switching modes or picking a
-            # player is INSTANT with zero extra network calls. Returns a flat
-            # list of prop opportunities, each with per-book quotes, sorted by
-            # the biggest cross-book gap first.
-            def _build():
-                from odds.line_shopping import biggest_gaps
-                return biggest_gaps(500)  # pull the whole slate once
-            return _with_deadline(_build, seconds=45, default=[]) or []
-
-        # Opening the tab is INSTANT — the heavy fetch only runs when asked, so
-        # the tab never greets you with a long spinner.
-        if "shop_loaded" not in st.session_state:
-            st.session_state["shop_loaded"] = False
-        c_load, c_note = st.columns([1, 2])
-        if c_load.button("🔄 Load / refresh lines"):
-            st.session_state["shop_loaded"] = True
-            _cached_shop.clear()  # force a fresh pull on an explicit refresh
-        c_note.caption("Pulls every player prop across all 8 books once. "
-                       "First load ~15-30s; cached after that, so everything "
-                       "below is instant.")
-
-        if not st.session_state["shop_loaded"]:
-            st.info("Tap **Load / refresh lines** to compare today's props "
-                    "across every sportsbook.")
-            st.stop()
-
-        all_props = _cached_shop()
-        if not all_props:
-            st.info("No cross-book prop lines posted yet (they fill in closer to "
-                    "tip-off), or the feed is briefly rate-limited. Tap "
-                    "**Load / refresh lines** again in a minute.")
-            st.stop()
-
-        def _pretty(pt):
-            return PROP_WORDS.get(pt, pt)
-
-        # Two modes, both reading the SAME cached pull (no new network calls).
-        mode = st.radio("View", ["🔥 Top 10 gaps", "🔎 Look up a player"],
-                        horizontal=True, label_visibility="collapsed")
-
-        if mode == "🔎 Look up a player":
-            names = sorted({g["player"] for g in all_props})
-            who = st.multiselect("Players", names,
-                                 help="Pick one or more players to see their "
-                                      "lines across every book.")
-            if not who:
-                st.info("Pick one or more players above to see their lines.")
-                st.stop()
-            shown = [g for g in all_props if g["player"] in who]
-            st.caption(f"{len(who)} player{'s' if len(who) != 1 else ''} — every "
-                       "posted prop, best price per side across up to 8 books.")
-        else:
-            # Top 10 biggest cross-book gaps (already sorted biggest-first).
-            shown = all_props[:10]
-            st.caption("The 10 biggest price gaps across books right now — "
-                       "where one book is softest. Biggest gap first.")
-
-        if not shown:
-            st.info("Nothing to show for this selection.")
-        else:
-
-            for g in shown:
-                bo, bu = g["best_over"], g["best_under"]
-                title = (f"🛒  {g['player']}  ·  {_pretty(g['prop_type'])}  "
-                         f"{g['consensus_line']:g}"
-                         f"    📊 {g['line_spread']:g} pt gap across books")
-                with st.expander(title, expanded=False):
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("**⬆️ Best spot to bet the OVER**")
-                        st.success(f"**{bo['line']:g}** @ "
-                                   f"{int(bo['odds']):+} — **{bo['book']}**"
-                                   if bo['odds'] is not None else
-                                   f"**{bo['line']:g}** — **{bo['book']}**")
-                        st.caption("Lowest line on the board — easiest number "
-                                   "to clear if you like the over.")
-                    with c2:
-                        st.markdown("**⬇️ Best spot to bet the UNDER**")
-                        st.success(f"**{bu['line']:g}** @ "
-                                   f"{int(bu['odds']):+} — **{bu['book']}**"
-                                   if bu['odds'] is not None else
-                                   f"**{bu['line']:g}** — **{bu['book']}**")
-                        st.caption("Highest line on the board — most cushion if "
-                                   "you like the under.")
-
-                    # Full per-book table.
-                    import pandas as _pd
-                    rows = [{"Book": q["book"], "Line": q["line"],
-                             "Over": (f"{int(q['over']):+}"
-                                      if q["over"] is not None else "—"),
-                             "Under": (f"{int(q['under']):+}"
-                                       if q["under"] is not None else "—")}
-                            for q in g["all"]]
-                    st.dataframe(_pd.DataFrame(rows), hide_index=True,
-                                 use_container_width=True)
-
-            st.caption("⚠️ Line shopping needs accounts at multiple sportsbooks "
-                       "to actually use. The gap is the opportunity, but always "
-                       "confirm the live number on the book before betting — "
-                       "lines move, and these are a recent snapshot (cached 15 "
-                       "min).")
