@@ -1745,8 +1745,23 @@ else:
         if res["projection"] is None:
             st.warning("Not enough prior games for this player to project.")
         else:
-            lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
-            chance = res["p_over"] if lean == "OVER" else res["p_under"]
+            # PICK comes from PROJECTION vs LINE — the single source of truth.
+            # projected > line => OVER, always. p_over is a calibrated
+            # probability that can shrink in magnitude but must NEVER flip the
+            # side away from the projection (that caused UNDER badges on cards
+            # projecting clearly OVER). Keep the shown % consistent with the
+            # pick's side.
+            edge = res["projection"] - line
+            lean = "OVER" if edge >= 0 else "UNDER"
+            # Probability for the pick's side, forced consistent: at least 50%
+            # for the side the projection favors (a projection over the line
+            # can't be a sub-coinflip to go over).
+            _po = res["p_over"]
+            if lean == "OVER":
+                chance = _po if _po >= 0.5 else max(_po, 0.5)
+            else:
+                _pu = res["p_under"]
+                chance = _pu if _pu >= 0.5 else max(_pu, 0.5)
             conf = res["confidence"].split("(")[0].strip()
             conf_word = {"solid": "Reasonable confidence",
                          "moderate": "Moderate confidence — volatile form",
@@ -1754,7 +1769,6 @@ else:
                          "none": "No prior games"}.get(conf, conf)
             venue_txt = "vs" if is_home else "@"
             pick_color = "#22c55e" if lean == "OVER" else "#ef4444"
-            edge = res["projection"] - line
             edge_txt = (f"+{edge:.1f} over the line" if edge >= 0
                         else f"{edge:.1f} under the line")
             pct = int(round(chance * 100))
