@@ -120,132 +120,160 @@ from backtest.backtest import run_backtest  # noqa: E402
 
 st.set_page_config(page_title="NBA Prop Helper", page_icon="🏀", layout="wide")
 
-# --- Styling: a modern SPORTSBOOK look — bold green accent on near-black,
-#     elevated cards, chunky pills, confident numbers. ---
+# --- Styling: PREMIUM TERMINAL — near-black, monospace figures, amber glow,
+#     sharp data-dense panels. A "Bloomberg-for-props" insider-tool feel. ---
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Inter:wght@400;500;600;700;800&display=swap');
 
-/* ---- Accent palette ---- */
 :root {
-    --accent: #22c55e;          /* electric green */
-    --accent-dim: #16a34a;
-    --accent-glow: rgba(34,197,94,.35);
-    --bg: #07090c;
-    --panel: #10141a;
-    --panel-2: #141922;
-    --line: #1e2530;
-    --text: #f3f5f7;
-    --muted: #8b95a3;
-    --red: #ef4444;
+    --amber: #ffb000;           /* terminal amber accent */
+    --amber-dim: #cc8d00;
+    --amber-glow: rgba(255,176,0,.30);
+    --bg: #050607;
+    --panel: #0b0d10;
+    --panel-2: #0f1216;
+    --line: #1a1e24;
+    --grid: rgba(255,176,0,.05);
+    --text: #d7dde3;
+    --muted: #6b7682;
+    --green: #35d07f;
+    --red: #ff5d5d;
+    --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 }
 
-/* ---- Base ---- */
-html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont,
-    'Segoe UI', Roboto, sans-serif; }
-.stApp { background:
-    radial-gradient(1100px 520px at 85% -12%, rgba(34,197,94,.10) 0%, transparent 55%),
-    radial-gradient(800px 460px at -8% 6%, rgba(34,197,94,.05) 0%, transparent 55%),
-    var(--bg); color: var(--text); }
-.block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1200px; }
+/* ---- Base: dark with a faint terminal grid ---- */
+html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+.stApp {
+    background:
+      linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 100% 34px,
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 34px 100%,
+      radial-gradient(900px 480px at 88% -10%, rgba(255,176,0,.07) 0%, transparent 55%),
+      var(--bg);
+    color: var(--text);
+}
+.block-container { padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1220px; }
 
-/* ---- Headings ---- */
-h1, h2, h3 { letter-spacing: -0.025em; font-weight: 900; color: var(--text); }
-h3 { border-bottom: 2px solid var(--line); padding-bottom: 8px; margin-top: .5rem;
+/* numbers everywhere lean monospace for that terminal readout feel */
+div[data-testid="stMetricValue"], .stDataFrame, code, .term-num { font-family: var(--mono); }
+
+/* ---- Headings: uppercase, tracked-out, amber tick ---- */
+h1, h2, h3 { font-weight: 800; color: var(--text); letter-spacing: .01em; }
+h2, h3 { text-transform: uppercase; font-size: 1.02rem !important; letter-spacing: .14em;
+     color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 8px;
      position: relative; }
-h3::after { content:""; position:absolute; left:0; bottom:-2px; width:52px;
-     height:2px; background: var(--accent); }
+h2::before, h3::before { content:"▸ "; color: var(--amber); }
 
-/* ---- Metric tiles: dark card, green left-accent bar, lift on hover ---- */
+/* ---- Metric tiles: sharp panel, amber top-rule, mono value, glow on hover ---- */
 div[data-testid="stMetric"] {
-    background: linear-gradient(165deg, var(--panel-2) 0%, var(--panel) 100%);
+    background: var(--panel);
     border: 1px solid var(--line);
-    border-left: 3px solid var(--accent);
-    border-radius: 14px;
-    padding: 16px 18px;
-    box-shadow: 0 6px 20px rgba(0,0,0,.45);
-    transition: transform .12s ease, box-shadow .12s ease;
+    border-top: 2px solid var(--amber);
+    border-radius: 4px;
+    padding: 14px 16px;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.015);
+    transition: box-shadow .12s ease, border-color .12s ease;
 }
-div[data-testid="stMetric"]:hover { transform: translateY(-2px);
-    box-shadow: 0 10px 28px rgba(0,0,0,.55), 0 0 0 1px var(--accent-glow); }
-div[data-testid="stMetric"] label { color: var(--muted) !important; font-size: .74rem;
-    text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
-div[data-testid="stMetricValue"] { font-size: 1.8rem; font-weight: 900;
-    color: #fff; letter-spacing: -.02em; }
+div[data-testid="stMetric"]:hover {
+    box-shadow: 0 0 0 1px var(--amber-glow), 0 0 24px -6px var(--amber-glow); }
+div[data-testid="stMetric"] label { color: var(--muted) !important; font-size: .68rem;
+    text-transform: uppercase; letter-spacing: .14em; font-weight: 700; }
+div[data-testid="stMetricValue"] { font-size: 1.75rem; font-weight: 800;
+    color: var(--amber); text-shadow: 0 0 18px var(--amber-glow); letter-spacing: -.01em; }
 
-/* ---- Buttons: bold green pills, invert feel on hover ---- */
+/* ---- Buttons: sharp amber-outline, fills + glows on hover ---- */
 div.stButton > button {
-    background: var(--accent); color: #04110a; border: none;
-    border-radius: 999px; font-weight: 800; padding: .55rem 1.3rem;
-    letter-spacing: .01em; box-shadow: 0 4px 16px var(--accent-glow);
-    transition: transform .1s ease, box-shadow .1s ease, background .1s ease;
+    background: transparent; color: var(--amber);
+    border: 1px solid var(--amber); border-radius: 4px;
+    font-family: var(--mono); font-weight: 700; padding: .5rem 1.2rem;
+    letter-spacing: .06em; text-transform: uppercase; font-size: .82rem;
+    transition: all .12s ease;
 }
-div.stButton > button:hover { transform: translateY(-1px);
-    background: var(--accent-dim); box-shadow: 0 6px 22px var(--accent-glow); }
-div.stButton > button:active { transform: translateY(0); }
+div.stButton > button:hover { background: var(--amber); color: #120c00;
+    box-shadow: 0 0 22px -4px var(--amber-glow); }
+div.stButton > button:active { transform: translateY(1px); }
 
-/* ---- Tabs: pill row, green active ---- */
-div[data-baseweb="tab-list"] { gap: 6px; background: var(--panel); padding: 6px;
-    border-radius: 14px; border: 1px solid var(--line); }
-button[data-baseweb="tab"] { font-size: .96rem; font-weight: 700; border-radius: 10px;
-    padding: 9px 16px; color: var(--muted); transition: color .1s ease; }
-button[data-baseweb="tab"]:hover { color: var(--text); }
+/* ---- Tabs: terminal command strip, amber active with underglow ---- */
+div[data-baseweb="tab-list"] { gap: 2px; background: var(--panel); padding: 4px;
+    border: 1px solid var(--line); border-radius: 4px; }
+button[data-baseweb="tab"] { font-family: var(--mono); font-size: .82rem; font-weight: 600;
+    border-radius: 3px; padding: 9px 15px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .06em; transition: all .1s ease; }
+button[data-baseweb="tab"]:hover { color: var(--text); background: var(--panel-2); }
 button[data-baseweb="tab"][aria-selected="true"] {
-    background: var(--accent) !important; color: #04110a !important;
-    box-shadow: 0 3px 12px var(--accent-glow); }
+    background: rgba(255,176,0,.10) !important; color: var(--amber) !important;
+    box-shadow: inset 0 -2px 0 var(--amber); }
 div[data-baseweb="tab-highlight"], div[data-baseweb="tab-border"] { display:none; }
 
-/* ---- Inputs: dark, rounded, green focus ring ---- */
+/* ---- Inputs: sharp, mono, amber focus ---- */
 div[data-baseweb="input"] input, div[data-baseweb="select"] > div,
 .stNumberInput input, .stTextInput input {
-    background: var(--panel) !important; border-radius: 10px !important;
-    border: 1px solid var(--line) !important; color: var(--text) !important; }
+    background: #070809 !important; border-radius: 4px !important;
+    border: 1px solid var(--line) !important; color: var(--text) !important;
+    font-family: var(--mono) !important; }
 div[data-baseweb="input"]:focus-within, .stNumberInput div:focus-within,
 div[data-baseweb="select"] > div:focus-within {
-    border-color: var(--accent) !important;
-    box-shadow: 0 0 0 3px var(--accent-glow) !important; }
+    border-color: var(--amber) !important;
+    box-shadow: 0 0 0 1px var(--amber-glow), 0 0 16px -6px var(--amber-glow) !important; }
 
-/* ---- Tables ---- */
-div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden;
+/* ---- Tables: sharp, mono, gridded ---- */
+div[data-testid="stDataFrame"] { border-radius: 4px; overflow: hidden;
     border: 1px solid var(--line); }
 
-/* ---- Sidebar ---- */
+/* ---- Sidebar: control panel ---- */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0c0f14 0%, #070a0e 100%);
+    background: linear-gradient(180deg, #080a0c 0%, #050607 100%);
     border-right: 1px solid var(--line); }
-section[data-testid="stSidebar"] h1 { font-size: 1.2rem; }
+section[data-testid="stSidebar"] h1 { font-size: 1.05rem; text-transform: uppercase;
+    letter-spacing: .12em; color: var(--amber); }
 
-/* ---- Expanders: card feel, green edge on hover ---- */
-div[data-testid="stExpander"] { border: 1px solid var(--line); border-radius: 14px;
+/* ---- Expanders: sharp panels, amber edge on hover ---- */
+div[data-testid="stExpander"] { border: 1px solid var(--line); border-radius: 4px;
     background: var(--panel); overflow: hidden; transition: border-color .12s ease; }
-div[data-testid="stExpander"]:hover { border-color: var(--accent-glow); }
+div[data-testid="stExpander"]:hover { border-color: var(--amber); }
+div[data-testid="stExpander"] summary { font-family: var(--mono); letter-spacing: .02em; }
 
-/* ---- Alerts: tint the success/info/warn to the palette ---- */
-div[data-testid="stAlert"] { border-radius: 12px; border: 1px solid var(--line); }
+/* ---- Alerts ---- */
+div[data-testid="stAlert"] { border-radius: 4px; border: 1px solid var(--line);
+    background: var(--panel) !important; }
 
-/* ---- Radio / slider accents ---- */
-div[role="radiogroup"] label { font-weight: 600; }
-.stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--accent); }
-.stSlider [data-baseweb="slider"] div[data-testid="stTickBar"] ~ div { background: var(--accent) !important; }
-
-/* ---- Checkboxes ---- */
+/* ---- Radio / slider / checkbox: amber ---- */
+div[role="radiogroup"] label { font-weight: 600; font-family: var(--mono);
+    font-size: .85rem; }
+.stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--amber); }
 .stCheckbox [data-baseweb="checkbox"] span[aria-checked="true"] {
-    background: var(--accent) !important; border-color: var(--accent) !important; }
+    background: var(--amber) !important; border-color: var(--amber) !important; }
 
-/* ---- App header banner ---- */
+/* ---- Terminal hero header ---- */
 .sb-hero {
-    background: linear-gradient(135deg, rgba(34,197,94,.16) 0%, rgba(34,197,94,.02) 55%, transparent 100%),
-               var(--panel);
-    border: 1px solid var(--line); border-left: 4px solid var(--accent);
-    border-radius: 18px; padding: 20px 24px; margin-bottom: 18px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    background: var(--panel);
+    border: 1px solid var(--line); border-left: 3px solid var(--amber);
+    border-radius: 4px; padding: 16px 20px; margin-bottom: 18px;
+    box-shadow: inset 0 0 40px -20px var(--amber-glow);
+    position: relative; overflow: hidden;
 }
-.sb-hero h1 { margin: 0; font-size: 1.9rem; }
-.sb-hero p { margin: .35rem 0 0; color: var(--muted); font-size: .98rem;
-    max-width: 640px; }
-.sb-pill { display:inline-block; background: var(--accent); color:#04110a;
-    font-weight:800; font-size:.72rem; letter-spacing:.06em; text-transform:uppercase;
-    padding: 3px 10px; border-radius: 999px; margin-bottom: 8px; }
+.sb-hero::after { content:""; position:absolute; top:0; right:0; width:220px; height:100%;
+    background: radial-gradient(120px 80px at 90% 0%, var(--amber-glow), transparent 70%); }
+.sb-hero h1 { margin: 0; font-family: var(--mono); font-size: 1.5rem; font-weight: 800;
+    color: var(--text); letter-spacing: .02em; }
+.sb-hero h1 .cur { color: var(--amber); animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .sb-hero h1 .cur { animation: none; } }
+.sb-hero p { margin: .4rem 0 0; color: var(--muted); font-size: .9rem;
+    font-family: var(--mono); max-width: 680px; line-height: 1.5; }
+.sb-pill { display:inline-block; border:1px solid var(--amber); color: var(--amber);
+    font-family: var(--mono); font-weight:700; font-size:.66rem; letter-spacing:.12em;
+    text-transform:uppercase; padding: 2px 9px; border-radius: 3px; margin-bottom: 9px; }
+
+/* ---- Hide Streamlit's own chrome so it reads as a standalone app ---- */
+#MainMenu { visibility: hidden; }
+header[data-testid="stHeader"] { display: none; }
+footer { display: none; }
+div[data-testid="stToolbar"] { display: none; }
+div[data-testid="stDecoration"] { display: none; }
+.stDeployButton { display: none; }
+/* pull content up now that the header is gone */
+.block-container { padding-top: 0.6rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -876,11 +904,10 @@ if chosen:
 # --------------------------------------------------------------------------- #
 st.markdown("""
 <div class="sb-hero">
-  <span class="sb-pill">🏀 NBA · Props</span>
-  <h1>Player-Prop Analyzer</h1>
-  <p>Project a stat line, estimate the Over/Under chance, and — with your odds —
-     see if it's a good deal. Shop lines across books for the real edge.
-     A research tool, not a guarantee.</p>
+  <span class="sb-pill">◉ NBA · LIVE TERMINAL</span>
+  <h1>props://analyzer<span class="cur">_</span></h1>
+  <p>&gt; project stat lines · estimate over/under · check EV · shop every book
+     for the edge.<br>&gt; research terminal — not a guarantee.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -890,10 +917,12 @@ elif not config:
     st.info("👈 Select at least one factor to build your model. A solid start: "
             "**Recent form** + **Opponent defense**.")
 else:
-    tab1, tab4, tab2, tab3, tab5, tab6 = st.tabs(["🔍 Analyze a Prop", "🎯 Value Scanner",
-                                      "📊 Backtest", "📒 Track Record",
+    tab1, tab5, tab6, tab4, tab3, tab2 = st.tabs(["🔍 Analyze a Prop",
                                       "🏀 Game Lines (ML + Spread)",
-                                      "🛒 Line Shopping"])
+                                      "🛒 Line Shopping",
+                                      "🎯 Value Scanner",
+                                      "📒 Track Record",
+                                      "📊 Backtest"])
 
     # ----------------------- Check a Player ----------------------- #
     with tab1:
@@ -1808,36 +1837,71 @@ else:
                  "is already offering. The wider the gap between books, the "
                  "bigger the opportunity.")
 
-        @st.cache_data(show_spinner="Comparing lines across all books…", ttl=900)
-        def _cached_gaps():
+        @st.cache_data(show_spinner="Comparing lines across all books… "
+                       "(first load pulls every game, ~15-30s)", ttl=900)
+        def _cached_shop():
+            # ONE heavy pull (every prop, every book, paginated), cached 15 min.
+            # Both the Top-10 view and the per-player lookup read from this same
+            # result — so after the first load, switching modes or picking a
+            # player is INSTANT with zero extra network calls. Returns a flat
+            # list of prop opportunities, each with per-book quotes, sorted by
+            # the biggest cross-book gap first.
             def _build():
                 from odds.line_shopping import biggest_gaps
-                return biggest_gaps(60)
-            return _with_deadline(_build, seconds=12, default=[]) or []
+                return biggest_gaps(500)  # pull the whole slate once
+            return _with_deadline(_build, seconds=45, default=[]) or []
 
-        colf1, colf2 = st.columns([1, 1])
-        min_spread = colf1.slider(
-            "Minimum gap between books (points)", 0.5, 6.0, 1.5, 0.5,
-            help="How far apart the lowest and highest line must be before we "
-                 "show it. A bigger gap = a bigger shopping edge.")
-        prop_opts = ["All"] + sorted(PROP_WORDS.values())
-        prop_filter = colf2.selectbox("Prop type", prop_opts, index=0)
+        # Opening the tab is INSTANT — the heavy fetch only runs when asked, so
+        # the tab never greets you with a long spinner.
+        if "shop_loaded" not in st.session_state:
+            st.session_state["shop_loaded"] = False
+        c_load, c_note = st.columns([1, 2])
+        if c_load.button("🔄 Load / refresh lines"):
+            st.session_state["shop_loaded"] = True
+            _cached_shop.clear()  # force a fresh pull on an explicit refresh
+        c_note.caption("Pulls every player prop across all 8 books once. "
+                       "First load ~15-30s; cached after that, so everything "
+                       "below is instant.")
 
-        gaps = _cached_gaps()
-        if not gaps:
+        if not st.session_state["shop_loaded"]:
+            st.info("Tap **Load / refresh lines** to compare today's props "
+                    "across every sportsbook.")
+            st.stop()
+
+        all_props = _cached_shop()
+        if not all_props:
             st.info("No cross-book prop lines posted yet (they fill in closer to "
-                    "tip-off), or the feed is briefly rate-limited. Try again in "
-                    "a minute.")
+                    "tip-off), or the feed is briefly rate-limited. Tap "
+                    "**Load / refresh lines** again in a minute.")
+            st.stop()
+
+        def _pretty(pt):
+            return PROP_WORDS.get(pt, pt)
+
+        # Two modes, both reading the SAME cached pull (no new network calls).
+        mode = st.radio("View", ["🔥 Top 10 gaps", "🔎 Look up a player"],
+                        horizontal=True, label_visibility="collapsed")
+
+        if mode == "🔎 Look up a player":
+            names = sorted({g["player"] for g in all_props})
+            who = st.multiselect("Players", names,
+                                 help="Pick one or more players to see their "
+                                      "lines across every book.")
+            if not who:
+                st.info("Pick one or more players above to see their lines.")
+                st.stop()
+            shown = [g for g in all_props if g["player"] in who]
+            st.caption(f"{len(who)} player{'s' if len(who) != 1 else ''} — every "
+                       "posted prop, best price per side across up to 8 books.")
         else:
-            def _pretty(pt):
-                return PROP_WORDS.get(pt, pt)
-            shown = [g for g in gaps
-                     if g["line_spread"] >= min_spread
-                     and (prop_filter == "All" or _pretty(g["prop_type"]) == prop_filter)]
-            st.caption(f"{len(shown)} shopping opportunit"
-                       f"{'y' if len(shown) == 1 else 'ies'} with a gap of "
-                       f"{min_spread:g}+ points, across up to 8 books. "
-                       "Biggest gaps first.")
+            # Top 10 biggest cross-book gaps (already sorted biggest-first).
+            shown = all_props[:10]
+            st.caption("The 10 biggest price gaps across books right now — "
+                       "where one book is softest. Biggest gap first.")
+
+        if not shown:
+            st.info("Nothing to show for this selection.")
+        else:
 
             for g in shown:
                 bo, bu = g["best_over"], g["best_under"]

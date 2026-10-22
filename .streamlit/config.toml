@@ -1,11 +1,11 @@
 [theme]
-# Modern sportsbook: near-black with an electric-green accent.
+# Premium terminal: near-black with an amber accent.
 base = "dark"
-primaryColor = "#22c55e"
-backgroundColor = "#07090c"
-secondaryBackgroundColor = "#10141a"
-textColor = "#f3f5f7"
-font = "sans serif"
+primaryColor = "#ffb000"
+backgroundColor = "#050607"
+secondaryBackgroundColor = "#0b0d10"
+textColor = "#d7dde3"
+font = "monospace"
 
 [server]
 headless = true
