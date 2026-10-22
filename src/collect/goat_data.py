@@ -130,6 +130,16 @@ def player_advanced_avg(player_id: int, season: int) -> dict:
         # Playmaking volume.
         "passes": _avg("passes"),
         "secondary_ast": _avg("secondary_assists"),
+        # Defense & hustle — the gritty stuff box scores miss.
+        "matchup_tov": _avg("matchup_turnovers"),     # TOs he forces on his man
+        "deflections": _avg("deflections"),
+        "charges_drawn": _avg("charges_drawn"),
+        "contested_shots": _avg("contested_shots"),
+        "box_outs": _avg("box_outs"),
+        "screen_ast": _avg("screen_assists"),
+        "fouls_drawn": _avg("fouls_drawn"),
+        "pct_steals": _avg("pct_steals"),
+        "pct_blocks": _avg("pct_blocks"),
         # Scoring profile — where his points come from.
         "pct_pts_paint": _avg("pct_pts_paint"),
         "pct_pts_3pt": _avg("pct_pts_3pt"),
@@ -348,6 +358,43 @@ def team_four_factors_map(season: int) -> dict:
             _TEAM_FF_CACHE[season] = prior
             return prior
     _TEAM_FF_CACHE[season] = cur
+    return cur
+
+
+_TEAM_STYLE_CACHE: dict = {}
+
+
+def team_style_map(season: int, category: str, type_: str) -> dict:
+    """Team style data for a category/type, keyed by team abbr -> stats dict.
+
+    category: 'playtype' (type: isolation, prballhandler, prrollman, spotup,
+    postup, handoff, cut, offscreen, transition, offrebound, misc) or
+    'tracking' (type: drives, painttouch, catchshoot, pullupshot, passing,
+    posttouch, elbowtouch, rebounding, possessions, efficiency, speeddistance).
+
+    Cached per (season, category, type). Early-season fallback to last year."""
+    key = (season, category, type_)
+    if key in _TEAM_STYLE_CACHE:
+        return _TEAM_STYLE_CACHE[key]
+
+    def _build(yr):
+        rows = _get_all(f"team_season_averages/{category}",
+                        {"season": yr, "season_type": "regular",
+                         "type": type_, "per_page": 100})
+        out = {}
+        for r in rows:
+            ab = (r.get("team") or {}).get("abbreviation")
+            if ab:
+                out[ab] = r.get("stats") or {}
+        return out
+
+    cur = _build(season)
+    if len(cur) < 25:
+        prior = _build(season - 1)
+        if len(prior) > len(cur):
+            _TEAM_STYLE_CACHE[key] = prior
+            return prior
+    _TEAM_STYLE_CACHE[key] = cur
     return cur
 
 
