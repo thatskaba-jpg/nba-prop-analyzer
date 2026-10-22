@@ -2329,7 +2329,9 @@ else:
                         f"team's plays{_mix_txt}. Higher usage = more "
                         "shots/touches = a higher, steadier line.")
 
-                    with st.expander("🔬 Deep stats (optional)"):
+                    with st.container():
+                        st.markdown("---")
+                        st.caption("🔬 Deep stats")
                         rows = []
                         if adv.get("ts_pct") is not None:
                             rows.append(f"True shooting {adv['ts_pct']*100:.1f}%")
@@ -2583,9 +2585,10 @@ else:
                     st.dataframe(sdf, use_container_width=True, hide_index=True)
 
                 # Everything technical hidden behind one optional expander.
-                with st.expander("🤓 Advanced details (optional)"):
-                    st.caption("For the curious — you don't need these to use "
-                               "the bot.")
+                with st.container():
+                    st.markdown("---")
+                    st.caption("🤓 Advanced details — for the curious, you "
+                               "don't need these to use the bot.")
                     st.write(f"- **Brier score:** {m['brier']} "
                              f"(lower is better; baseline {base['brier']})")
                     st.write(f"- **Log loss:** {m['log_loss']} "
