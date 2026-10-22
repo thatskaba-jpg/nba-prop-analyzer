@@ -322,6 +322,34 @@ def team_ratings_map(season: int) -> dict:
     return cur
 
 
+_TEAM_API_NET_CACHE: dict = {}
+
+
+def team_api_net_map(season: int) -> dict:
+    """ROSTER-SAFE current-season team cross-check: {abbr: {net, efg, gp}} from
+    the API's own team advanced averages for THIS season ONLY — no fallback to
+    last year, because a team average reflects the roster that produced it and
+    last season's roster may be half-traded. Early season this is thin (low gp),
+    so callers fade it to ~0 and lean on the trade-aware player ratings instead.
+    """
+    if season in _TEAM_API_NET_CACHE:
+        return _TEAM_API_NET_CACHE[season]
+    out = {}
+    try:
+        for r in team_ratings(season):
+            ab = (r.get("team") or {}).get("abbreviation")
+            st = r.get("stats") or {}
+            if not ab:
+                continue
+            out[ab] = {"net": st.get("net_rating"),
+                       "efg": st.get("efg_pct"),
+                       "gp": st.get("gp") or 0}
+    except Exception:
+        out = {}
+    _TEAM_API_NET_CACHE[season] = out
+    return out
+
+
 _TEAM_FF_CACHE: dict = {}
 
 

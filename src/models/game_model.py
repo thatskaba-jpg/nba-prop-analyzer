@@ -273,7 +273,8 @@ def _positional_defense_edge(home_abbr, away_abbr, positional):
 def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
                  four_factors=None, team_form=None, playtype=None,
                  positional=None, sim=None, market_p_home=None,
-                 games_played=0):
+                 games_played=0, home_edges=None, record_strength=None,
+                 team_api=None):
     """Return a dict with expected margin, win probs, and the inputs used.
 
     ratings: {abbr: {off, def, pace}} from team_ratings_map. Returns None if
@@ -302,6 +303,12 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
     if isinstance(profile, dict):
         prof.update(profile)
     home_edge = prof["home_edge"]
+    # Per-team home court: if we have real home/road splits, use THIS home
+    # team's actual edge (good home teams get more, poor ones ~0 or negative),
+    # scaled by the profile's home_edge dial relative to the ~2.5 league norm.
+    # (BOS is -0.3 at home; the flat +2.5 wrongly boosted it over a better DET.)
+    if home_edges and home_abbr in home_edges:
+        home_edge = home_edges[home_abbr] * (prof["home_edge"] / 2.5)
     margin_std = prof["margin_std"]
     net_scale = prof["net_scale"]
     pace_gain = prof["pace_gain"]
@@ -348,11 +355,9 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
     # net_scale controls how hard the rating gap is trusted.
     raw_margin = (home_pts - away_pts) * net_scale
     # Home-court soft cap: when the RATINGS clearly favor the road team
-    # (raw_margin < 0), a flat home bump shouldn't be able to flip the pick to
-    # the home side. It can narrow the road edge but not reverse a gap bigger
-    # than ~1.5 pts. (MIN was rated +4.2 at MIA, then home court flipped the
-    # pick to MIA — MIN won by 25. This stops that.) When the home team is
-    # already favored or it's near-even, the edge applies normally.
+    # (raw_margin < -1.5), a flat home bump shouldn't flip the pick to the home
+    # side. It can narrow the road edge but not reverse a gap bigger than ~1.5
+    # pts. (MIN rated +4.2 at MIA, home court flipped it to MIA — MIN won by 25.)
     if raw_margin < -1.5 and home_edge > 0:
         applied_home_edge = max(0.0, min(home_edge, abs(raw_margin) - 1.5))
     else:
@@ -409,7 +414,41 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
         # Blend recent-margin gap into the projected margin (base 25%, scaled by
         # this profile's form weight).
         form_pts = 0.25 * (hrm - arm) * w_form
+        # Early-season FADE: with only a game or two played, a single blowout
+        # makes "recent form" a ±12 swing that wrongly flips good ratings (NYK
+        # +11.9 vs PHI -7.7 flipped PHI@NYK). Shrink form toward 0 until a real
+        # sample exists: weight = g/(g+K_FORM). Full strength ~2 weeks in.
+        K_FORM = 6.0
+        if games_played is not None and games_played >= 0:
+            form_pts *= games_played / (games_played + K_FORM)
         margin += form_pts
+
+    # ---- REAL RECORD (W-L) strength ---------------------------------------
+    # A team's actual win% is the cleanest "are they good" signal. The gap
+    # between the two teams' record-strength (prior season blended into this
+    # one) nudges the margin. Gentle (×0.5) and capped ±4 so it refines the
+    # ratings, not replaces them.
+    if record_strength:
+        hr = record_strength.get(home_abbr)
+        ar = record_strength.get(away_abbr)
+        if hr is not None and ar is not None:
+            rec_pts = max(-4.0, min(4.0, (hr - ar) * 0.5))
+            margin += rec_pts
+
+    # ---- ROSTER-SAFE API team cross-check (current season only) -----------
+    # The API's own team net rating + eFG for THIS season cross-checks our
+    # player-summed ratings. It is NOT blended with last year (a team average
+    # carries its old roster), so it's faded by each team's actual games played
+    # (gp/(gp+5)) — ~0 now, growing as the real roster logs games. Gentle, cap 3.
+    if team_api:
+        ha = team_api.get(home_abbr) or {}
+        aa = team_api.get(away_abbr) or {}
+        hn, an = ha.get("net"), aa.get("net")
+        if hn is not None and an is not None:
+            gp = min(ha.get("gp") or 0, aa.get("gp") or 0)
+            fade = gp / (gp + 5.0)
+            api_pts = max(-3.0, min(3.0, (hn - an) * 0.15 * fade))
+            margin += api_pts
     hrest, arest = hform.get("rest_days"), aform.get("rest_days")
     if hrest is not None and arest is not None:
         def _b2b(days):

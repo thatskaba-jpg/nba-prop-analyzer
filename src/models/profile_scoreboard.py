@@ -73,6 +73,48 @@ def _market_for_game(gdate, home, away):
     return snap.get("market_p_home"), snap.get("games_played", 0)
 
 
+_HOME_EDGES_CACHE = {}
+
+
+def _home_edges(season):
+    """Cached per-team home-court edges (real home/road splits) for grading."""
+    if season not in _HOME_EDGES_CACHE:
+        try:
+            from models.team_form import home_edge_map
+            _HOME_EDGES_CACHE[season] = home_edge_map(season)
+        except Exception:
+            _HOME_EDGES_CACHE[season] = {}
+    return _HOME_EDGES_CACHE[season]
+
+
+_RECORD_CACHE = {}
+
+
+def _record_strength(season):
+    """Cached per-team real-record (W-L) strength in points for grading."""
+    if season not in _RECORD_CACHE:
+        try:
+            from models.team_form import record_strength_map
+            _RECORD_CACHE[season] = record_strength_map(season)
+        except Exception:
+            _RECORD_CACHE[season] = {}
+    return _RECORD_CACHE[season]
+
+
+_TEAM_API_CACHE = {}
+
+
+def _team_api(season):
+    """Cached roster-safe current-season API team net/efg cross-check."""
+    if season not in _TEAM_API_CACHE:
+        try:
+            from collect.goat_data import team_api_net_map
+            _TEAM_API_CACHE[season] = team_api_net_map(season)
+        except Exception:
+            _TEAM_API_CACHE[season] = {}
+    return _TEAM_API_CACHE[season]
+
+
 def _blend_ratings(season):
     """Team ratings for the game model, roster-strength FIRST.
 
@@ -308,7 +350,10 @@ def compute_live_scoreboard(season=2026, days_back=30):
         for pname, prof in GAME_PROFILES.items():
             proj = project_game(home, away, ratings, prof, positional=_pos,
                                 four_factors=_ff, team_form=_form,
-                                market_p_home=_mkt, games_played=_mg)
+                                market_p_home=_mkt, games_played=_mg,
+                                home_edges=_home_edges(season),
+                                record_strength=_record_strength(season),
+                                team_api=_team_api(season))
             if not proj:
                 continue
             rec = tally.setdefault(pname, [0, 0, 0.0])  # [correct, total, brier]
@@ -353,7 +398,10 @@ def scoreboard_detail(season=2026, days_back=30):
         for pname, prof in GAME_PROFILES.items():
             proj = project_game(home, away, ratings, prof, positional=_pos,
                                 four_factors=_ff, team_form=_form,
-                                market_p_home=_mkt, games_played=_mg)
+                                market_p_home=_mkt, games_played=_mg,
+                                home_edges=_home_edges(season),
+                                record_strength=_record_strength(season),
+                                team_api=_team_api(season))
             if not proj:
                 continue
             picked_home = proj["exp_margin"] > 0
@@ -413,7 +461,10 @@ def update_scoreboard(season=2026, use_live=True):
         for pname, prof in GAME_PROFILES.items():
             proj = project_game(home, away, ratings, prof, positional=_pos,
                                 four_factors=_ff, team_form=_form,
-                                market_p_home=_mkt, games_played=_mg)
+                                market_p_home=_mkt, games_played=_mg,
+                                home_edges=_home_edges(season),
+                                record_strength=_record_strength(season),
+                                team_api=_team_api(season))
             if not proj:
                 continue
             picked_home = proj["exp_margin"] > 0

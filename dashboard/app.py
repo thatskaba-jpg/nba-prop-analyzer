@@ -3337,6 +3337,22 @@ else:
             _gconn.close()
         except Exception:
             _gl_games_played = 0
+        # Per-team home-court edges from real home/road splits (cached).
+        try:
+            from models.team_form import home_edge_map
+            _gl_home_edges = home_edge_map(_season)
+        except Exception:
+            _gl_home_edges = {}
+        try:
+            from models.team_form import record_strength_map
+            _gl_record = record_strength_map(_season)
+        except Exception:
+            _gl_record = {}
+        try:
+            from collect.goat_data import team_api_net_map
+            _gl_team_api = team_api_net_map(_season)
+        except Exception:
+            _gl_team_api = {}
         _gl_iso = cached_team_style(_season, "playtype", "isolation")
         _gl_drives = cached_team_style(_season, "tracking", "drives")
 
@@ -3400,37 +3416,28 @@ else:
                     _sb_err = str(_e)
                 if board:
                     import pandas as _pd
-                    # Convert calibration (Brier, lower=better) to a plain
-                    # 0-100 "accuracy score" (higher=better) so it reads simply.
-                    def _acc_score(br):
-                        if br is None:
-                            return None
-                        return max(0, round((1.0 - br) * 100))
-                    # Best model = lowest Brier (best calibrated) among those
-                    # with a score; mark it so the user sees ONE clear answer.
-                    _scored = [(r[0], r[4]) for r in board if r[4] is not None]
-                    _best = min(_scored, key=lambda x: x[1])[0] if _scored else None
-                    # Sort by accuracy score (lowest Brier = best) first, so the
-                    # most accurate model is always on top; rows without a score
-                    # fall to the bottom.
-                    _board = sorted(
-                        board,
-                        key=lambda r: (r[4] if r[4] is not None else 1e9))
+                    # Rank purely by WIN RATE — the user tracks wins, not
+                    # calibration. Best = highest win%, ties broken by more
+                    # games (bigger sample). Rows with no games fall to bottom.
+                    def _winpct(r):
+                        _c, _t = r[1], r[2]
+                        return (_c / _t) if _t else -1.0
+                    _best = max(board, key=lambda r: (_winpct(r), r[2]))[0] \
+                        if board else None
+                    _board = sorted(board, key=lambda r: (_winpct(r), r[2]),
+                                    reverse=True)
                     sb = _pd.DataFrame(
                         [{"Profile": ("⭐ " + n if n == _best else n),
                           "Record": f"{c}-{t-c}",
-                          "Accuracy score": (f"{_acc_score(br)}/100"
-                                             if br is not None else "—"),
+                          "Win %": (f"{round(c/t*100)}%" if t else "—"),
                           "Games": t}
                          for n, c, t, pct, br in _board])
                     st.dataframe(sb, use_container_width=True, hide_index=True)
-                    _best_txt = (f"⭐ **{_best}** is the most accurate model so "
-                                 f"far. " if _best else "")
+                    _best_txt = (f"⭐ **{_best}** has the best win rate so far. "
+                                 if _best else "")
                     st.caption(
-                        "Ranked by **Accuracy score** — how well-calibrated each "
-                        "model's confidence is (100 = perfect), rewarding being "
-                        "confident when right and cautious when unsure. "
-                        "(**Record** is its straight-up win-loss.) " + _best_txt
+                        "Ranked by **win %** — straight-up winners picked "
+                        "right, most wins on top. " + _best_txt
                         + "Small samples early, so give it time to settle.")
                     # Export: per-game, per-preset picks so you can see exactly
                     # what each profile selected and whether it hit.
@@ -3544,7 +3551,10 @@ else:
                                         playtype=_gl_playtype,
                                         positional=_gl_positional,
                                         market_p_home=_mkt_ph,
-                                        games_played=_games_played)
+                                        games_played=_games_played,
+                                        home_edges=_gl_home_edges,
+                                        record_strength=_gl_record,
+                                        team_api=_gl_team_api)
                 except TypeError:
                     try:
                         proj = project_game(home, away, ratings, gprofile, team_inj,
