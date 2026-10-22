@@ -115,10 +115,18 @@ def player_advanced_avg(player_id: int, season: int) -> dict:
         # Matchup DEFENSE — what the player allows to who he guards.
         "matchup_pts": _avg("matchup_player_points"),
         "matchup_fg_pct": _avg("matchup_fg_pct"),
+        "matchup_3pt_pct": _avg("matchup_3pt_pct"),
+        "matchup_ast": _avg("matchup_assists"),
         # Shot quality — how good his looks are.
         "contested_fg_pct": _avg("contested_fg_pct"),
         "uncontested_fg_pct": _avg("uncontested_fg_pct"),
         "rim_fg_pct": _avg("defended_at_rim_fg_pct"),
+        # Raw ATTEMPT + PASS volume (counts, per game) — not just percentages.
+        "contested_fga": _avg("contested_fga"),
+        "uncontested_fga": _avg("uncontested_fga"),
+        "rim_fga": _avg("defended_at_rim_fga"),
+        "matchup_fga": _avg("matchup_fga"),       # shots he faces on defense
+        "matchup_3pa": _avg("matchup_3pa"),
         # Playmaking volume.
         "passes": _avg("passes"),
         "secondary_ast": _avg("secondary_assists"),
@@ -135,6 +143,52 @@ def player_advanced_avg(player_id: int, season: int) -> dict:
 def standings(season: int) -> list:
     """Team standings for a season: wins/losses, home/road, conference ranks."""
     return _get_all("standings", {"season": season})
+
+
+_SHOOT_SPLITS_CACHE: dict = {}
+
+# Distance buckets at/behind the NBA three-point line (22-23.75 ft). The 5ft_range
+# shooting splits bucket by raw distance, so 3PT volume ≈ these buckets summed.
+_THREE_RANGE = ("20-24", "25-29", "30-34", "35-39", "40+")
+
+
+def shooting_splits(player_id: int, season: int) -> dict:
+    """Shooting splits by distance for ONE player-season, from
+    season_averages/shooting type=5ft_range. Returns the raw stats dict
+    (keys like '25-29_ft._fga'), or {} if unavailable. Cached per player-season.
+
+    Verified live: category 'shooting', type '5ft_range' yields the distance
+    buckets; the 20-24ft bucket straddles the arc, so three-point volume from
+    these buckets is approximate (good enough for a context note, not a model
+    input)."""
+    key = (int(player_id), int(season))
+    if key in _SHOOT_SPLITS_CACHE:
+        return _SHOOT_SPLITS_CACHE[key]
+    try:
+        r = _get("nba/v1/season_averages/shooting",
+                 {"player_ids[]": int(player_id), "season": int(season),
+                  "season_type": "regular", "type": "5ft_range"})
+        rows = r.get("data", [])
+        out = rows[0].get("stats", {}) if rows else {}
+    except Exception:
+        out = {}
+    _SHOOT_SPLITS_CACHE[key] = out
+    return out
+
+
+def expected_threes(player_id: int, season: int) -> dict:
+    """Roughly how many threes a player takes/makes per game, from shooting
+    splits. Returns {'fga_3','fgm_3','fg3_pct'} or {} if no data. Approximate
+    (the 20-24ft bucket straddles the arc) — for a 3PM-prop context note."""
+    s = shooting_splits(player_id, season)
+    if not s:
+        return {}
+    fga = sum(s.get(f"{b}_ft._fga", 0) or 0 for b in _THREE_RANGE)
+    fgm = sum(s.get(f"{b}_ft._fgm", 0) or 0 for b in _THREE_RANGE)
+    if fga <= 0:
+        return {}
+    return {"fga_3": round(fga, 1), "fgm_3": round(fgm, 1),
+            "fg3_pct": round(fgm / fga, 3)}
 
 
 def lineups(game_id: int) -> list:
@@ -163,6 +217,25 @@ def lineup_for_team(game_id: int, team_abbr: str) -> dict:
             continue
         (starters if r.get("starter") else bench).append(nm)
     return {"starters": starters, "bench": bench}
+
+
+def starters_detailed(game_id: int, team_abbr: str) -> list:
+    """Starters for one team with position + player_id, for matchup lookups.
+    Returns [{'name', 'position', 'player_id'}, ...] (empty before lineups post).
+    Position is the lineup slot ('G'/'F'/'C'); player_id is balldontlie's."""
+    out = []
+    for r in lineups(game_id):
+        t = (r.get("team") or {}).get("abbreviation")
+        if t != team_abbr or not r.get("starter"):
+            continue
+        p = r.get("player") or {}
+        nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        if nm:
+            out.append({"name": nm,
+                        "position": (r.get("position")
+                                     or p.get("position") or "").upper(),
+                        "player_id": p.get("id")})
+    return out
 
 
 # NOTE: /teams/season_averages exists (returns 400, not 404) but its required
@@ -233,6 +306,48 @@ def team_ratings_map(season: int) -> dict:
             _TEAM_RATINGS_CACHE[season] = prior
             return prior
     _TEAM_RATINGS_CACHE[season] = cur
+    return cur
+
+
+_TEAM_FF_CACHE: dict = {}
+
+
+def team_four_factors_map(season: int) -> dict:
+    """{team_abbr: {efg, tov_pct, oreb_pct, dreb_pct, ts, efg_rank, tov_rank,
+    oreb_rank}} — Dean Oliver's Four Factors (the FT-rate factor isn't exposed
+    by this endpoint; eFG/TOV/OREB are the three heaviest and ARE here).
+
+    Same source rows as team_ratings (team advanced), same early-season
+    fallback to last year when the current season is too thin."""
+    if season in _TEAM_FF_CACHE:
+        return _TEAM_FF_CACHE[season]
+
+    def _build(rows):
+        out = {}
+        for r in rows:
+            ab = (r.get("team") or {}).get("abbreviation")
+            st = r.get("stats") or {}
+            if not ab:
+                continue
+            out[ab] = {
+                "efg": st.get("efg_pct"),
+                "tov_pct": st.get("tm_tov_pct"),
+                "oreb_pct": st.get("oreb_pct"),
+                "dreb_pct": st.get("dreb_pct"),
+                "ts": st.get("ts_pct"),
+                "efg_rank": st.get("efg_pct_rank"),
+                "tov_rank": st.get("tm_tov_pct_rank"),
+                "oreb_rank": st.get("oreb_pct_rank"),
+            }
+        return out
+
+    cur = _build(team_ratings(season))
+    if len(cur) < 25:
+        prior = _build(team_ratings(season - 1))
+        if len(prior) > len(cur):
+            _TEAM_FF_CACHE[season] = prior
+            return prior
+    _TEAM_FF_CACHE[season] = cur
     return cur
 
 

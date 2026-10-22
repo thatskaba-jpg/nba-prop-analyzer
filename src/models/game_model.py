@@ -129,14 +129,19 @@ def _star_tax_points(out_list):
     return round(total, 1), reasons
 
 
-def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None):
+def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
+                 four_factors=None):
     """Return a dict with expected margin, win probs, and the inputs used.
 
     ratings: {abbr: {off, def, pace}} from team_ratings_map. Returns None if
     either team's ratings are missing. `profile` is an optional dict of knobs
     (see GAME_PROFILES). `injuries` is an optional {team_abbr: [(name, status,
     ppg), ...]} map — present teams get a 'Star Tax' margin deduction for their
-    OUT/DOUBTFUL players, like the books do when a star is ruled out."""
+    OUT/DOUBTFUL players, like the books do when a star is ruled out.
+    `four_factors` is an optional {abbr: {efg, tov_pct, oreb_pct, ...}} map
+    (team_four_factors_map); when present, the eFG% edge — the single most
+    predictive of Dean Oliver's Four Factors — nudges the margin. Off by
+    default, so behavior is unchanged when it isn't supplied."""
     h = ratings.get(home_abbr)
     a = ratings.get(away_abbr)
     if not h or not a:
@@ -174,6 +179,18 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None):
     # A team losing players gives up margin; the opponent gains it.
     margin += (away_tax - home_tax)
 
+    # ---- Four Factors: eFG% edge nudges the margin (opt-in) ----
+    # eFG% is the heaviest of Oliver's factors. A 1 percentage-point team eFG%
+    # edge is worth roughly a point over a full game; we apply it gently
+    # (0.8 pt per 1% gap) so it refines, never dominates, the ratings.
+    ff_pts = 0.0
+    if four_factors:
+        hf = four_factors.get(home_abbr) or {}
+        af = four_factors.get(away_abbr) or {}
+        if hf.get("efg") is not None and af.get("efg") is not None:
+            ff_pts = (hf["efg"] - af["efg"]) * 100.0 * 0.8
+            margin += ff_pts
+
     p_home = _norm_cdf(margin / margin_std)
     return {
         "home": home_abbr, "away": away_abbr,
@@ -187,6 +204,7 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None):
         "home_injury_tax": home_tax, "away_injury_tax": away_tax,
         "home_injury_reasons": home_reasons,
         "away_injury_reasons": away_reasons,
+        "four_factor_pts": round(ff_pts, 1),
     }
 
 
