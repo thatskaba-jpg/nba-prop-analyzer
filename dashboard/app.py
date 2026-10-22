@@ -749,14 +749,28 @@ def todays_keys():
 
 
 @st.cache_data(show_spinner=False, ttl=900)
+def _cached_games_on_date_ok(date_iso):
+    """Cache ONLY successful non-empty fetches (raises on empty so a transient
+    429/empty is not cached for 15 min)."""
+    from odds.balldontlie_props import games_on_date
+    g = games_on_date(date_iso)
+    if not g:
+        raise ValueError("empty — do not cache")
+    return g
+
+
 def cached_games_on_date(date_iso):
-    """Scheduled NBA games for a date (matchup/home/away/status). Cached 15 min.
-    [] on error. Works for any date — pure schedule, no odds needed."""
+    """Scheduled NBA games for a date. Retries live if the cache has no good
+    copy yet (so a one-off empty fetch doesn't persist as 'No games')."""
     try:
-        from odds.balldontlie_props import games_on_date
-        return games_on_date(date_iso)
+        return _cached_games_on_date_ok(date_iso)
     except Exception:
-        return []
+        # No cached success — try once live (a genuinely empty day returns []).
+        try:
+            from odds.balldontlie_props import games_on_date
+            return games_on_date(date_iso)
+        except Exception:
+            return []
 
 
 @st.cache_data(show_spinner=False, ttl=900)
