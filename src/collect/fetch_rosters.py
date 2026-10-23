@@ -33,6 +33,9 @@ def _ensure_table(conn):
             fetched_at  TEXT
         )
         """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(player_teams)")}
+    if "position" not in cols:   # added for the per-game roster view
+        conn.execute("ALTER TABLE player_teams ADD COLUMN position TEXT")
     conn.commit()
 
 
@@ -47,11 +50,13 @@ def fetch_rosters():
             for p in rows:
                 name = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
                 team = (p.get("team") or {}).get("abbreviation")
+                pos = (p.get("position") or "").strip().upper() or None
                 if name and team:
                     conn.execute(
                         "INSERT OR REPLACE INTO player_teams "
-                        "(player_name, team, fetched_at) VALUES (?,?,?)",
-                        (name, team, now))
+                        "(player_name, team, fetched_at, position) "
+                        "VALUES (?,?,?,?)",
+                        (name, team, now, pos))
                     stored += 1
             conn.commit()
             print(f"  ...stored {stored} player teams so far")

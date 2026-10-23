@@ -151,13 +151,16 @@ def ensure_indexes(conn=None):
     own = conn is None
     if own:
         conn = get_connection()
-    for sql in (
-        "CREATE INDEX IF NOT EXISTS idx_pgl_name_date "
-        "ON player_game_logs(player_name, game_date)",
-        "CREATE INDEX IF NOT EXISTS idx_pgl_date ON player_game_logs(game_date)",
-        "CREATE INDEX IF NOT EXISTS idx_pgl_game ON player_game_logs(game_id)",
-    ):
+    # ONLY the name index. Date and game_id indexes were tried and REMOVED: the
+    # builders that read nearly the whole table (`WHERE game_date < ?`, GROUP BY
+    # game_id) get slower with them (SQLite walks the index and then fetches
+    # every row one by one instead of just scanning the table). They made the
+    # value scanner and Game Lines page about twice as slow.
+    for sql in ("DROP INDEX IF EXISTS idx_pgl_date",
+                "DROP INDEX IF EXISTS idx_pgl_game"):
         conn.execute(sql)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pgl_name_date "
+                 "ON player_game_logs(player_name, game_date)")
     conn.commit()
     if own:
         conn.close()

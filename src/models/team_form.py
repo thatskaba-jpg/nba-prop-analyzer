@@ -133,6 +133,38 @@ def record_strength_map(season=2026, prior_season=2025):
     return out
 
 
+def _games_by_team(conn, cutoff):
+    """{TEAM: [(game_date, margin), ...]} for EVERY team, oldest first, strictly
+    before cutoff. One pass over the game log. (team_form_map used to rescan the
+    whole table twice per team, ~50 full scans for a 12-game slate.)"""
+    rows = conn.execute(
+        """
+        SELECT game_id, game_date,
+               SUBSTR(matchup, 1, INSTR(matchup, ' ') - 1) AS team_abbr,
+               SUM(points) AS pts
+        FROM player_game_logs
+        WHERE game_date < ? AND minutes > 0
+        GROUP BY game_id, team_abbr
+        """,
+        (cutoff,)).fetchall()
+    by_game = {}
+    for r in rows:
+        slot = by_game.setdefault(r["game_id"], {"date": r["game_date"], "pts": {}})
+        if r["team_abbr"]:
+            slot["pts"][r["team_abbr"].upper()] = r["pts"] or 0
+    out = {}
+    for g in by_game.values():
+        pts = g["pts"]
+        if len(pts) != 2:
+            continue                      # need both sides to form a margin
+        (a, pa), (b, pb) = pts.items()
+        out.setdefault(a, []).append((g["date"], pa - pb))
+        out.setdefault(b, []).append((g["date"], pb - pa))
+    for games in out.values():
+        games.sort(key=lambda x: x[0])
+    return out
+
+
 def _team_games(conn, team, cutoff):
     """Return [(game_date, margin), ...] for `team`, oldest first, STRICTLY
     before cutoff. margin = team points - opponent points for that game.
@@ -207,12 +239,25 @@ def rest_days(team, cutoff):
 def team_form_map(teams, cutoff, n=10):
     """{team: {'recent_margin':..., 'rest_days':...}} for a set of teams, in one
     pass. Used by the game model / scoreboard to pass form into project_game."""
+    import datetime as _dt
+    conn = get_connection()
+    try:
+        by_team = _games_by_team(conn, cutoff)      # ONE scan for all the teams
+    finally:
+        conn.close()
     out = {}
     for t in teams:
         if not t:
             continue
-        out[t.upper()] = {
-            "recent_margin": recent_margin(t, cutoff, n),
-            "rest_days": rest_days(t, cutoff),
-        }
+        games = by_team.get(t.upper(), [])
+        margin = rest = None
+        if games:
+            last = [m for _, m in games[-n:]]
+            margin = round(sum(last) / len(last), 2) if last else None
+            try:
+                rest = (_dt.date.fromisoformat(cutoff[:10])
+                        - _dt.date.fromisoformat(games[-1][0][:10])).days
+            except Exception:
+                rest = None
+        out[t.upper()] = {"recent_margin": margin, "rest_days": rest}
     return out

@@ -6,9 +6,10 @@ spread_home/away_value, moneyline_home/away_odds, total_value with per-vendor
 rows, so we take a CONSENSUS (median across sportsbooks) for a stable line.
 Team abbreviations come from the games feed (game_id -> home/visitor team).
 
-FALLBACK: the SportsGameOdds events feed we already pull for props, parsed from
-its full-game markets (points-*-game-{ml,sp,ou}-*). Used only if balldontlie
-returns nothing.
+BACKUPS (only if balldontlie returns nothing, e.g. it is rate-limited, so the
+GOAT API isn't overwhelmed): ESPN's free public scoreboard (DraftKings line)
+first, then NBA.com's odds feed, then the SportsGameOdds events feed parsed from its full-game markets
+(points-*-game-{ml,sp,ou}-*).
 
 WHY IT MATTERS FOR PROPS (not just for betting sides):
   - The TOTAL is the scoring environment. A 240 total is a track meet — every
@@ -111,6 +112,24 @@ def _from_balldontlie(date):
     return out
 
 
+def _from_espn(date):
+    """Backup: DraftKings lines from ESPN's public scoreboard (single book)."""
+    try:
+        from collect.espn_api import game_lines
+        return game_lines(date)
+    except Exception:
+        return {}
+
+
+def _from_nba(date):
+    """Backup: NBA.com's public odds feed (moneyline + spread, no total)."""
+    try:
+        from collect.nba_api import game_lines
+        return game_lines(date)
+    except Exception:
+        return {}
+
+
 def _from_sportsgameodds():
     """Fallback: parse full-game markets from the SGO events feed."""
     try:
@@ -153,7 +172,7 @@ def _from_sportsgameodds():
 def build_game_lines_map(date=None):
     """{team_abbr: {total, spread, moneyline, opp, is_home, matchup, source}}.
 
-    balldontlie first (consensus across books); SportsGameOdds as fallback.
+    balldontlie first (consensus across books); then ESPN, NBA.com, SportsGameOdds.
     Empty when no odds are posted yet."""
     import datetime as _dt
     if not date:
@@ -165,7 +184,9 @@ def build_game_lines_map(date=None):
     bdl = _from_balldontlie(date)
     if bdl:
         return bdl
-    return _from_sportsgameodds()
+    # balldontlie empty (rate-limited, down, or no lines yet): backups. ESPN
+    # first (free, no quota), then SportsGameOdds (all books, but quota-limited).
+    return _from_espn(date) or _from_nba(date) or _from_sportsgameodds()
 
 
 if __name__ == "__main__":

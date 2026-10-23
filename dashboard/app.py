@@ -15,11 +15,17 @@ backtest). Nothing is made up: numbers come from stored games; odds only appear
 when YOU type them in.
 """
 
+import os
 import sys
 from datetime import date
 from pathlib import Path
 
 import streamlit as st
+
+# In the dashboard, a rate-limited (429) or erroring balldontlie call must fail
+# FAST instead of sleeping 15-60s per retry (that is what made pages hang).
+# Cron jobs don't set this, so they still wait politely.
+os.environ["BDL_FAIL_FAST"] = "1"
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 from database import get_connection  # noqa: E402
@@ -81,10 +87,16 @@ def sgo_all_props():
             if bdl:
                 return bdl
         except _BDLErr as e:
-            if "rate limit" in str(e).lower():
-                raise  # let the dashboard show the wait message
-    # Fallback to SportsGameOdds.
-    return _sgo_all() if _sgo_has() else {}
+            if "rate limit" in str(e).lower() and not _sgo_has():
+                raise  # no backup available: let the dashboard show the wait message
+    # Backup: SportsGameOdds (also used when balldontlie is rate-limited, so the
+    # GOAT API isn't hammered).
+    try:
+        return _sgo_all() if _sgo_has() else {}
+    except Exception as e:
+        if "rate limit" in str(e).lower():
+            raise
+        return {}
 
 
 def sgo_prop_odds(name, prop_type):
@@ -618,9 +630,17 @@ def positional_map(stat, cutoff):
 
 
 @st.cache_data(show_spinner=False)
-def player_group(pid, cutoff):
+def _player_groups_map(cutoff):
+    """{player_id: position group} as of `cutoff`. One pass over the game log,
+    so it is cached per cutoff DATE, not per player."""
     from features.positional_defense import player_groups
-    return player_groups(cutoff).get(pid)
+    return player_groups(cutoff)
+
+
+def player_group(pid, cutoff):
+    # This used to be cached per (player, cutoff), and every player has a
+    # different cutoff, so a scan rebuilt the whole map ~200 times.
+    return _player_groups_map(cutoff).get(pid)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -864,7 +884,7 @@ def cached_bio(player_name):
 
 @st.cache_data(show_spinner=False, ttl=900)
 def todays_keys():
-    """Normalized name-keys of players with props posted today (SportsGameOdds)."""
+    """Normalized name-keys of players with props posted today."""
     try:
         return sgo_today()
     except Exception:
@@ -966,47 +986,262 @@ def cached_team_injuries():
     return _with_deadline(_build, seconds=4, default={}) or {}
 
 
-@st.cache_data(show_spinner=False, ttl=600)
-def cached_team_lineup(team_abbr):
-    """Confirmed starters/bench for a team's game TODAY, from the lineups feed
-    (posts near tip-off; empty before). Finds today's game id for the team,
-    then pulls that team's rows only. Cached 10 min, deadline-bounded."""
-    if not team_abbr:
-        return {"starters": [], "bench": []}
+@st.cache_data(show_spinner=False, ttl=300)
+def cached_all_lineups():
+    """{TEAM: [raw lineup rows]} for EVERY game today, fetched ONCE (games in
+    parallel). Lineups post near tip-off, so before that every list is empty.
+
+    Why this exists: the old per-team lookup re-listed today's games and then
+    polled every game's lineup for EACH of ~24 teams (~300 API calls), hitting
+    a 4s deadline per team. That alone took ~100s of the value scan and froze
+    the whole page. Now: one games call + one lineup call per game, in
+    parallel, shared by every team and every player."""
     def _build():
-        from collect.goat_data import lineup_for_team
+        from concurrent.futures import ThreadPoolExecutor
+        from collect.goat_data import lineups
         from odds.balldontlie_props import _todays_game_ids
-        from collect.schedule import upcoming_games
-        from database import nba_today
-        # Map team -> today's game id via the schedule's game list.
         gids = _todays_game_ids()
-        # Match the team to one of today's games by checking each game's rows.
-        for gid in gids:
-            lu = lineup_for_team(gid, team_abbr)
-            if lu["starters"] or lu["bench"]:
-                return lu
-        return {"starters": [], "bench": []}
-    return _with_deadline(_build, seconds=4,
-                          default={"starters": [], "bench": []}) \
-        or {"starters": [], "bench": []}
+        if not gids:
+            return {}
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(gids))) as ex:
+            for rows in ex.map(lambda g: lineups(g) or [], gids):
+                for r in rows:
+                    t = ((r.get("team") or {}).get("abbreviation") or "").upper()
+                    if t:
+                        out.setdefault(t, []).append(r)
+        return out
+    return _with_deadline(_build, seconds=10, default={}) or {}
 
 
-@st.cache_data(show_spinner=False, ttl=600)
+def cached_team_lineup(team_abbr):
+    """Confirmed starters/bench NAMES for a team's game today ({'starters': [],
+    'bench': []} before lineups post)."""
+    res = {"starters": [], "bench": []}
+    for r in cached_all_lineups().get((team_abbr or "").upper(), []):
+        p = r.get("player") or {}
+        nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        if nm:
+            res["starters" if r.get("starter") else "bench"].append(nm)
+    return res
+
+
 def cached_opp_starters(opp_abbr):
     """Opponent's confirmed starters WITH position + player_id for tonight's
-    game: [{'name','position','player_id'}, ...]. Used to pick the likely
-    primary defender (same position group) for a matchup-defense note."""
-    if not opp_abbr:
-        return []
+    game: [{'name','position','player_id'}, ...] (empty before lineups post).
+    Used to pick the likely primary defender for a matchup-defense note."""
+    out = []
+    for r in cached_all_lineups().get((opp_abbr or "").upper(), []):
+        if not r.get("starter"):
+            continue
+        p = r.get("player") or {}
+        nm = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+        if nm:
+            out.append({"name": nm,
+                        "position": (r.get("position") or p.get("position") or "").upper(),
+                        "player_id": p.get("id")})
+    return out
+
+
+def refresh_injuries_now():
+    """Pull the latest injury reports (balldontlie, then ESPN which overrides)
+    into the local table and drop the caches that read it. Both fetchers keep
+    the old data if they fail. Returns the number of rows now in the table."""
+    def _b():
+        try:
+            from collect.fetch_injuries import fetch_injuries
+            fetch_injuries()
+        except Exception:
+            pass
+        try:
+            from collect.fetch_injuries_espn import fetch_injuries_espn
+            fetch_injuries_espn()
+        except Exception:
+            pass
+        return True
+    _with_deadline(_b, seconds=25, default=False)
+    for fn in (cached_team_injuries, cached_out_teammates):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+    try:
+        c = get_connection()
+        n = c.execute("SELECT COUNT(*) FROM injuries").fetchone()[0]
+        c.close()
+        return n
+    except Exception:
+        return 0
+
+
+@st.cache_resource
+def _inj_refresh_state():
+    return {"last": 0.0}
+
+
+def auto_refresh_injuries(max_age_s=900):
+    """Refresh injuries if the last refresh from this app is older than
+    `max_age_s` (default 15 min). Cheap no-op otherwise."""
+    import time as _t
+    stt = _inj_refresh_state()
+    if _t.time() - stt["last"] >= max_age_s:
+        stt["last"] = _t.time()       # set first: no pile-up on slow feeds
+        refresh_injuries_now()
+
+
+def injuries_updated_caption():
+    """'🩹 Injuries updated 1:05 AM ET (N players listed)' from the DB itself."""
+    try:
+        import datetime as _d
+        from zoneinfo import ZoneInfo
+        c = get_connection()
+        last, n = c.execute("SELECT MAX(fetched_at), COUNT(*) FROM injuries").fetchone()
+        c.close()
+        if not last:
+            return "🩹 No injury data yet."
+        t = _d.datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_d.timezone.utc).astimezone(ZoneInfo("America/New_York"))
+        return (f"🩹 Injuries updated {t.strftime('%a %-I:%M %p ET')} "
+                f"({n} players listed)")
+    except Exception:
+        return ""
+
+
+def fetch_day_lineups(day_iso):
+    """{TEAM: [raw lineup rows]} for every game on `day_iso`, games fetched in
+    parallel. Rows are empty for games whose lineup isn't posted yet (it posts
+    near tip-off). Returns None if the schedule itself couldn't be read."""
+    from concurrent.futures import ThreadPoolExecutor
+    from collect.goat_data import lineups
+    from odds.balldontlie_props import _get_all
+    games = _get_all("v1/games", {"dates[]": day_iso, "per_page": 100})
+    gids = [g["id"] for g in games if g.get("id") is not None]
+    if not gids:
+        return None
+    out = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(gids))) as ex:
+        for rows in ex.map(lambda g: lineups(g) or [], gids):
+            for r in rows:
+                t = ((r.get("team") or {}).get("abbreviation") or "").upper()
+                if t:
+                    out.setdefault(t, []).append(r)
+    return out
+
+
+@st.cache_resource
+def _lineup_store():
+    """Process-wide, no expiry: the last "check all live lineups" result.
+    {"day": iso, "ts": epoch, "rows": {team: rows}, "games": n}. It stays until
+    the next click, even across browser refreshes."""
+    return {}
+
+
+def check_all_lineups(day_iso):
+    """Fetch every game's lineup for `day_iso` and keep it until the next call.
+    On failure the previous result is kept. Returns (ok, message)."""
+    import time as _t
+    try:
+        ensure_roster_positions()
+    except Exception:
+        pass
+    res = _with_deadline(lambda: fetch_day_lineups(day_iso), seconds=20,
+                         default=None)
+    if res is None:
+        return False, ("Couldn't reach the lineups feed. Kept the previous "
+                       "result (if any); try again in a minute.")
+    _lineup_store().update({"day": day_iso, "ts": _t.time(), "rows": res})
+    return True, ""
+
+
+def lineup_check_status(day_iso):
+    """(rows_by_team, caption) for the stored check, or ({}, caption)."""
+    import time as _t
+    from zoneinfo import ZoneInfo
+    import datetime as _d
+    st_ = _lineup_store()
+    if not st_ or st_.get("day") != day_iso:
+        return {}, ("📡 Lineups not checked yet. Press **Check all live "
+                    "lineups + injuries**; until then each game shows a projected lineup.")
+    when = _d.datetime.fromtimestamp(st_["ts"], ZoneInfo("America/New_York"))
+    rows = st_["rows"]
+    posted = sum(1 for v in rows.values() if v)
+    return rows, (f"📡 Lineups checked {when.strftime('%-I:%M %p ET')} · "
+                  f"{posted // 2 if posted else 0} game(s) with a posted "
+                  f"lineup. Kept until you check again.")
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
+def ensure_roster_positions():
+    """If any rostered player lacks an official position, re-run the (safe,
+    idempotent) roster fetch once to fill it. Only runs after the user ticks the
+    live box. Offline/slow -> gives up at the deadline and the roster view keeps
+    its estimated positions."""
     def _build():
-        from collect.goat_data import starters_detailed
-        from odds.balldontlie_props import _todays_game_ids
-        for gid in _todays_game_ids():
-            s = starters_detailed(gid, opp_abbr)
-            if s:
-                return s
-        return []
-    return _with_deadline(_build, seconds=4, default=[]) or []
+        from database import get_connection
+        conn = get_connection()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(player_teams)")}
+            missing = ("position" not in cols) or conn.execute(
+                "SELECT COUNT(*) FROM player_teams WHERE position IS NULL "
+                "OR position = ''").fetchone()[0] > 0
+        finally:
+            conn.close()
+        if missing:
+            from collect.fetch_rosters import fetch_rosters
+            fetch_rosters()
+        return True
+    return bool(_with_deadline(_build, seconds=25, default=False))
+
+
+def render_game_rosters(away, home, day_iso):
+    """Compact "who's playing": each team's (projected) five starters plus the
+    notable players ruled out, in two lines, from the local DB only (no API, so
+    it costs nothing at page load). A checkbox opens the FULL view: starters,
+    bench, positions, minutes, and an optional live lineup check."""
+    try:
+        # Reload so a long-running Streamlit process that imported an OLDER
+        # game_roster (before compact_markdown existed) picks up the new file
+        # instead of failing with an ImportError.
+        import importlib
+        import collect.game_roster as _gr
+        _gr = importlib.reload(_gr)
+        build_roster, load_team_context = _gr.build_roster, _gr.load_team_context
+        lineup_rows_for_team = _gr.lineup_rows_for_team
+        roster_markdown, compact_markdown = _gr.roster_markdown, _gr.compact_markdown
+        from database import get_connection
+        key = f"{day_iso}_{away}_{home}"
+        full = st.checkbox("👥 Full roster (bench, minutes)",
+                           key=f"roster_full_{key}")
+        stored, _ = lineup_check_status(day_iso)
+        conn = get_connection()
+        try:
+            ctx = {t: load_team_context(conn, t) for t in (away, home)}
+        finally:
+            conn.close()
+        rosters = {}
+        for team in (away, home):
+            roster_rows, minutes, injuries = ctx[team]
+            rosters[team] = build_roster(
+                lineup_rows_for_team(stored.get(team, []), team),
+                roster_rows, minutes, injuries)
+        if not full:
+            from team_names import fullify as _nm2
+            for col, team in zip(st.columns(2), (away, home)):
+                col.markdown(_nm2(compact_markdown(team, rosters[team])))
+            return
+        cols = st.columns(2)
+        any_est = False
+        for col, team in zip(cols, (away, home)):
+            r = rosters[team]
+            any_est = any_est or any("~" in e["position"]
+                                     for e in r["starters"] + r["bench"])
+            from team_names import fullify as _nm3
+            col.markdown(_nm3(roster_markdown(team, r)))
+        if any_est:
+            from collect.game_roster import POSITION_NOTE
+            st.caption(POSITION_NOTE)
+    except Exception as e:  # never let a roster hiccup break the game card
+        st.caption(f"Roster unavailable right now ({type(e).__name__}: {str(e)[:120]}).")
 
 
 def primary_defender_note(opp_abbr, player_group, season):
@@ -1040,7 +1275,7 @@ def cached_game_lines(date=None):
     def _build():
         from odds.game_lines import build_game_lines_map
         return build_game_lines_map(date)
-    return _with_deadline(_build, seconds=4, default={}) or {}
+    return _with_deadline(_build, seconds=10, default={}) or {}
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -1057,13 +1292,73 @@ def cached_schedule(date=None):
     def _build():
         from collect.balldontlie_client import _get
         out = {}
-        for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
-            h = (g.get("home_team") or {}).get("abbreviation")
-            a = (g.get("visitor_team") or {}).get("abbreviation")
-            if h and a:
-                out[f"{a} @ {h}"] = str(g.get("status") or "")
+        try:
+            for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
+                h = (g.get("home_team") or {}).get("abbreviation")
+                a = (g.get("visitor_team") or {}).get("abbreviation")
+                if h and a:
+                    out[f"{a} @ {h}"] = str(g.get("status") or "")
+        except Exception:
+            out = {}
+        if not out:   # balldontlie rate-limited/down -> ESPN, then NBA.com
+            from collect.espn_api import schedule
+            out = schedule(date)
+        if not out:
+            from collect.nba_api import schedule as _nba_schedule
+            out = _nba_schedule(date)
         return out
-    return _with_deadline(_build, seconds=4, default={}) or {}
+    return _with_deadline(_build, seconds=12, default={}) or {}
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def cached_start_times(date=None):
+    """{"AWAY @ HOME": ISO start time in UTC} for sorting games by tip-off.
+    balldontlie first (its `datetime` field), ESPN as backup. {} on failure."""
+    import datetime as _d
+    date = date or _d.date.today().isoformat()
+    def _build():
+        out = {}
+        try:
+            from collect.balldontlie_client import _get
+            for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
+                h = (g.get("home_team") or {}).get("abbreviation")
+                a = (g.get("visitor_team") or {}).get("abbreviation")
+                dt = g.get("datetime")
+                if not dt:
+                    st_ = str(g.get("status") or "")
+                    dt = st_ if (st_[:4].isdigit() and "T" in st_) else None
+                if h and a and dt:
+                    out[f"{a} @ {h}"] = str(dt)
+        except Exception:
+            out = {}
+        if not out:
+            from collect.espn_api import start_times
+            out = start_times(date)
+        return out
+    return _with_deadline(_build, seconds=12, default={}) or {}
+
+
+def _pretty_date(iso):
+    """'2026-10-23' -> 'Fri, Oct 23' (unchanged if it can't be parsed)."""
+    try:
+        import datetime as _d
+        return _d.date.fromisoformat(str(iso)).strftime("%a, %b %-d")
+    except Exception:
+        return str(iso)
+
+
+def _tip_label(iso):
+    """'2026-10-23T23:30:00Z' -> '7:30 PM ET' ('' if unparseable)."""
+    try:
+        import datetime as _d
+        from zoneinfo import ZoneInfo
+        t = _d.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_d.timezone.utc)
+        et = t.astimezone(ZoneInfo("America/New_York"))
+        return et.strftime("%-I:%M %p ET")
+    except Exception:
+        return ""
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -1077,19 +1372,28 @@ def cached_scores(date=None):
     def _build():
         from collect.balldontlie_client import _get
         out = {}
-        for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
-            h = (g.get("home_team") or {}).get("abbreviation")
-            a = (g.get("visitor_team") or {}).get("abbreviation")
-            if not (h and a):
-                continue
-            hs, as_ = g.get("home_team_score"), g.get("visitor_team_score")
-            if hs is None or as_ is None:
-                continue
-            final = str(g.get("status") or "").strip().lower().startswith("final")
-            out[f"{a} @ {h}"] = {"home": int(hs), "away": int(as_),
-                                 "final": final}
+        try:
+            for g in _get("games", {"dates[]": date, "per_page": 100}).get("data", []):
+                h = (g.get("home_team") or {}).get("abbreviation")
+                a = (g.get("visitor_team") or {}).get("abbreviation")
+                if not (h and a):
+                    continue
+                hs, as_ = g.get("home_team_score"), g.get("visitor_team_score")
+                if hs is None or as_ is None:
+                    continue
+                final = str(g.get("status") or "").strip().lower().startswith("final")
+                out[f"{a} @ {h}"] = {"home": int(hs), "away": int(as_),
+                                     "final": final}
+        except Exception:
+            out = {}
+        if not out:   # balldontlie rate-limited/down -> ESPN, then NBA.com
+            from collect.espn_api import scores
+            out = scores(date)
+        if not out:
+            from collect.nba_api import scores as _nba_scores
+            out = _nba_scores(date)
         return out
-    return _with_deadline(_build, seconds=4, default={}) or {}
+    return _with_deadline(_build, seconds=8, default={}) or {}
 
 
 def _game_not_started(status: str) -> bool:
@@ -1124,6 +1428,13 @@ def season_games_count(hist):
         return 0
 
 
+@st.cache_resource
+def _scan_store():
+    """Process-wide {scan_key: (timestamp, rows, note)} shared by all browser
+    sessions, so refreshing the page doesn't throw the last scan away."""
+    return {}
+
+
 def scan_today_value(_config, stats, edge_threshold, max_players):
     """Run every player in today's games through the model, compare each real
     posted prop line/odds to our projection, and return value bets ranked by EV.
@@ -1138,14 +1449,14 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
     """
     import datetime as _dt
     if not sgo_has_key():
-        return [], "No SportsGameOdds key — add SPORTSGAMEODDS_KEY to .env to scan real odds."
+        return [], "No odds key — add BALLDONTLIE_API_KEY (or SPORTSGAMEODDS_KEY) to .env to scan real odds."
 
     # ONE network call (cached 5 min): every player's prop lines for today.
     try:
         props = cached_all_props()
     except Exception as e:
         if "rate limit" in str(e).lower() or "429" in str(e):
-            return [], ("⏳ SportsGameOdds rate limit hit (free tier) — wait "
+            return [], ("⏳ Odds rate limit hit — wait "
                         "about a minute, then scan again.")
         return [], f"Couldn't fetch odds: {e}"
     if not props:
@@ -1184,6 +1495,22 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
     except Exception:
         shared_game_lines = {}
 
+    # SPEED: each player needs an advanced-stats API call (~0.3s each). Doing
+    # them one by one was ~1 minute for a full slate. Fetch them all up front,
+    # several at a time (results are cached in-process, so the loop below gets
+    # them instantly). Failures are ignored here; the loop handles them as before.
+    if player_advanced_avg is not None and roster:
+        from concurrent.futures import ThreadPoolExecutor
+        _adv_season = _rs if _rs >= 2024 else 2024
+
+        def _prefetch(item):
+            try:
+                player_advanced_avg(item[1], _adv_season)
+            except Exception:
+                pass
+        with ThreadPoolExecutor(max_workers=8) as _ex:
+            list(_ex.map(_prefetch, roster))
+
     rows = []
     for name, pid in roster:
         try:
@@ -1202,7 +1529,9 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
             my_team = player_team(pid)
             auto = next_opponent(my_team)
             opp, is_home = (auto if auto else (hist.iloc[-1]["opponent"], True))
-            grp = player_group(pid, cutoff)
+            # One shared date for the whole scan (a position group doesn't depend
+            # on the cutoff day), so the map is built once, not once per player.
+            grp = player_group(pid, shared_cutoff)
             inj = current_injury(pid)
             _early = season_games_count(hist) < MIN_SEASON_GAMES_FOR_VALUE
 
@@ -1767,10 +2096,10 @@ def _save_current_model():
 # --------------------------------------------------------------------------- #
 st.markdown("""
 <div class="sb-hero">
-  <span class="sb-pill">💣 NBA · Player Props</span>
+  <span class="sb-pill">💣 NBA · Props &amp; Game Lines</span>
   <h1>Bomb Vegas <span style="color:var(--muted);font-weight:700;">· Prop Analyzer</span></h1>
-  <p>Your edge, every night. Stat projections, Over/Under reads, and the best
-     price across 8 books. 💣</p>
+  <p>Player-prop projections, game-line picks and price checks against real
+     sportsbook lines. 💣</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1796,8 +2125,8 @@ except Exception:
 
 tabM, tab1, tab5, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
                                   "🔍 Analyze a Prop",
-                                  "🏀 Game Lines (ML + Spread)",
-                                  "🎯 Value Scanner",
+                                  "🏀 Game Lines",
+                                  "🎯 Value Board",
                                   "📒 Track Record",
                                   "📊 Backtest"])
 
@@ -2385,7 +2714,7 @@ else:
             if st.session_state.get("sgo_msg_warn"):
                 st.info(st.session_state.pop("sgo_msg_warn"))
         else:
-            st.caption("Tip: add a free SPORTSGAMEODDS_KEY to .env to auto-fill "
+            st.caption("Tip: add BALLDONTLIE_API_KEY (or SPORTSGAMEODDS_KEY) to .env to auto-fill "
                        "real prop odds. For now, type them in.")
 
         oc1, oc2 = st.columns(2)
@@ -2574,8 +2903,7 @@ else:
                 st.session_state["my_slip"] = _slip
                 st.rerun()
             bc2.caption(f"Your slip has {len(_slip)} pick"
-                        f"{'s' if len(_slip) != 1 else ''} — track them live on "
-                        "the 🔴 Live Tracker tab.")
+                        f"{'s' if len(_slip) != 1 else ''}.")
 
             # --- Combo-stat note (now a real empirical win%) ---
             if res.get("combo_note"):
@@ -2742,7 +3070,7 @@ else:
                             f"#{_o['allowed_rank']} of {_o['of']} (#1 = most "
                             "careless).")
 
-            with st.expander("📊 Extra context (live GOAT data)"):
+            with st.expander("📊 Extra context (live data)"):
                 cur_season = cutoff[:4] if cutoff else "2026"
                 try:
                     cs = int(cur_season) if int(cur_season) >= 2024 else 2024
@@ -3179,7 +3507,7 @@ else:
                  "you more than the risk — based on our estimate, not a promise.")
 
         if not sgo_has_key():
-            st.warning("Add a free **SPORTSGAMEODDS_KEY** to your `.env` to scan "
+            st.warning("Add your **BALLDONTLIE_API_KEY** (or SPORTSGAMEODDS_KEY) to `.env` to scan "
                        "real odds. Without it there are no live lines to compare "
                        "against.")
         elif not config:
@@ -3202,33 +3530,49 @@ else:
 
             def _run_scan():
                 """Run the scan ONCE (no blocking sleep) and store results.
-
-                The old auto-retry used time.sleep(), which froze the whole app
-                for a minute and often still hit the limit. Instead we scan once
-                and, if rate-limited, surface a 'Try again' button — responsive,
-                honest, and the user stays in control."""
-                with st.spinner("Scanning today's players against live odds…"):
+                Results are also kept in a process-wide store so a browser
+                refresh / new tab shows them instantly instead of rescanning."""
+                import time as _t
+                t0 = _t.time()
+                with st.spinner("Scanning today's players against live odds… "
+                                "(about a minute)"):
                     rows, note = scan_today_value(
                         config, scan_stats, min_edge / 100.0, 300)
+                note = f"{note}  (scan took {_t.time() - t0:.0f}s)"
                 st.session_state["scan_rows"] = rows
                 st.session_state["scan_note"] = note
                 st.session_state["scan_sig"] = (tuple(scan_stats), min_edge)
+                _scan_store()[_scan_key] = (_t.time(), rows, note)
 
-            # Auto-load: scan when the tab opens with settings we haven't run yet.
-            # The 5-min odds cache means re-opening the tab is usually free.
             sig = (tuple(scan_stats), min_edge)
-            refresh = st.button("🔄 Refresh now", key="scanner_refresh")
-            if (refresh
-                    or "scan_rows" not in st.session_state
-                    or st.session_state.get("scan_sig") != sig):
+            _scan_key = (sig, repr(config)[:400], date.today().isoformat())
+            # NO auto-scan on page load: the scan takes a while and runs on the
+            # same thread as every other tab, so scanning automatically froze
+            # Game Lines and the rest of the page on every refresh. Instead:
+            # show the last scan if it's fresh, else wait for a button press.
+            import time as _t2
+            _hit = _scan_store().get(_scan_key)
+            if (st.session_state.get("scan_sig") != sig
+                    and _hit and _t2.time() - _hit[0] < 1800):
+                st.session_state["scan_rows"] = _hit[1]
+                st.session_state["scan_note"] = _hit[2]
+                st.session_state["scan_sig"] = sig
+            bcol1, bcol2 = st.columns([1, 3])
+            go = bcol1.button("▶ Run scan" if "scan_rows" not in st.session_state
+                              else "🔄 Rescan", key="scanner_refresh",
+                              type="primary")
+            if go:
                 _run_scan()
+            elif st.session_state.get("scan_sig") != sig:
+                st.info("Pick your stats above, then press **▶ Run scan**. "
+                        "(A scan takes about a minute, so it only runs when you "
+                        "press the button.)")
 
             rows = st.session_state.get("scan_rows")
             note = st.session_state.get("scan_note", "")
             # If rate-limited, offer a non-blocking retry instead of freezing.
             if "rate limit" in note.lower():
-                st.warning(note + "  The free tier allows 10 pulls per minute; "
-                           "it clears within a minute.")
+                st.warning(note + "  This clears within a minute.")
                 if st.button("🔁 Try the scan again"):
                     _run_scan()
                     st.rerun()
@@ -3337,7 +3681,7 @@ else:
 
     # ----------------------- Game Lines: ML + Spread ----------------------- #
     with tab5:
-        st.subheader("Game lines — moneyline & spread")
+        st.subheader("Game lines: moneyline & spread")
         st.write("Bet the **game itself**, not just player props. We project "
                  "each game's winner and margin from team ratings + home court, "
                  "compare it to the **real sportsbook line**, and flag where the "
@@ -3376,6 +3720,24 @@ else:
             cached_game_lines.clear()
             cached_schedule.clear()
             st.rerun()
+        if st.button("📡 Check all live lineups + injuries",
+                     key="check_all_lineups",
+                     help="Fetches the confirmed starters for every game "
+                          "(posted ~30-60 min before tip) AND the latest injury "
+                          "reports. Lineups are kept until you press this "
+                          "again; injuries also refresh on their own every "
+                          "15 minutes."):
+            with st.spinner("Checking lineups and injuries…"):
+                refresh_injuries_now()
+                _ok, _msg = check_all_lineups(gl_date)
+            if not _ok:
+                st.warning(_msg)
+        else:
+            # Quiet automatic refresh (at most every 15 min) so the Star Tax
+            # and OUT lists don't rely on a cron job that may not be running.
+            auto_refresh_injuries()
+        st.caption(lineup_check_status(gl_date)[1] + "  \n"
+                   + injuries_updated_caption())
         lines = cached_game_lines(gl_date)
         # Blend THIS season with LAST season for the game model. Early in a new
         # season this year's sample is tiny, so we lean on last year and shift
@@ -3471,14 +3833,26 @@ else:
             sched = cached_schedule(gl_date)  # {matchup: status}
             scores = cached_scores(gl_date)   # {matchup: {home,away,final}}
             total_sched = len(sched)
-            open_games = [m for m in games if _game_not_started(sched.get(m, ""))]
-            live_games = [m for m in games if m not in open_games]
+            _starts = cached_start_times(gl_date)    # {matchup: ISO UTC}
+
+            def _tip(m):
+                # Tip-off time: schedule feed first, else the status if it is
+                # still an ISO time. Games with no time sort last.
+                st_ = sched.get(m, "")
+                return (_starts.get(m)
+                        or (st_ if (st_[:4].isdigit() and "T" in st_) else "")
+                        or "9999")
+            open_games = sorted((m for m in games
+                                 if _game_not_started(sched.get(m, ""))),
+                                key=lambda m: (_tip(m), m))
+            live_games = sorted((m for m in games if m not in open_games),
+                                key=lambda m: (_tip(m), m))
 
             # Plain-language headline: lead with how many games are SHOWN so it
             # never looks like fewer are displayed, then the open/live split.
             if total_sched:
                 msg = (f"**Showing {len(games)} game"
-                       f"{'s' if len(games) != 1 else ''}** on {gl_date}"
+                       f"{'s' if len(games) != 1 else ''}** on {_pretty_date(gl_date)}"
                        f" — {len(open_games)} open (not tipped off), "
                        f"{len(live_games)} live/final.")
                 if total_sched > len(games):
@@ -3595,8 +3969,8 @@ else:
                     st.caption(f"(Frozen picks unavailable: {_fe})")
 
             # ---- Separate SPREAD (ATS) track record -------------------- #
-            with st.expander("🎯 Spread track record — ATS (our pick vs the "
-                             "book's line)"):
+            with st.expander("🎯 Spread track record: did our side cover? "
+                             "(vs the book's line)"):
                 try:
                     from models.spread_scoreboard import (grade_finished,
                                                           get_record,
@@ -3612,7 +3986,7 @@ else:
                     _c, _w, _p, _pct = get_record()
                     _decided = _c + _w
                     if _decided:
-                        st.metric("ATS record (our side covered)",
+                        st.metric("Spread record (our side covered)",
                                   f"{_c}-{_w}"
                                   + (f"-{_p} push" if _p else ""),
                                   f"{_pct*100:.0f}% vs 52.4% break-even")
@@ -3634,14 +4008,34 @@ else:
                         import pandas as _pd2
                         _scsv = _pd2.DataFrame(_sdet).to_csv(index=False)
                         st.download_button(
-                            "⬇️ Export ATS picks (CSV)", _scsv,
+                            "⬇️ Export spread picks (CSV)", _scsv,
                             file_name="spread_ats_picks.csv",
                             mime="text/csv", key="dl_ats_picks")
                 except Exception as _e:
                     st.caption(f"Spread board unavailable: {_e}")
 
-            # Show open (bettable) games first, then live/final ones.
+            # Open (bettable) games first, then live/final -- each group in
+            # tip-off order.
             ordered = open_games + live_games
+            from team_names import fullify as _nm
+
+            class _NamedSt:
+                """Streamlit with team abbreviations shown as full names in the
+                text it displays (keys and logic still use abbreviations)."""
+                _TEXT = ("markdown", "caption", "success", "info", "warning",
+                         "write", "error", "expander")
+
+                def __getattr__(self, k):
+                    f = getattr(st, k)
+                    if k in self._TEXT:
+                        def w(body, *a, **kw):
+                            return f(_nm(body), *a, **kw)
+                        return w
+                    return f
+            _gst = _NamedSt()
+            _export_entries = []            # filled per OPEN game in the loop
+            _export_slot = st.container()   # export buttons drawn here (top)
+
             for matchup in ordered:
                 # matchup is "AWAY @ HOME"
                 try:
@@ -3750,6 +4144,7 @@ else:
                     sp_h = g.get("spread")
                     ml_pick = None    # moneyline value pick (or None)
                     sp_pick = None    # spread value pick (or None)
+                    ml_edge = ml_prob = sp_edge = sp_cover = None
                     if ml_h is not None and ml_a is not None:
                         _ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
                                             int(ml_h), int(ml_a),
@@ -3757,6 +4152,11 @@ else:
                         if _ev.get("is_value"):
                             _ml_side = (home if _ev["recommended_side"] == "over"
                                         else away)
+                            _ml_home_side = _ev["recommended_side"] == "over"
+                            ml_edge = (_ev["edge_over_pct"] if _ml_home_side
+                                       else _ev["edge_under_pct"])
+                            ml_prob = (proj["p_home_win"] if _ml_home_side
+                                       else proj["p_away_win"])
                             # The model's actual favorite (by projected margin).
                             _fav = home if proj["exp_margin"] > 0 else away
                             # A value bet on the model's UNDERDOG is a price/EV
@@ -3772,6 +4172,10 @@ else:
                         _evs = evaluate_prop(_ph, _pa, -110, -110,
                                              edge_threshold=ev_bar / 100.0)
                         if _evs.get("is_value"):
+                            _sp_home_side = _evs["recommended_side"] == "over"
+                            sp_edge = (_evs["edge_over_pct"] if _sp_home_side
+                                       else _evs["edge_under_pct"])
+                            sp_cover = _ph if _sp_home_side else _pa
                             sp_pick = (f"{home} {sp_h:+g}"
                                        if _evs["recommended_side"] == "over"
                                        else f"{away} {-sp_h:+g}")
@@ -3798,7 +4202,7 @@ else:
 
                     if _suppress:
                         # Don't flash ✅ we distrust — show the model lean, muted.
-                        quick = " · ⚠️ low confidence"
+                        quick = f" · ⚠️ skip · model leans {_fav}"
                         pick_block = (
                             f"⚠️ **Skip — model disagrees with the market by "
                             f"{_mkt_gap:.0f} pts** (we say {home} "
@@ -3810,6 +4214,16 @@ else:
                     else:
                         _any = ml_pick or sp_pick
                         quick = " · ✅ value" if _any else " · no edge"
+                        # Put the actual pick in the title so you don't have to
+                        # open the card: "✅ SAS ML + HOU -3.5" or the lean.
+                        _bits = []
+                        if ml_pick:
+                            _bits.append(ml_pick.replace(" to win", " ML")
+                                         .replace(" (underdog value)", " ML"))
+                        if sp_pick:
+                            _bits.append(sp_pick)
+                        quick = (f" · ✅ {' + '.join(_bits)}" if _bits
+                                 else f" · no edge (leans {_fav})")
                         # Informational badge: model favors the OPPOSITE side
                         # from the book, but the gap is small (not suppressed).
                         # We flag it so you know it's a contrarian coin-flip —
@@ -3823,7 +4237,9 @@ else:
                                     f"market:** the book leans **{_book_fav}**, "
                                     f"we lean **{_fav}** (close call). Early "
                                     f"season, lean to the market if unsure.")
-                                quick = " · ⚠️ vs market"
+                                quick = (quick.replace(" · ✅ ", " · ⚠️ vs market · ", 1)
+                                         if "✅" in quick else
+                                         f" · ⚠️ vs market · leans {_fav}")
                         pick_block = (
                             "💰 **Moneyline:** "
                             + (f"✅ {ml_pick}" if ml_pick
@@ -3831,6 +4247,22 @@ else:
                             + "  \n📊 **Spread:** "
                             + (f"✅ {sp_pick}" if sp_pick else "— no edge")
                             + _disagree_note)
+                if proj and is_open:
+                    _export_entries.append({
+                        "tip": _tip_label(_tip(matchup)),
+                        "away": away, "home": home,
+                        "fav": home if proj["exp_margin"] > 0 else away,
+                        "margin": proj["exp_margin"],
+                        "p_home_win": proj["p_home_win"],
+                        "p_away_win": proj["p_away_win"],
+                        "ml_pick": ml_pick, "sp_pick": sp_pick,
+                        "skip": bool(_suppress),
+                        "ml_edge": ml_edge, "ml_prob": ml_prob,
+                        "sp_edge": sp_edge, "sp_cover": sp_cover,
+                        "ml_home": g.get("moneyline"),
+                        "ml_away": (lines.get(away) or {}).get("moneyline"),
+                        "spread_home": g.get("spread"),
+                        "total": g.get("total")})
                 # (No extra text for live/final games — the FINAL/LIVE tag and,
                 #  for final games, the grade below already say the status.)
 
@@ -3863,10 +4295,12 @@ else:
                                    + ("✅ covered" if ats else "❌ missed"))
                     grade_title = f"  ·  {win_txt}  ·  {pick_txt}{ats_txt}"
 
-                title = f"🏀 {matchup}  ·  {tag}{quick}{grade_title}"
-                with st.expander(title, expanded=False):
+                _tl = _tip_label(_tip(matchup))
+                title = (f"🏀 {matchup}  ·  " + (f"{_tl}  ·  " if _tl else "")
+                         + f"{tag}{quick}{grade_title}")
+                with _gst.expander(title, expanded=False):
                     if pick_block:
-                        st.markdown(pick_block)
+                        _gst.markdown(pick_block)
                     if proj and sc and sc.get("final"):
                         actual_margin = sc["home"] - sc["away"]
                         model_home = proj["exp_margin"] > 0
@@ -3891,211 +4325,298 @@ else:
                                          + ("✅ model's side covered."
                                             if ats_right
                                             else "❌ model's side didn't cover."))
-                        st.markdown(
+                        _gst.markdown(
                             f'<div style="background:{box};padding:10px 14px;'
                             f'border-radius:10px;color:#e6e9ef;font-size:.9rem;'
                             f'margin-bottom:10px;">{line_txt}</div>',
                             unsafe_allow_html=True)
                     if not is_open:
-                        st.caption("This game has tipped off — the line below is "
+                        _gst.caption("This game has tipped off — the line below is "
                                    "the last PRE-GAME number, kept for reference. "
                                    "You generally can't place a pre-game ML/spread "
                                    "bet once the game is live.")
                     if not proj:
-                        st.caption("Missing team ratings for one side — can't "
+                        _gst.caption("Missing team ratings for one side — can't "
                                    "project this game yet (common very early in "
                                    "the season).")
+                        render_game_rosters(away, home, str(gl_date))
                         continue
-                    c1, c2 = st.columns(2)
-                    # Reconcile displayed points with the ADJUSTED margin. The
-                    # raw exp_home/away_pts are pre-adjustment (ratings only);
-                    # the final margin folds in home edge, form, four factors,
-                    # playtype and the TOV battle. Re-split the projected TOTAL
-                    # by the final margin so the two numbers can never disagree
-                    # about who's favored (total stays fixed, margin honored).
                     _tot = proj["exp_total"]
                     _mgn = proj["exp_margin"]           # +ve => home favored
-                    _disp_home = (_tot + _mgn) / 2.0
-                    _disp_away = (_tot - _mgn) / 2.0
-                    c1.metric(f"{home} (home) projected", f"{_disp_home:.0f}")
-                    c2.metric(f"{away} (away) projected", f"{_disp_away:.0f}")
-                    fav = home if proj["exp_margin"] > 0 else away
-                    st.write(f"**Our projection:** {fav} by "
-                             f"**{abs(proj['exp_margin']):.1f}** "
-                             f"(total ~{proj['exp_total']:.0f}, "
-                             f"pace {proj['pace']:.0f}). Win odds: "
-                             f"{home} {proj['p_home_win']*100:.0f}% / "
-                             f"{away} {proj['p_away_win']*100:.0f}%.")
+                    fav = home if _mgn > 0 else away
+                    ml_home = g.get("moneyline")
+                    ml_away = (lines.get(away) or {}).get("moneyline")
+                    sp_home = g.get("spread")
 
-                    # ---- Four Factors: eFG% edge folded into the margin ----
-                    ffp = proj.get("four_factor_pts")
-                    hff = _gl_four_factors.get(home) or {}
-                    aff = _gl_four_factors.get(away) or {}
-                    if hff.get("efg") is not None and aff.get("efg") is not None:
-                        _side = home if ffp and ffp > 0 else away
-                        st.caption(
-                            f"📐 Four Factors — eFG%: {home} "
-                            f"{hff['efg']*100:.1f}% vs {away} "
-                            f"{aff['efg']*100:.1f}%"
-                            + (f"  →  nudged the margin **{ffp:+.1f}** toward "
-                               f"{_side}." if ffp else " (even).")
-                            + f"  TOV%: {home} {hff.get('tov_pct',0)*100:.1f}% / "
-                            f"{away} {aff.get('tov_pct',0)*100:.1f}%  ·  "
-                            f"OREB%: {home} {hff.get('oreb_pct',0)*100:.1f}% / "
-                            f"{away} {aff.get('oreb_pct',0)*100:.1f}%")
-
-                    # ---- Polymarket: a SECOND price to diff against the book --
-                    pm = cached_polymarket(home, away)
-                    if pm:
-                        pm_h = pm["p_home"] * 100
-                        model_h = proj["p_home_win"] * 100
-                        gap = model_h - pm_h
-                        vol = pm.get("volume_24h", 0)
-                        agree = "same side" if (model_h >= 50) == (pm_h >= 50) \
-                            else "OPPOSITE sides"
-                        note = ("thin market — treat as weak" if vol < 5000
-                                else "")
-                        st.info(
-                            f"🪙 **Polymarket (crowd):** {home} {pm_h:.0f}% / "
-                            f"{away} {100-pm_h:.0f}%  ·  our model {home} "
-                            f"{model_h:.0f}%.  Gap **{gap:+.0f} pts**, {agree}."
-                            + (f"  ⚠️ {note}." if note else "")
-                            + f"  (24h vol ${vol:,.0f}.) A big gap vs the "
-                              "sportsbook line below can flag news the book "
-                              "hasn't moved on yet — a signal, not a bet.")
-
-                    # ---- Line movement: where the number OPENED vs now ----
-                    opn = _gl_open_odds.get(matchup)
-                    if opn:
-                        from odds.line_movement import movement_label
-                        mv = []
-                        mt = movement_label(opn.get("total"), g.get("total"))
-                        if mt:
-                            mv.append(f"Total {mt}")
-                        ms = movement_label(opn.get("spread_home"),
-                                            g.get("spread"), kind="spread")
-                        if ms:
-                            mv.append(f"{home} spread {ms}")
-                        if mv:
-                            st.caption(
-                                "📊 Line movement — " + "  ·  ".join(mv)
-                                + ". The move since open shows which way the "
-                                  "market (often sharp money) leaned.")
-
-                    # ---- Team style: how each side plays (context) ----
-                    def _style(abbr):
-                        iso = (_gl_iso.get(abbr) or {}).get("ppp")
-                        drv = (_gl_drives.get(abbr) or {}).get("drives")
-                        bits = []
-                        if iso is not None:
-                            bits.append(f"ISO {iso:.2f} pts/poss")
-                        if drv is not None:
-                            bits.append(f"{drv:.0f} drives/game")
-                        return f"**{abbr}** " + ", ".join(bits) if bits else None
-                    sty = [x for x in (_style(home), _style(away)) if x]
-                    if sty:
-                        st.caption("🎬 Team style: " + "  ·  ".join(sty)
-                                   + ". (ISO efficiency = points per isolation "
-                                     "possession; drives = rim pressure.)")
-
-                    # ---- Each team's DEFENSE: points allowed per 100 (#rank) --
-                    def _def_line(abbr):
-                        row = ratings.get(abbr) or {}
-                        dv = row.get("def")
-                        if dv is None:
-                            return None
-                        rk = row.get("def_rank")
-                        rktxt = f" (#{rk} of 30)" if rk else ""
-                        feel = ("stingy" if (rk and rk <= 10)
-                                else "leaky" if (rk and rk >= 21)
-                                else "average")
-                        return f"**{abbr}** allows {dv:g}/100{rktxt} — {feel} D"
-                    dlines = [x for x in (_def_line(home), _def_line(away)) if x]
-                    if dlines:
-                        st.caption("🛡️ Defense (points allowed per 100 poss, "
-                                   "lower = better): " + "  ·  ".join(dlines))
-
-                    # ---- Star Tax: injuries that moved the margin ----
+                    # ---- KEY NUMBERS: identical block for each team ----
+                    # Always AWAY on the left, HOME on the right (same order as
+                    # the title "AWAY @ HOME"), same five lines for both.
+                    sp_away = -sp_home if sp_home is not None else None
                     htax = proj.get("home_injury_tax") or 0
                     atax = proj.get("away_injury_tax") or 0
-                    if htax or atax:
-                        bits = []
-                        if htax:
-                            bits.append(f"**{home}** −{htax:.1f} ("
-                                        + ", ".join(proj.get(
-                                            "home_injury_reasons", [])) + ")")
-                        if atax:
-                            bits.append(f"**{away}** −{atax:.1f} ("
-                                        + ", ".join(proj.get(
-                                            "away_injury_reasons", [])) + ")")
-                        st.info("🩹 Injury adjustment (Star Tax) applied to the "
-                                "margin: " + "; ".join(bits)
-                                + ". A ruled-out star shifts the line toward the "
-                                "healthy team — the pick above already reflects "
-                                "this.")
 
-                    # ---- Moneyline EV (if the book posted ML) ----
-                    ml_home = g.get("moneyline")
-                    g_away = lines.get(away) or {}
-                    ml_away = g_away.get("moneyline")
+                    def _side_md(team, role, p_win, ml, sp, pts, tax, why):
+                        """Same five lines for every team, '—' when missing."""
+                        hurt = (f"−{tax:.1f} margin ({', '.join(why[:2])})"
+                                if tax else "none")
+                        return (
+                            f"**{team}** _({role})_  \n"
+                            f"Win chance: **{p_win*100:.0f}%**  \n"
+                            f"Moneyline: {f'{int(ml):+}' if ml is not None else '—'}  \n"
+                            f"Spread: {f'{sp:+g}' if sp is not None else '—'}  \n"
+                            f"Projected score: {pts:.0f}  \n"
+                            f"🩹 Injuries: {hurt}")
+
+                    _cl, _cr = _gst.columns(2)
+                    _cl.markdown(_nm(_side_md(
+                        away, "away", proj["p_away_win"], ml_away, sp_away,
+                        (_tot - _mgn) / 2.0, atax,
+                        proj.get("away_injury_reasons", []))))
+                    _cr.markdown(_nm(_side_md(
+                        home, "home", proj["p_home_win"], ml_home, sp_home,
+                        (_tot + _mgn) / 2.0, htax,
+                        proj.get("home_injury_reasons", []))))
+                    _line2 = [f"Model favors **{fav}** by **{abs(_mgn):.1f}**"]
+                    if g.get("total") is not None:
+                        _line2.append(f"Total {g['total']:g} (model "
+                                      f"{proj['exp_total']:.0f})")
+                    _gst.markdown("  ·  ".join(_line2))
+
+                    # ---- Value callouts (only when there IS an edge) ----
                     if ml_home is not None and ml_away is not None:
                         ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
                                            int(ml_home), int(ml_away),
                                            edge_threshold=ev_bar / 100.0)
-                        st.markdown(f"**Moneyline** — {home} {int(ml_home):+} / "
-                                    f"{away} {int(ml_away):+}")
                         if ev.get("is_value"):
                             over = ev["recommended_side"] == "over"
                             side = home if over else away
                             edge = (ev["edge_over_pct"] if over
                                     else ev["edge_under_pct"])
-                            st.success(f"✅ Value on **{side}** moneyline "
-                                       f"(edge {edge:+.1f}% vs the fair line).")
-                        else:
-                            st.caption("No moneyline edge — the price matches our "
-                                       "estimate.")
-
-                    # ---- Spread EV (if the book posted a spread) ----
-                    sp_home = g.get("spread")
+                            _gst.success(f"✅ Moneyline value: **{side}** "
+                                       f"(edge {edge:+.1f}%).")
                     if sp_home is not None:
                         p_home_cov, p_away_cov = cover_probability(
                             proj["exp_margin"], sp_home, _mstd)
-                        # Both sides priced ~ -110 by convention unless we have better.
                         ev_s = evaluate_prop(p_home_cov, p_away_cov, -110, -110,
                                              edge_threshold=ev_bar / 100.0)
-                        st.markdown(f"**Spread** — {home} {sp_home:+g} / "
-                                    f"{away} {-sp_home:+g}")
-                        _favt = home if sp_home < 0 else away
-                        _dogt = away if sp_home < 0 else home
-                        _num = abs(sp_home)
-                        st.caption(
-                            f"➖ **minus = favorite**: {_favt} {-_num:g} must "
-                            f"**win by more than {_num:g}** to cover. "
-                            f"➕ **plus = underdog**: {_dogt} +{_num:g} covers "
-                            f"if they **win outright OR lose by less than "
-                            f"{_num:g}**. (Land exactly on {_num:g} = push, "
-                            f"bet refunded.)")
                         if ev_s.get("is_value"):
                             over = ev_s["recommended_side"] == "over"
                             side = (f"{home} {sp_home:+g}" if over
                                     else f"{away} {-sp_home:+g}")
                             edge = (ev_s["edge_over_pct"] if over
                                     else ev_s["edge_under_pct"])
-                            st.success(f"✅ Value on **{side}** "
-                                       f"(we have the cover at "
+                            _gst.success(f"✅ Spread value: **{side}** (cover "
                                        f"{max(p_home_cov, p_away_cov)*100:.0f}%, "
                                        f"edge {edge:+.1f}%).")
-                        else:
-                            st.caption("No spread edge — our margin agrees with "
-                                       "the line.")
+                            from odds.spread_hint import spread_hint
+                            _gst.caption("💡 " + spread_hint(
+                                home if over else away,
+                                sp_home if over else -sp_home))
 
-                    if g.get("total") is not None:
-                        st.caption(f"Game total (O/U): **{g['total']:g}**. "
-                                   f"Our projected total: {proj['exp_total']:.0f}.")
+                    # ---- Who's playing: starters + notable outs, 2 lines ----
+                    render_game_rosters(away, home, str(gl_date))
+
+                    # ---- Everything else is one click away ----
+                    if _gst.checkbox("More details (four factors, line move, "
+                                   "defense, style, crowd odds)",
+                                   key=f"gl_more_{gl_date}_{matchup}"):
+                        # ---- Four Factors: eFG% edge folded into the margin ----
+                        ffp = proj.get("four_factor_pts")
+                        hff = _gl_four_factors.get(home) or {}
+                        aff = _gl_four_factors.get(away) or {}
+                        if hff.get("efg") is not None and aff.get("efg") is not None:
+                            _side = home if ffp and ffp > 0 else away
+                            _gst.caption(
+                                f"📐 Four Factors — eFG%: {away} "
+                                f"{aff['efg']*100:.1f}% vs {home} "
+                                f"{hff['efg']*100:.1f}%"
+                                + (f"  →  nudged the margin **{ffp:+.1f}** toward "
+                                   f"{_side}." if ffp else " (even).")
+                                + f"  TOV%: {away} {aff.get('tov_pct',0)*100:.1f}% / "
+                                f"{home} {hff.get('tov_pct',0)*100:.1f}%  ·  "
+                                f"OREB%: {away} {aff.get('oreb_pct',0)*100:.1f}% / "
+                                f"{home} {hff.get('oreb_pct',0)*100:.1f}%")
+
+                        # ---- Polymarket: a SECOND price to diff against the book --
+                        pm = cached_polymarket(home, away)
+                        if pm:
+                            pm_h = pm["p_home"] * 100
+                            model_h = proj["p_home_win"] * 100
+                            gap = model_h - pm_h
+                            vol = pm.get("volume_24h", 0)
+                            agree = "same side" if (model_h >= 50) == (pm_h >= 50) \
+                                else "OPPOSITE sides"
+                            note = ("thin market — treat as weak" if vol < 5000
+                                    else "")
+                            _gst.info(
+                                f"🪙 **Polymarket (crowd):** {away} {100-pm_h:.0f}% / "
+                                f"{home} {pm_h:.0f}%  ·  our model {home} "
+                                f"{model_h:.0f}%.  Gap **{gap:+.0f} pts**, {agree}."
+                                + (f"  ⚠️ {note}." if note else "")
+                                + f"  (24h vol ${vol:,.0f}.) A big gap vs the "
+                                  "sportsbook line below can flag news the book "
+                                  "hasn't moved on yet — a signal, not a bet.")
+
+                        # ---- Line movement: where the number OPENED vs now ----
+                        opn = _gl_open_odds.get(matchup)
+                        if opn:
+                            from odds.line_movement import movement_label
+                            mv = []
+                            mt = movement_label(opn.get("total"), g.get("total"))
+                            if mt:
+                                mv.append(f"Total {mt}")
+                            ms = movement_label(opn.get("spread_home"),
+                                                g.get("spread"), kind="spread")
+                            if ms:
+                                mv.append(f"{home} spread {ms}")
+                            if mv:
+                                _gst.caption(
+                                    "📊 Line movement — " + "  ·  ".join(mv)
+                                    + ". The move since open shows which way the "
+                                      "market (often sharp money) leaned.")
+
+                        # ---- Team style: how each side plays (context) ----
+                        def _style(abbr):
+                            iso = (_gl_iso.get(abbr) or {}).get("ppp")
+                            drv = (_gl_drives.get(abbr) or {}).get("drives")
+                            bits = []
+                            if iso is not None:
+                                bits.append(f"ISO {iso:.2f} pts/poss")
+                            if drv is not None:
+                                bits.append(f"{drv:.0f} drives/game")
+                            return f"**{abbr}** " + ", ".join(bits) if bits else None
+                        sty = [x for x in (_style(away), _style(home)) if x]
+                        if sty:
+                            _gst.caption("🎬 Team style: " + "  ·  ".join(sty)
+                                       + ". (ISO efficiency = points per isolation "
+                                         "possession; drives = rim pressure.)")
+
+                        # ---- Each team's DEFENSE: points allowed per 100 (#rank) --
+                        def _def_line(abbr):
+                            row = ratings.get(abbr) or {}
+                            dv = row.get("def")
+                            if dv is None:
+                                return None
+                            rk = row.get("def_rank")
+                            rktxt = f" (#{rk} of 30)" if rk else ""
+                            feel = ("stingy" if (rk and rk <= 10)
+                                    else "leaky" if (rk and rk >= 21)
+                                    else "average")
+                            return f"**{abbr}** allows {dv:g}/100{rktxt} — {feel} D"
+                        dlines = [x for x in (_def_line(away), _def_line(home)) if x]
+                        if dlines:
+                            _gst.caption("🛡️ Defense (points allowed per 100 poss, "
+                                       "lower = better): " + "  ·  ".join(dlines))
+
+                        if sp_home is not None:
+                            # ---- Alternate spreads: what each line is worth ----
+                            from odds.alt_spreads import ladder, fmt_odds
+                            _alt = ladder(proj["exp_margin"], sp_home, _mstd,
+                                          cover_probability)
+                            import pandas as _pda
+                            _gst.markdown("**Alternate spreads** (cover chance "
+                                          "by our numbers)")
+                            _gst.dataframe(_pda.DataFrame([{
+                                f"{away} line": f"{r['away_line']:+g}",
+                                f"{away} cover": f"{r['p_away']*100:.0f}%",
+                                f"{away} take at": fmt_odds(r["need_away"]),
+                                f"{home} line": f"{r['home_line']:+g}",
+                                f"{home} cover": f"{r['p_home']*100:.0f}%",
+                                f"{home} take at": fmt_odds(r["need_home"]),
+                            } for r in _alt]), hide_index=True,
+                                use_container_width=True)
+                            _gst.caption("Take at = the price your book must "
+                                         "beat for a 3-point edge by our "
+                                         "numbers (break-even is about 2-3 "
+                                         "points worse). Better odds than "
+                                         "that = worth a look; worse = skip. "
+                                         "Buying points for a safer cover "
+                                         "costs odds. Our margin hasn't beaten "
+                                         "the market in tests, so use it as a "
+                                         "guide.")
+                            from odds.spread_hint import spread_hint
+                            _gst.caption("💡 " + spread_hint(away, -sp_home))
+                            _gst.caption("💡 " + spread_hint(home, sp_home))
+            # ---- Most confident picks + share (drawn at the TOP of the list) ----
+            with _export_slot:
+                # Reload: a long-running Streamlit process may still hold an
+                # OLDER export_gamelines in memory (missing newer functions).
+                import importlib
+                import export_gamelines as _eg
+                _eg = importlib.reload(_eg)
+                build_rows, to_text, to_csv = _eg.build_rows, _eg.to_text, _eg.to_csv
+                top_picks, top_leans, top_ml = _eg.top_picks, _eg.top_leans, _eg.top_ml
+                import datetime as _dx
+                try:
+                    _lbl = _dx.date.fromisoformat(str(gl_date)).strftime("%a %b %-d")
+                except Exception:
+                    _lbl = str(gl_date)
+                _rows = build_rows(_export_entries)
+                _top = top_picks(_export_entries)
+                _txt = to_text(_rows, _lbl, top=_top, ml=top_ml(_export_entries))
+
+                st.markdown("#### ⭐ Most confident picks")
+                if _top:
+                    import pandas as _pdt
+                    st.dataframe(_pdt.DataFrame(_top), hide_index=True,
+                                 use_container_width=True)
+                    st.caption("Ranked by edge: the gap between our chance and "
+                               "the fair price. Chance = how often we think the "
+                               "pick wins (or covers). Bigger gap = more "
+                               "confident, but still not a guarantee: in "
+                               "past-game tests this model has not beaten the "
+                               "sportsbook lines.")
+                elif _rows:
+                    st.info("No pick clears the edge bar today. Games where the "
+                            "model is most sure who wins (this is NOT a price "
+                            "edge):")
+                    import pandas as _pdt
+                    st.dataframe(_pdt.DataFrame(top_leans(_export_entries)),
+                                 hide_index=True, use_container_width=True)
+                else:
+                    st.caption("No open games with lines yet.")
+
+                # ---- Moneyline: who the model is surest will WIN ----
+                _mlt = top_ml(_export_entries)
+                if _mlt:
+                    st.markdown("#### 💰 Moneyline: most likely winners")
+                    import pandas as _pdm
+                    st.dataframe(_pdm.DataFrame(_mlt), hide_index=True,
+                                 use_container_width=True)
+                    st.caption("Ranked by how sure the model is that the team "
+                               "wins. Heavy favorites win often but pay little, "
+                               "so a pick only counts as value (✅) when the "
+                               "price is good too. The model's moneyline "
+                               "numbers are pulled toward the market, so a ✅ "
+                               "moneyline price edge is rare.")
+
+
             st.caption("⚠️ Game-side projections blend a rotation Monte Carlo "
                        "sim (who plays × their usage/efficiency, averaged over "
                        "thousands of runs) with the team-ratings baseline + home "
                        "court. Treat a ✅ as 'worth a look', and remember sides "
                        "are efficiently priced; your edge is a soft/stale line, "
                        "not out-guessing the market.")
+
+            # ---- Share (bottom of the page): two small download buttons ----
+            if _rows:
+                st.markdown("&nbsp;")
+                st.caption("📤 Share today's picks")
+                # Never let the labels wrap letter-by-letter on narrow screens.
+                st.markdown(
+                    "<style>[data-testid='stDownloadButton'] button"
+                    "{white-space:nowrap;padding:.25rem .8rem;"
+                    "min-height:2rem;font-size:.85rem;}</style>",
+                    unsafe_allow_html=True)
+                dl1, dl2, _sp = st.columns([2, 2, 3])
+                dl1.download_button(
+                    "⬇ CSV", to_csv(_rows),
+                    file_name=f"nba_gamelines_{gl_date}.csv",
+                    mime="text/csv", key=f"dl_gl_csv_{gl_date}",
+                    use_container_width=True)
+                dl2.download_button(
+                    "⬇ Text", _txt,
+                    file_name=f"nba_gamelines_{gl_date}.txt",
+                    mime="text/plain", key=f"dl_gl_txt_{gl_date}",
+                    use_container_width=True)
 

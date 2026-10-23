@@ -90,32 +90,36 @@ def fetch_injuries():
     _ensure_table(conn)
     stored = 0
     try:
-        # Clear only our own prior snapshot; keep ESPN overrides intact.
-        conn.execute("DELETE FROM injuries WHERE source = 'balldontlie' "
-                     "OR source IS NULL")
-        conn.commit()
+        # Fetch EVERYTHING first. Only if that succeeds do we replace our old
+        # snapshot, so a rate limit or network blip can't wipe the injury list.
+        fetched = []
         for rows, _cur in iter_pages("player_injuries", {}, start_cursor=None):
-            conn.execute("BEGIN")
-            for r in rows:
-                player = r.get("player") or {}
-                pid = player.get("id")
-                if pid is None:
-                    continue
-                name = f"{player.get('first_name','')} {player.get('last_name','')}".strip()
-                status = (r.get("status") or "").strip()
-                desc = (r.get("description") or r.get("return_date") or "")
-                if upsert_injury(conn, pid, name, status, desc, _now(),
-                                 "balldontlie"):
-                    stored += 1
-            conn.commit()
-    except BallDontLieError as e:
+            fetched.extend(rows)
+    except Exception as e:  # BallDontLieError, rate limit, or no network
         conn.close()
-        print(f"Injuries request failed: {e}")
-        print("If this is a tier/endpoint issue, injuries may need a specific "
-              "GOAT add-on — we don't fabricate them.")
-        return
+        print(f"Injuries request failed: {type(e).__name__}: {str(e)[:120]}")
+        print("Kept the previous injury list (nothing was deleted). If this is "
+              "a tier/endpoint issue, injuries may need a specific GOAT "
+              "add-on; we don't fabricate them.")
+        return 0
+    # Clear only our own prior snapshot; keep ESPN overrides intact.
+    conn.execute("DELETE FROM injuries WHERE source = 'balldontlie' "
+                 "OR source IS NULL")
+    now = _now()
+    for r in fetched:
+        player = r.get("player") or {}
+        pid = player.get("id")
+        if pid is None:
+            continue
+        name = f"{player.get('first_name','')} {player.get('last_name','')}".strip()
+        status = (r.get("status") or "").strip()
+        desc = (r.get("description") or r.get("return_date") or "")
+        if upsert_injury(conn, pid, name, status, desc, now, "balldontlie"):
+            stored += 1
+    conn.commit()
     conn.close()
-    print(f"Stored {stored} current injuries (as of {_now()} UTC).")
+    print(f"Stored {stored} current injuries (as of {now} UTC).")
+    return stored
 
 
 def current_injury(player_id: int):

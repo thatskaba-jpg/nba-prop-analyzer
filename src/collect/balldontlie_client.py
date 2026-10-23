@@ -15,6 +15,7 @@ The key lives in .env as:
 """
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -47,19 +48,26 @@ else:
 RATE_NOTE = (f"~{60.0 / MIN_SECONDS_BETWEEN_CALLS:.0f} requests/min "
              f"(tier: {_tier})")
 _last_call_time = [0.0]  # list so the inner function can mutate it
+_cooldown_until = [0.0]  # fail-fast mode: no calls until this time after a 429
 
 
 class BallDontLieError(Exception):
     pass
 
 
+_throttle_lock = threading.Lock()
+
+
 def _throttle():
-    """Sleep just enough to respect the rate limit."""
-    elapsed = time.time() - _last_call_time[0]
-    wait = MIN_SECONDS_BETWEEN_CALLS - elapsed
-    if wait > 0:
-        time.sleep(wait)
-    _last_call_time[0] = time.time()
+    """Sleep just enough to respect the rate limit. Thread-safe: parallel
+    callers are spaced MIN_SECONDS_BETWEEN_CALLS apart (the request itself runs
+    outside the lock, so several can be in flight at once)."""
+    with _throttle_lock:
+        elapsed = time.time() - _last_call_time[0]
+        wait = MIN_SECONDS_BETWEEN_CALLS - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_time[0] = time.time()
 
 
 def _get(path, params=None):
@@ -79,13 +87,27 @@ def _get(path, params=None):
         url = f"{BASE_URL}/{p}"
     headers = {"Authorization": API_KEY}
 
+    # Interactive callers (the dashboard) set BDL_FAIL_FAST=1: never sleep through
+    # 429/5xx retries (up to ~2.5 min per call) -- raise at once so the caller can
+    # use a backup source. After a 429 we also refuse calls for 60s so one rate
+    # limit doesn't turn into dozens of slow failures.
+    fast = os.getenv("BDL_FAIL_FAST") == "1"
+    if fast and time.time() < _cooldown_until[0]:
+        raise BallDontLieError("429 rate limited (cooling down)")
+
     for attempt in range(1, 5):
         _throttle()
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp = requests.get(url, headers=headers, params=params,
+                            timeout=10 if fast else 30)
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 401:
             raise BallDontLieError("401 Unauthorized — the API key is wrong or the trial expired.")
+        if resp.status_code == 429 and fast:
+            _cooldown_until[0] = time.time() + 60
+            raise BallDontLieError("429 rate limited")
+        if resp.status_code in (500, 502, 503, 504) and fast:
+            raise BallDontLieError(f"{resp.status_code} server error")
         if resp.status_code == 429:
             wait = attempt * 15
             print(f"  Rate limited (429). Waiting {wait}s...")
