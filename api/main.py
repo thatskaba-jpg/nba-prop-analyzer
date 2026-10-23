@@ -20,6 +20,7 @@ Endpoints:
     GET  /api/game-lines?date=            -> game lines + model projection
 """
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,8 @@ from database import get_connection
 from features.features import load_player_history
 from models.prop_model_config import build_config, analyze, FACTORS
 from odds.ev_engine import evaluate_prop
+from odds.market_anchor import anchor_to_market
+from models.fitted_projection import slate_p_over
 
 PROP_WORDS = {
     "points": "Points", "rebounds": "Rebounds", "assists": "Assists",
@@ -56,11 +59,18 @@ DEFAULT_FACTORS = {k: v for k, v in DEFAULT_FACTORS.items() if k in FACTORS}
 
 app = FastAPI(title="NBA Prop Analyzer API")
 
-# The front-end is served from the same origin in production, but allow all in
-# dev so a locally-served page can call the API without CORS pain.
+# The front-end is served from this same origin, so cross-origin access is only
+# needed for a locally-run dev page. Allow just localhost by default (a wildcard
+# lets ANY website you visit call this API in your browser and spend your
+# paid-API quota). Override with API_CORS_ORIGINS="https://a.example,https://b".
+# There is NO authentication on this API: keep it bound to 127.0.0.1 and do not
+# deploy it publicly without adding some.
+_ORIGINS = [o.strip() for o in os.getenv(
+    "API_CORS_ORIGINS",
+    "http://127.0.0.1:8000,http://localhost:8000").split(",") if o.strip()]
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=_ORIGINS, allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -122,7 +132,19 @@ def analyze_prop(req: AnalyzeReq):
     res = analyze(cfg, req.player_id, req.prop_type, req.line, cutoff, hist, ctx)
     if res.get("projection") is None:
         raise HTTPException(422, "could not project this prop")
-    ev = evaluate_prop(res["p_over"], res["p_under"],
+    # Value is judged on the market-anchored probability: the model alone hasn't
+    # beaten the posted line, so it only nudges the line's own number.
+    _conn = get_connection()
+    _row = _conn.execute("SELECT player_name FROM player_game_logs "
+                         "WHERE player_id = ? LIMIT 1", (req.player_id,)).fetchone()
+    _conn.close()
+    anch = anchor_to_market(res["p_over"], res["p_under"],
+                            int(req.odds_over), int(req.odds_under),
+                            p_over_raw=res.get("p_over_raw"),
+                            p_over_fitted=slate_p_over(
+                                _row["player_name"] if _row else "",
+                                req.prop_type, req.line))
+    ev = evaluate_prop(anch["p_over"], anch["p_under"],
                        int(req.odds_over), int(req.odds_under))
     lean = "OVER" if res["p_over"] >= 0.5 else "UNDER"
 
@@ -176,6 +198,8 @@ def analyze_prop(req: AnalyzeReq):
         "ev_pick_pct": ev_pick, "odds_pick": odds_pick,
         "is_value": ev.get("is_value", False),
         "recommended_side": ev.get("recommended_side"),
+        "anchored": anch["anchored"],
+        "p_over_anchored": anch["p_over"] if anch["anchored"] else None,
         "reasons": reasons,
         "recent": recent,
         "recent_hits": hit_count, "recent_n": len(recent),
@@ -254,10 +278,10 @@ def game_lines(date: Optional[str] = None):
     from odds.game_lines import build_game_lines_map
     from models.game_model import project_game, cover_probability
     from collect.goat_data import team_ratings_map
-    import datetime as _dt
-    date = date or _dt.date.today().isoformat()
+    from database import nba_season_start_year, nba_today
+    date = date or nba_today()          # US-Eastern slate, not the server's UTC day
     lines = build_game_lines_map(date)
-    ratings = team_ratings_map(2025)
+    ratings = team_ratings_map(nba_season_start_year())
     out = []
     seen = set()
     for team, g in lines.items():

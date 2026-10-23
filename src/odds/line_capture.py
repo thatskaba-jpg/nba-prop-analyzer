@@ -20,7 +20,9 @@ This module fixes that GOING FORWARD:
   3. grade_settled()   -> once a game is final, join the stored line to the
                           ACTUAL stat in player_game_logs (on player_id+game_id)
                           and mark each row won/lost/push. This is what turns
-                          captured lines into a real-line results set.
+                          captured lines into a real-line results set. A player
+                          who logged 0 minutes (DNP) is VOIDED, not graded as an
+                          under: sportsbooks refund those bets.
 
 HONESTY NOTES.
   - Opening lines are REAL market lines but move a lot before tip; closing lines
@@ -47,6 +49,7 @@ except ImportError:
 
 from database import get_connection  # noqa: E402
 from features.features import COMBO_PARTS  # noqa: E402
+from grading import PENDING, VOID, settle_stat  # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -122,9 +125,9 @@ def ensure_table():
             line          REAL NOT NULL,
             odds_over     INTEGER,
             odds_under    INTEGER,
-            actual        REAL,                   -- filled by grade_settled()
-            hit_over      INTEGER,                -- 1/0/NULL(push or ungraded)
-            graded_at     TEXT,
+            actual        REAL,                   -- filled by grade_settled(); NULL if voided (DNP)
+            hit_over      INTEGER,                -- 1/0/NULL(push, voided DNP, or ungraded)
+            graded_at     TEXT,                   -- set once processed, even if voided
             UNIQUE(game_id, player_id, prop_type, book, snapshot, line)
         )
     """)
@@ -242,38 +245,84 @@ def backfill_opening(start_date: str, end_date: str):
             "days": days, "rows_seen": seen, "rows_inserted": inserted}
 
 
-def _actual_stat(conn, player_id, game_id, prop_type):
-    """The player's actual stat for a final game, or None if not logged yet."""
+def _result_for(conn, player_id, game_id, prop_type):
+    """How a stored line settled: (status, actual).
+
+      (PENDING, None)  the game isn't in player_game_logs yet
+      (VOID, None)     the player logged 0 minutes (DNP): sportsbooks refund the
+                       bet, so it must not count as an over OR an under
+      (FINAL, value)   the player's real stat for that game
+    """
     row = conn.execute(
         "SELECT * FROM player_game_logs WHERE player_id=? AND game_id=?",
         (player_id, game_id)).fetchone()
-    if not row:
-        return None
-    if prop_type in COMBO_PARTS:
-        try:
-            return float(sum(row[c] for c in COMBO_PARTS[prop_type]))
-        except (KeyError, TypeError):
-            return None
-    if prop_type in _STAT_COLS:
-        v = row[prop_type]
-        return float(v) if v is not None else None
-    return None
+    return settle_stat(row, prop_type, COMBO_PARTS, _STAT_COLS)
+
+
+def _actual_stat(conn, player_id, game_id, prop_type):
+    """The player's actual stat for a final game, or None if there isn't a
+    gradable one (not logged yet, or a DNP). Kept for older callers; the
+    graders use _result_for() so they can tell a DNP from a missing game."""
+    status, actual = _result_for(conn, player_id, game_id, prop_type)
+    return actual
+
+
+def void_dnp_props():
+    """Void already-graded lines whose player did not play. Safe to repeat.
+
+    Before the DNP rule existed, a player with 0 minutes was graded as
+    actual=0 -> UNDER (about 4% of all graded lines). This finds those rows and
+    clears actual + hit_over, keeping graded_at so they aren't picked up as
+    ungraded again. Returns how many rows it repaired (0 once clean)."""
+    ensure_table()
+    conn = get_connection()
+    cur = conn.execute(
+        """
+        UPDATE historical_props
+           SET actual = NULL, hit_over = NULL
+         WHERE graded_at IS NOT NULL
+           AND (hit_over IS NOT NULL OR actual IS NOT NULL)
+           AND EXISTS (
+               SELECT 1 FROM player_game_logs g
+                WHERE g.player_id = historical_props.player_id
+                  AND g.game_id = CAST(historical_props.game_id AS TEXT)
+                  AND (g.minutes IS NULL OR g.minutes <= 0))
+        """)
+    repaired = cur.rowcount
+    conn.commit()
+    conn.close()
+    return repaired
 
 
 def grade_settled():
     """For every ungraded stored line whose game now has a logged result, fill
-    actual + hit_over (1 over / 0 under / NULL push). Returns a summary."""
+    actual + hit_over (1 over / 0 under / NULL push).
+
+    A player who logged 0 minutes didn't play, and sportsbooks void props for
+    non-participants. Those rows are stamped graded (so they aren't re-checked
+    every run) but keep actual=NULL and hit_over=NULL, so they count as neither
+    an over nor an under in any validation or calibration set. Earlier DNPs that
+    were wrongly graded as unders are repaired on the way out (void_dnp_props).
+
+    Returns a summary dict."""
     ensure_table()
     conn = get_connection()
     ungraded = conn.execute(
         "SELECT id, player_id, game_id, prop_type, line "
         "FROM historical_props WHERE graded_at IS NULL").fetchall()
     now = datetime.utcnow().isoformat(timespec="seconds")
-    graded = pushes = still_pending = 0
+    graded = pushes = voided = still_pending = 0
     for r in ungraded:
-        actual = _actual_stat(conn, r["player_id"], r["game_id"], r["prop_type"])
-        if actual is None:
+        status, actual = _result_for(conn, r["player_id"], r["game_id"],
+                                     r["prop_type"])
+        if status == PENDING:
             still_pending += 1
+            continue
+        if status == VOID:
+            conn.execute(
+                "UPDATE historical_props SET actual=NULL, hit_over=NULL, "
+                "graded_at=? WHERE id=?", (now, r["id"]))
+            voided += 1
             continue
         if actual == r["line"]:
             hit = None  # push
@@ -286,7 +335,9 @@ def grade_settled():
         graded += 1
     conn.commit()
     conn.close()
-    return {"graded": graded, "pushes": pushes, "still_pending": still_pending}
+    repaired = void_dnp_props()
+    return {"graded": graded, "pushes": pushes, "voided": voided,
+            "repaired": repaired, "still_pending": still_pending}
 
 
 def coverage():
@@ -302,8 +353,11 @@ def coverage():
         "GROUP BY snapshot").fetchall())
     games = conn.execute(
         "SELECT COUNT(DISTINCT game_id) c FROM historical_props").fetchone()["c"]
+    voided = conn.execute(
+        "SELECT COUNT(*) c FROM historical_props WHERE graded_at IS NOT NULL "
+        "AND actual IS NULL AND hit_over IS NULL").fetchone()["c"]
     conn.close()
-    return {"rows_total": total, "rows_graded": graded,
+    return {"rows_total": total, "rows_graded": graded, "rows_voided": voided,
             "distinct_games": games, "by_snapshot": by_snap}
 
 

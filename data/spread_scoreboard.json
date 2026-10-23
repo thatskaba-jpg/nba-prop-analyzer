@@ -1,24 +1,117 @@
 {
   "pending": {
-    "CLE @ PHI|2026-10-22": {
-      "home": "PHI",
-      "away": "CLE",
-      "spread_home": -3.5,
-      "proj_margin": 9.2,
-      "our_side": "home"
-    },
     "DEN @ OKC|2026-10-22": {
       "home": "OKC",
       "away": "DEN",
       "spread_home": -8.5,
       "proj_margin": 14.4,
       "our_side": "home"
+    },
+    "ATL @ CHA|2026-10-23": {
+      "home": "CHA",
+      "away": "ATL",
+      "spread_home": 2.5,
+      "proj_margin": -2.0,
+      "our_side": "home"
+    },
+    "CHI @ MIL|2026-10-23": {
+      "home": "MIL",
+      "away": "CHI",
+      "spread_home": -1.5,
+      "proj_margin": 1.2,
+      "our_side": "away"
+    },
+    "DAL @ IND|2026-10-23": {
+      "home": "IND",
+      "away": "DAL",
+      "spread_home": -5.5,
+      "proj_margin": 4.9,
+      "our_side": "away"
+    },
+    "DET @ MIA|2026-10-23": {
+      "home": "MIA",
+      "away": "DET",
+      "spread_home": 1.5,
+      "proj_margin": -0.5,
+      "our_side": "home"
+    },
+    "HOU @ SAS|2026-10-23": {
+      "home": "SAS",
+      "away": "HOU",
+      "spread_home": -5.5,
+      "proj_margin": 3.9,
+      "our_side": "away"
+    },
+    "LAC @ LAL|2026-10-23": {
+      "home": "LAL",
+      "away": "LAC",
+      "spread_home": -9.5,
+      "proj_margin": 8.8,
+      "our_side": "away"
+    },
+    "MEM @ GSW|2026-10-23": {
+      "home": "GSW",
+      "away": "MEM",
+      "spread_home": -3.5,
+      "proj_margin": 2.3,
+      "our_side": "away"
+    },
+    "MIN @ ORL|2026-10-23": {
+      "home": "ORL",
+      "away": "MIN",
+      "spread_home": 1.5,
+      "proj_margin": -1.5,
+      "our_side": "away"
+    },
+    "NOP @ UTA|2026-10-23": {
+      "home": "UTA",
+      "away": "NOP",
+      "spread_home": -3.0,
+      "proj_margin": 1.0,
+      "our_side": "away"
+    },
+    "NYK @ BOS|2026-10-23": {
+      "home": "BOS",
+      "away": "NYK",
+      "spread_home": -2.5,
+      "proj_margin": 2.0,
+      "our_side": "away"
+    },
+    "POR @ SAC|2026-10-23": {
+      "home": "SAC",
+      "away": "POR",
+      "spread_home": 7.5,
+      "proj_margin": -7.6,
+      "our_side": "away"
+    },
+    "TOR @ WAS|2026-10-23": {
+      "home": "WAS",
+      "away": "TOR",
+      "spread_home": 5.5,
+      "proj_margin": -5.0,
+      "our_side": "home"
     }
   },
   "record": {
-    "correct": 0,
+    "correct": 1,
     "wrong": 0,
     "push": 0
   },
-  "graded_ids": []
+  "graded_ids": [
+    "CLE @ PHI|2026-10-22"
+  ],
+  "graded_detail": [
+    {
+      "game_id": "CLE @ PHI|2026-10-22",
+      "matchup": "CLE @ PHI",
+      "home": "PHI",
+      "away": "CLE",
+      "spread_home": -3.5,
+      "our_side": "home",
+      "proj_margin": 9.2,
+      "actual_margin": 8,
+      "covered_side": "home",
+      "result": "win"
+    }
+  ]
 }

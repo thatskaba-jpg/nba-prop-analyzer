@@ -1,0 +1,36 @@
+{
+  "intercept": -0.0492,
+  "w_market": 0.8644,
+  "w_model": 0.062,
+  "meta": {
+    "n_lines": 19989,
+    "fit_from": "2025-10-21",
+    "fit_through": "2026-10-20",
+    "book": "fanduel",
+    "markets": [
+      "points",
+      "rebounds",
+      "assists",
+      "threes_made"
+    ],
+    "model_weight_95ci": [
+      0.0255,
+      0.104
+    ],
+    "fitted_at": "2026-10-23 04:17:31"
+  },
+  "fitted": {
+    "intercept": -0.0177,
+    "w_market": 0.7579,
+    "w_model": 0.1789,
+    "meta": {
+      "n_lines": 25944,
+      "model_weight_95ci": [
+        0.1239,
+        0.2385
+      ],
+      "model_trained_before": "2025-10-21",
+      "fitted_at": "2026-10-23 04:06:44"
+    }
+  }
+}

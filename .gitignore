@@ -13,6 +13,11 @@ data/*.csv
 data/*.parquet
 data/raw/
 data/*.log
+# Throwaway out-of-sample calibration fit (src/models/calibration.py fit --holdout)
+data/calibration_holdout.json
+# Rebuilt every run: today's fitted projections and the last pipeline status
+data/fitted_slate.json
+data/pipeline_status.json
 
 # Python
 __pycache__/

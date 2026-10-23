@@ -1,27 +1,32 @@
 # Sports Betting Research Bot
 
-A data-driven research tool that analyzes NBA (then NFL) player props, estimates
-probabilities, compares them to sportsbook odds, and **honestly backtests itself**.
-It does not place bets and makes no guarantees — it helps you make informed decisions.
+A data-driven research tool that analyzes NBA player props, estimates
+probabilities, compares them to sportsbook odds, and **honestly tests itself**.
+It does not place bets and makes no guarantees. It helps you make informed decisions.
 
-## The one rule that matters most
-Every prediction uses **only data available before that game started.** No peeking
-at the future. This is what separates a real model from a fantasy one.
+## The rules that matter most
+1. Every prediction uses **only data available before that game started.**
+2. A "value" label is only worth what it did on games that hadn't happened yet.
+   The app keeps a forward record (paper bets, frozen picks) that can't be
+   backfilled or edited, and shows it next to the claims.
 
 ## Project layout
 ```
 sports-betting-bot/
 ├── .env                  your secret API keys (create from .env.example)
 ├── requirements.txt      Python libraries
-├── data/                 the SQLite database (data/bot.db) lives here
+├── data/                 the SQLite database (data/bot.db), calibration + model files
 ├── src/
 │   ├── database.py       storage layer (SQLite)
-│   ├── collect/          download & store data        (Phase 3)
-│   ├── features/         build prediction inputs       (Phase 5)
-│   ├── models/           the models                    (Phase 4)
-│   ├── odds/             sportsbook odds + EV math      (Phase 6)
-│   └── backtest/         the honesty check             (Phase 8)
-└── dashboard/app.py      Streamlit dashboard            (Phase 7)
+│   ├── grading.py        the ONE rule for settling a prop (a DNP is voided)
+│   ├── collect/          download & store data; daily_update.py, intraday.py
+│   ├── features/         leak-free pre-game inputs
+│   ├── models/           projections, calibration, fitted_projection, paper_bets, elo
+│   ├── odds/             sportsbook prices, EV math, market_anchor
+│   └── backtest/         the honesty checks (see "Is the model any good?")
+├── tests/                unit tests (python -m unittest discover -s tests)
+├── dashboard/app.py      Streamlit dashboard
+└── api/main.py           small JSON API (bind to 127.0.0.1; it has no auth)
 ```
 
 ## Setup (one time)
@@ -40,32 +45,47 @@ sports-betting-bot/
    ```
    pip install -r requirements.txt
    ```
-4. Create your secrets file (you can leave it blank until Phase 6):
+4. Create your secrets file:
    ```
    cp .env.example .env
    ```
 
-## Try it — pull real NBA data
-With the environment active (`(.venv)` showing):
-```
-python3 src/collect/fetch_player_logs.py "LeBron James" 2023-24
-```
-This downloads LeBron's 2023-24 game log from NBA.com and stores it in `data/bot.db`.
-
 ## Next time you open Terminal
-You only install once. After that, each session just:
 ```
 cd ~/sports-betting-bot
 source .venv/bin/activate
+streamlit run dashboard/app.py
 ```
 
-## Phases
-1. Pick data sources ✅ (NBA stats = free via `nba_api`)
-2. Project setup ✅
-3. Collect & store historical data ← **we are here**
-4. Baseline statistical model
-5. Matchup / injury / role features
-6. Sportsbook odds + expected value
-7. Dashboard
-8. Honest backtesting
-9. Scheduled updates + alerts
+## Run the tests
+```
+python -m unittest discover -s tests
+```
+
+## Keeping it fresh (two scheduled jobs)
+`crontab -e`, with the machine on US-Eastern time:
+```
+# nightly: box scores, rosters, injuries, grading, weekly model retrain
+0 9 * * *            cd ~/sports-betting-bot && ./.venv/bin/python src/collect/daily_update.py >> data/daily_update.log 2>&1
+# game days: prices, injury/lineup news, paper bets, closing lines (the last run before tip is the "close")
+0 12,15,17,18,19 * * * cd ~/sports-betting-bot && ./.venv/bin/python src/collect/intraday.py >> data/intraday.log 2>&1
+```
+Both record what worked in `data/pipeline_status.json`; the dashboard warns when
+data is stale or a key step failed. `refresh.command` runs the nightly job by hand.
+
+## Is the model any good? (run these, don't trust the labels)
+| Question | Command |
+|---|---|
+| Does the model know anything the betting line doesn't? | `python src/backtest/market_edge_test.py` (add `--save` to refit the weights the app uses) |
+| Is the fitted projection better than the rules-based one? | `python src/backtest/projection_eval.py` (`--save-anchor` to store its weights) |
+| How did flagged bets do at real prices, out of sample? | `python src/models/calibration.py fit --holdout 2026-02-01`, then `python src/backtest/real_line_validation.py` |
+| What is the best price across books worth? | `python src/backtest/line_shopping_test.py` |
+| Which way of picking game winners holds up? | `python src/backtest/game_model_eval.py` |
+| How are the forward paper bets doing? | `python src/models/paper_bets.py` (also on the Track Record tab) |
+
+After changing anything that feeds a probability, refit: `python src/models/calibration.py fit`
+and `python src/backtest/market_edge_test.py --save`.
+
+## Status
+Phases 1 to 9 are built (data, projections, odds + EV, dashboard, backtests,
+scheduled updates). The current work is evidence: see `PROGRESS.md`.

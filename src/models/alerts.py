@@ -32,6 +32,8 @@ from features.positional_defense import positional_defense_factors, player_group
 from models.prop_model_config import ModelConfig, analyze  # noqa: E402
 from models.milestone_props import milestone_probability  # noqa: E402
 from odds.ev_engine import evaluate_prop  # noqa: E402
+from odds.market_anchor import anchor_to_market  # noqa: E402
+from models.fitted_projection import slate_p_over  # noqa: E402
 from models.prediction_tracker import log_prediction  # noqa: E402
 
 # Confidence label -> a quality score used for ranking (higher = more trustworthy).
@@ -85,7 +87,14 @@ def scan_watchlist(config: ModelConfig, watchlist, edge_threshold=0.03,
 
         odds_over, odds_under = w.get("odds_over"), w.get("odds_under")
         if odds_over is not None and odds_under is not None:
-            ev = evaluate_prop(res["p_over"], res["p_under"],
+            # Value is judged on the market-anchored probability: the model
+            # alone hasn't beaten the line, so it only nudges the line's number.
+            anch = anchor_to_market(res["p_over"], res["p_under"],
+                                    int(odds_over), int(odds_under),
+                                    p_over_raw=res.get("p_over_raw"),
+                                    p_over_fitted=slate_p_over(
+                                        w.get("player_name", ""), prop, line))
+            ev = evaluate_prop(anch["p_over"], anch["p_under"],
                                int(odds_over), int(odds_under))
             entry["is_value"] = ev["is_value"]
             entry["ev_pct"] = (ev["ev_over_pct"] if pick == "over"

@@ -202,9 +202,15 @@ _FEATURES = ["home_off", "home_def", "home_wr", "home_rest",
              "home_last5_net", "away_last5_net"]
 
 
-def train(save: bool = True) -> dict:
+def train(save: bool = True, games=None, refit_all: bool = True) -> dict:
     """Fit the win + margin models on a time-ordered split and report honest
-    out-of-sample accuracy. Returns the fit dict (also written to disk)."""
+    out-of-sample accuracy. Returns the fit dict (also written to disk).
+
+    games       pre-built games table (defaults to API-first reconstruction)
+    refit_all   after scoring on the newest 20%, refit on EVERY game before
+                saving. (It used to save the 80% fit, so the deployed model had
+                never seen the most recent ~1,500 games.) The reported metrics
+                are still the honest holdout ones."""
     try:
         from sklearn.linear_model import LogisticRegression, Ridge
         from sklearn.preprocessing import StandardScaler
@@ -216,8 +222,8 @@ def train(save: bool = True) -> dict:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
     # API-first: real official final scores from balldontlie.
-    games = _reconstruct_games(seasons=list(range(2026, 2019, -1)))
-    src = "balldontlie API"
+    if games is None:
+        games = _reconstruct_games(seasons=list(range(2026, 2019, -1)))
     if games.empty or len(games) < 500:
         print("not enough games to train:", len(games))
         return None
@@ -265,6 +271,13 @@ def train(save: bool = True) -> dict:
     print(f"margin-sign acc    : {spread_acc:.3f}")
     print(f"total MAE          : {total_mae:.2f} pts  (avg total {ytte.mean():.0f})")
 
+    if refit_all:
+        scaler = StandardScaler().fit(X)
+        Xall = scaler.transform(X)
+        win = LogisticRegression(max_iter=1000, C=1.0).fit(Xall, yw)
+        marg = Ridge(alpha=1.0).fit(Xall, ym)
+        tot = Ridge(alpha=1.0).fit(Xall, yt)
+
     fit = {
         "features": _FEATURES,
         "scaler_mean": scaler.mean_.tolist(),
@@ -281,7 +294,8 @@ def train(save: bool = True) -> dict:
                     "margin_mae": mae, "margin_sign_acc": spread_acc,
                     "total_mae": total_mae,
                     "majority_baseline": base, "test_games": int(len(Xte)),
-                    "train_games": int(len(Xtr))},
+                    "train_games": int(len(Xtr)),
+                    "final_fit_on_all_games": bool(refit_all)},
     }
     if save:
         _MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)

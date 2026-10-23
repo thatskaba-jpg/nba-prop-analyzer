@@ -50,13 +50,28 @@ everywhere: no peeking at the future (no data leakage).
 - Positions for the position-aware defense are INFERRED from each player's stat
   profile; run fetch_positions.py to upgrade to balldontlie's real position field.
 
-## One open data item (optional)
-The current seasons (2024-25 / 2025-26 / 2026-27) were loaded BEFORE the
-steals/blocks/turnovers columns existed, so those columns are blank for those
-rows. Everything works on the complete 2020–2024 data. To fill the new stats
-for current seasons, clear the two checkpoints and re-pull:
-    rm data/checkpoints/stats_season_2024.cursor data/checkpoints/stats_season_2025.cursor
-    python3 src/collect/fetch_balldontlie_stats.py 2024 2025 2026
+## What the evidence says (Oct 2026)
+Measured on ~570K graded real lines (2025-26 season), out of sample, at the real
+posted prices, DNPs voided:
+- The old model's "value" flags averaged about -5.8% ROI per bet (about -4.4%
+  after calibration), no better than picking at random after the vig. The raw
+  model alone scores worse than a coin flip on log loss.
+- A projection FITTED to history (src/models/fitted_projection.py) is clearly
+  better than the hand-tuned one (error 2.62 vs 2.72 points, line itself 2.58)
+  and is the first to add a small, statistically visible amount beyond the line
+  (blend weight about 0.18, log-loss gain about 0.0008).
+- Shopping across books is worth about +3 points of ROI per bet (the best price
+  vs the average); "stale number" flags did not pay (realized ROI about 0).
+- Elo (results only) picks game winners 68% on 1,558 held-out games; the trained
+  ML model 64%; always-home 55%. The hand-built game model can't be backtested,
+  so it is judged by the frozen-picks table on the Game Lines tab.
+So probabilities are market-anchored (src/odds/market_anchor.py), and the
+forward test (paper bets, frozen picks, closing line value) decides what's real.
+
+## How things are settled
+- A player who logs 0 minutes is VOIDED (books refund the bet), never an under.
+- Predictions, paper bets and frozen picks are first-write-wins.
+- Nothing is called an edge until the forward record, not a backtest, says so.
 
 ## How to run
     cd ~/sports-betting-bot && source .venv/bin/activate

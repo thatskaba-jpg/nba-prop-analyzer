@@ -167,10 +167,14 @@ def _blend_ratings(season):
         r = roster.get(ab)
         a = api.get(ab)
         if not r:
-            out[ab] = dict(a); continue
+            b = dict(a)
+            if b.get("off") is not None and b.get("def") is not None:
+                b["net"] = round(b["off"] - b["def"], 1)
+            out[ab] = b; continue
         if not a or a.get("off") is None or a.get("def") is None:
             out[ab] = {"off": r["off"], "def": r["def"],
-                       "pace": r.get("pace", 100.0)}
+                       "pace": r.get("pace", 100.0),
+                       "net": round(r["off"] - r["def"], 1)}
             continue
         n = a.get("games") or 0
         w_api = max(0.0, min(1.0, n / (n + K)))
@@ -178,6 +182,10 @@ def _blend_ratings(season):
         for f in ("off", "def"):
             b[f] = round(w_api * a[f] + (1 - w_api) * r[f], 1)
         b["pace"] = a.get("pace") or r.get("pace", 100.0)
+        # net MUST equal off-def. The API's raw net_rating is a 1-game ±40
+        # artifact early season; recompute it from the blended off/def so every
+        # surface and the team_api cross-check see a consistent number.
+        b["net"] = round(b["off"] - b["def"], 1)
         out[ab] = b
     return out
 
@@ -445,13 +453,16 @@ def update_scoreboard(season=2026, use_live=True):
     Grades from the LIVE scores feed by default (updates the same night a game
     goes final); falls back to the DB game logs if the feed returns nothing."""
     data = _load()
-    done = set(data.get("graded_game_ids", []))
+    # Compare ids as TEXT everywhere. The live feed hands back ints but the DB
+    # fallback hands back text ("21717855" != 21717855 inside a set), so the
+    # same game used to be graded twice whenever the two sources alternated.
+    done = {str(g) for g in data.get("graded_game_ids", [])}
     ratings = _blend_ratings(season)
     games = (_finished_games_live() if use_live else []) \
         or _finished_games(season)
     newly = 0
     for gid, gdate, home, away, hp, ap in games:
-        if gid in done:
+        if str(gid) in done:
             continue
         home_won = hp > ap
         _pos = _positional_for_date(gdate)
@@ -473,11 +484,15 @@ def update_scoreboard(season=2026, use_live=True):
             rec["total"] += 1
             if correct:
                 rec["correct"] += 1
-        done.add(gid)
+        done.add(str(gid))
         newly += 1
-    data["graded_game_ids"] = sorted(done, key=str)
+    data["graded_game_ids"] = sorted(done)
     if newly:
         _save(data)
+    try:                                 # also settle the frozen (forward) picks
+        grade_forward(games)
+    except Exception:
+        pass
     return data
 
 
@@ -493,6 +508,134 @@ def get_scoreboard():
         rows.append((pname, rec.get("correct", 0), tot, pct))
     rows.sort(key=lambda x: (-x[3], -x[2]))
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# FROZEN PICKS: the honest version of this scoreboard
+#
+# The board above re-grades finished games with TODAY'S ratings, which already
+# include those games, so it can only flatter. Here every profile's pick (plus
+# a few dumb baselines) is written down BEFORE tip, first write wins, and graded
+# after the final. Elo (results only) scored 68% on 1,558 held-out games, so a
+# profile that can't beat the baselines here is not adding anything.
+# --------------------------------------------------------------------------- #
+
+_FWD_PATH = Path(__file__).resolve().parents[2] / "data" / "profile_forward.json"
+BASELINE_HOME = "Baseline: always home"
+BASELINE_ELO = "Baseline: Elo (results only)"
+BASELINE_MARKET = "Baseline: market favorite"
+_elo_cache = {"at": None, "elo": None}
+
+
+def _fwd_load():
+    try:
+        data = json.loads(_FWD_PATH.read_text())
+        data.setdefault("pending", {})
+        data.setdefault("record", {})
+        data.setdefault("graded_keys", [])
+        return data
+    except Exception:
+        return {"pending": {}, "record": {}, "graded_keys": []}
+
+
+def _fwd_save(data):
+    _FWD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _FWD_PATH.write_text(json.dumps(data, indent=1))
+
+
+def _elo_now():
+    """Elo ratings learned from every finished game (rebuilt at most hourly)."""
+    import time
+    if _elo_cache["elo"] is None or time.time() - (_elo_cache["at"] or 0) > 3600:
+        from models.elo import current_ratings
+        _elo_cache["elo"], _elo_cache["at"] = current_ratings(k=20, hca=50, carry=0.6), time.time()
+    return _elo_cache["elo"]
+
+
+def build_picks(home, away, ratings, project_kwargs, market_p_home=None, elo=None):
+    """Every profile's pick for one game, plus the baselines.
+    -> {name: {"home": bool, "p_home": float|None, "margin": float|None}}"""
+    picks = {}
+    for pname, prof in GAME_PROFILES.items():
+        proj = project_game(home, away, ratings, prof, **(project_kwargs or {}))
+        if proj:
+            picks[pname] = {"home": proj["exp_margin"] > 0,
+                            "p_home": proj["p_home_win"], "margin": proj["exp_margin"]}
+    picks[BASELINE_HOME] = {"home": True, "p_home": None, "margin": None}
+    if elo is not None:
+        p = elo.p_home(home, away)
+        picks[BASELINE_ELO] = {"home": p >= 0.5, "p_home": round(p, 4),
+                               "margin": round(elo.margin(home, away), 1)}
+    if market_p_home is not None and 0.0 < market_p_home < 1.0:
+        picks[BASELINE_MARKET] = {"home": market_p_home >= 0.5,
+                                  "p_home": round(float(market_p_home), 4), "margin": None}
+    return picks
+
+
+def capture_forward_picks(gdate, home, away, ratings, project_kwargs=None,
+                          market_p_home=None, elo=None):
+    """Freeze the picks for a game that has NOT started. First write wins: once a
+    game is captured (or graded), later calls change nothing. Returns True if
+    this call stored it."""
+    key = f"{gdate}|{away} @ {home}"
+    data = _fwd_load()
+    if key in data["pending"] or key in data["graded_keys"]:
+        return False
+    if elo is None:
+        try:
+            elo = _elo_now()
+        except Exception:
+            elo = None
+    picks = build_picks(home, away, ratings, project_kwargs, market_p_home, elo)
+    if len(picks) <= 1:                     # nothing but the trivial baseline
+        return False
+    data["pending"][key] = {"date": gdate, "home": home, "away": away,
+                            "picks": picks}
+    _fwd_save(data)
+    return True
+
+
+def grade_forward(finished_games):
+    """Grade frozen games that are now final. `finished_games` is
+    [(game_id, date, home, away, home_pts, away_pts), ...]. Returns how many."""
+    data = _fwd_load()
+    if not data["pending"]:
+        return 0
+    by_key = {f"{g[1]}|{g[3]} @ {g[2]}": g for g in finished_games}
+    graded = 0
+    for key in list(data["pending"]):
+        g = by_key.get(key)
+        if not g:
+            continue
+        home_won = g[4] > g[5]
+        for name, pick in data["pending"][key]["picks"].items():
+            rec = data["record"].setdefault(name, {"correct": 0, "total": 0, "brier_sum": 0.0, "brier_n": 0})
+            rec["total"] += 1
+            rec["correct"] += 1 if pick["home"] == home_won else 0
+            if pick.get("p_home") is not None:
+                rec["brier_sum"] += (pick["p_home"] - (1.0 if home_won else 0.0)) ** 2
+                rec["brier_n"] += 1
+        data["graded_keys"].append(key)
+        del data["pending"][key]
+        graded += 1
+    if graded:
+        _fwd_save(data)
+    return graded
+
+
+def get_forward_scoreboard():
+    """[(name, correct, total, pct, brier)] best win% first; baselines included."""
+    rows = []
+    for name, r in _fwd_load()["record"].items():
+        t = r["total"]
+        rows.append((name, r["correct"], t, (r["correct"] / t) if t else 0.0,
+                     (r["brier_sum"] / r["brier_n"]) if r.get("brier_n") else None))
+    rows.sort(key=lambda x: (-x[3], -x[2]))
+    return rows
+
+
+def forward_pending_count():
+    return len(_fwd_load()["pending"])
 
 
 if __name__ == "__main__":

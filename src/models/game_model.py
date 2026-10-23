@@ -140,9 +140,11 @@ def _norm_ppf(p):
 def _star_tax_points(out_list):
     """Total point-value a team loses from its OUT/DOUBTFUL players.
 
-    Each absent player's spread value ≈ ppg × 0.20, clamped to 1-7 points (a
-    ~25-ppg star ≈ 5, a bench player ≈ 1), which matches the market's rule of
-    thumb that a top star is worth 4-7 points to the spread. DOUBTFUL counts
+    Each absent player's spread value ≈ ppg × 0.20, clamped to 0.25-7 points (a
+    ~25-ppg star ≈ 5, a 10-ppg rotation player ≈ 2, a deep-bench player well
+    under a point), which matches the market's rule of thumb that a top star is
+    worth 4-7 points to the spread. The floor used to be a full point, so five
+    end-of-bench players listed out docked a team 5 points. DOUBTFUL counts
     half (the player might suit up). Returns (points, [reasons])."""
     if not out_list:
         return 0.0, []
@@ -160,7 +162,7 @@ def _star_tax_points(out_list):
             weight = 0.25   # ~50/50 to play — small partial dock
         else:
             continue
-        val = max(1.0, min(7.0, (ppg or 0.0) * 0.20)) * weight
+        val = max(0.25, min(7.0, (ppg or 0.0) * 0.20)) * weight
         total += val
         _lbl = ("OUT" if weight >= 1.0
                 else "DOUBTFUL" if weight >= 0.5 else "QUESTIONABLE")
@@ -323,6 +325,15 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
     w_form = _w.get("form", 1.0)          # recent hot/cold
     w_match = _w.get("matchup", 1.0)      # positional + playtype edge
 
+    # `games_played` arrives as the LEAGUE-WIDE count of finished games this
+    # season (that is what the dashboard and the market snapshots store). The
+    # fade constants below (K_FORM, K_MKT) are meant PER TEAM, so convert: every
+    # game involves two of the 30 teams, so the average team has played
+    # 2 * league_games / 30. Left unconverted, 14 league games (two nights in)
+    # read as "14 games each" and handed the model 54% of the market blend when
+    # each team had played one or two games.
+    team_games_played = (games_played or 0) * 2.0 / 30.0
+
     # Pace: amplify/dampen the game's distance from league average by pace_gain.
     raw_pace = ((h.get("pace") or LEAGUE_PACE)
                 + (a.get("pace") or LEAGUE_PACE)) / 2.0
@@ -386,10 +397,9 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
         # eFG%: ~0.8 margin pts per 1 percentage-point edge (heaviest factor).
         if hf.get("efg") is not None and af.get("efg") is not None:
             ff_pts += (hf["efg"] - af["efg"]) * 100.0 * 0.8 * w_shoot
-        # TOV%: fewer turnovers = more shots. A 1pt TOV% edge ~0.5 margin pts;
-        # LOWER is better, so the sign is reversed (away_tov - home_tov).
-        if hf.get("tov_pct") is not None and af.get("tov_pct") is not None:
-            ff_pts += (af["tov_pct"] - hf["tov_pct"]) * 100.0 * 0.5 * w_ball
+        # TOV%: scored ONCE, by _tov_battle() below (~0.6 margin pts per 1pt
+        # TOV% edge, capped). It used to be added here as well from the very
+        # same tov_pct, so every turnover edge counted twice (~1.1 pts per 1pt).
         # OREB%: extra possessions. ~0.4 margin pts per 1pt OREB% edge.
         if hf.get("oreb_pct") is not None and af.get("oreb_pct") is not None:
             ff_pts += (hf["oreb_pct"] - af["oreb_pct"]) * 100.0 * 0.4 * w_reb
@@ -419,8 +429,7 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
         # +11.9 vs PHI -7.7 flipped PHI@NYK). Shrink form toward 0 until a real
         # sample exists: weight = g/(g+K_FORM). Full strength ~2 weeks in.
         K_FORM = 6.0
-        if games_played is not None and games_played >= 0:
-            form_pts *= games_played / (games_played + K_FORM)
+        form_pts *= team_games_played / (team_games_played + K_FORM)
         margin += form_pts
 
     # ---- REAL RECORD (W-L) strength ---------------------------------------
@@ -482,7 +491,7 @@ def project_game(home_abbr, away_abbr, ratings, profile=None, injuries=None,
     market_used = False
     if market_p_home is not None and 0.0 < market_p_home < 1.0:
         K_MKT = 12.0
-        w_model = games_played / (games_played + K_MKT)
+        w_model = team_games_played / (team_games_played + K_MKT)
         p_home = w_model * p_home + (1 - w_model) * market_p_home
         market_used = True
         # Re-derive a margin consistent with the blended probability, so the

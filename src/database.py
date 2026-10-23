@@ -29,7 +29,16 @@ def nba_today() -> str:
         from zoneinfo import ZoneInfo
         return _d.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     except Exception:
-        return (_d.datetime.utcnow() - _d.timedelta(hours=5)).date().isoformat()
+        now_utc = _d.datetime.now(_d.timezone.utc)
+        return (now_utc - _d.timedelta(hours=5)).date().isoformat()
+
+def nba_season_start_year() -> int:
+    """Start year of the NBA season in play (seasons tip off in October, so
+    Jan-Sep belongs to the season that began the previous calendar year)."""
+    today = nba_today()
+    year, month = int(today[:4]), int(today[5:7])
+    return year if month >= 10 else year - 1
+
 
 # The database file lives in the project's data/ folder.
 # This file is src/database.py, so the project root is ONE level up from src/.
@@ -133,6 +142,27 @@ def get_connection():
     return conn
 
 
+def ensure_indexes(conn=None):
+    """Create the indexes the readers rely on (safe to repeat).
+
+    load_player_history() looks players up BY NAME and the team/defense builders
+    scan BY DATE; with only the (player_id, game_id) primary key those were full
+    scans of ~250K rows on every call."""
+    own = conn is None
+    if own:
+        conn = get_connection()
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_pgl_name_date "
+        "ON player_game_logs(player_name, game_date)",
+        "CREATE INDEX IF NOT EXISTS idx_pgl_date ON player_game_logs(game_date)",
+        "CREATE INDEX IF NOT EXISTS idx_pgl_game ON player_game_logs(game_id)",
+    ):
+        conn.execute(sql)
+    conn.commit()
+    if own:
+        conn.close()
+
+
 def init_schema():
     """Create our tables if they don't already exist.
 
@@ -205,6 +235,7 @@ def init_schema():
             UNIQUE(player_id, game_date, prop_type, line, model_name)
         )
         """)
+    ensure_indexes(conn)
     conn.commit()
     conn.close()
     print(f"Database ready at: {DB_PATH}")

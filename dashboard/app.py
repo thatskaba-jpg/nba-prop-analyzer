@@ -38,6 +38,8 @@ from models.prediction_tracker import (  # noqa: E402
     log_prediction, grade_pending, tracking_summary,
 )
 from odds.ev_engine import evaluate_prop  # noqa: E402
+from odds.market_anchor import anchor_to_market  # noqa: E402
+from models.fitted_projection import slate_p_over  # noqa: E402
 try:
     from odds.sportsgameodds_client import player_prop_odds as _sgo_prop, has_key as _sgo_has, todays_player_keys as _sgo_today, all_player_props as _sgo_all  # noqa: E402
 except Exception:
@@ -91,9 +93,12 @@ def sgo_prop_odds(name, prop_type):
             hit = _bdl_prop(name, prop_type)
             if hit:
                 return hit
-        except _BDLErr:
+        except (_BDLErr, OSError):      # OSError covers a dropped connection/timeout
             pass
-    return _sgo_prop(name, prop_type) if _sgo_has() else None
+    try:
+        return _sgo_prop(name, prop_type) if _sgo_has() else None
+    except OSError:                     # no network: show "no odds", not a stack trace
+        return None
 
 
 def sgo_today():
@@ -102,9 +107,12 @@ def sgo_today():
             k = _bdl_today()
             if k:
                 return k
-        except _BDLErr:
+        except (_BDLErr, OSError):
             pass
-    return _sgo_today() if _sgo_has() else set()
+    try:
+        return _sgo_today() if _sgo_has() else set()
+    except OSError:
+        return set()
 try:
     from collect.goat_data import (  # noqa: E402
         season_average, advanced_stats, standings_map, team_ratings_map,
@@ -1272,7 +1280,13 @@ def scan_today_value(_config, stats, edge_threshold, max_players):
                 res = analyze(_config, pid, stat, line, cutoff, hist, ctx)
                 if res["projection"] is None:
                     continue
-                ev = evaluate_prop(res["p_over"], res["p_under"],
+                # Judge value on the market-anchored probability: the model
+                # alone hasn't beaten the posted line (see market_edge_test).
+                _anch = anchor_to_market(res["p_over"], res["p_under"],
+                                         int(o_over), int(o_under),
+                                         p_over_raw=res.get("p_over_raw"),
+                                         p_over_fitted=slate_p_over(name, stat, line))
+                ev = evaluate_prop(_anch["p_over"], _anch["p_under"],
                                    int(o_over), int(o_under),
                                    edge_threshold=edge_threshold)
                 # Pick = which side the PROJECTION lands on vs the line. This is
@@ -1759,6 +1773,26 @@ st.markdown("""
      price across 8 books. 💣</p>
 </div>
 """, unsafe_allow_html=True)
+
+# Data health: say so out loud instead of quietly running on stale data.
+try:
+    import pipeline_status as _ps
+    from database import nba_today as _nba_today
+    _hc = get_connection()
+    _last_game = _hc.execute("SELECT MAX(game_date) FROM player_game_logs").fetchone()[0]
+    _hc.close()
+    _today = _nba_today()
+    _stale, _stale_msg = _ps.freshness(_last_game, _today, max_gap_days=4)
+    if _stale and _today[5:7] not in ("07", "08", "09"):    # not the offseason
+        st.warning(f"⚠ {_stale_msg}")
+    _broken = [k for k in _ps.failed_steps()
+               if k in ("daily:games", "daily:lines", "intraday:lines")]
+    if _broken:
+        st.warning("⚠ The last update had problems with: " + ", ".join(_broken)
+                   + ". Prices or box scores may be out of date. "
+                     "Details: data/pipeline_status.json")
+except Exception:
+    pass
 
 tabM, tab1, tab5, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
                                   "🔍 Analyze a Prop",
@@ -2400,7 +2434,13 @@ else:
             pct = int(round(chance * 100))
 
             # Expected value for the side we lean, using the entered odds.
-            ev = evaluate_prop(res["p_over"], res["p_under"],
+            # Judge value on the market-anchored probability: the model alone
+            # hasn't beaten the posted line (see market_edge_test).
+            _anch = anchor_to_market(res["p_over"], res["p_under"],
+                                     int(odds_over), int(odds_under),
+                                     p_over_raw=res.get("p_over_raw"),
+                                     p_over_fitted=slate_p_over(sel, prop_type, line))
+            ev = evaluate_prop(_anch["p_over"], _anch["p_under"],
                                int(odds_over), int(odds_under))
             ev_pick = ev["ev_over_pct"] if lean == "OVER" else ev["ev_under_pct"]
             ev_odds = odds_over if lean == "OVER" else odds_under
@@ -2439,6 +2479,12 @@ else:
                     f'<div style="background:{ev_bg}; padding:8px 20px; '
                     f'border-top:1px solid #2a3142; color:#e6e9ef; font-size:.9rem;">'
                     f'{ev_label}.</div>')
+            if _anch["anchored"] and ev_pick is not None:
+                ev_strip = ev_strip.replace(
+                    ".</div>",
+                    '. <span style="color:#93a1b5;font-size:.78rem;">'
+                    "Blended with the market line: our model alone hasn't "
+                    "beaten it yet.</span></div>", 1)
 
             # --- The bet slip ---
             bio = cached_bio(sel)
@@ -2576,12 +2622,18 @@ else:
                            "prediction. Small samples swing fast.")
 
             if st.button("📒 Log this prediction to my track record"):
-                log_prediction(
+                _logged = log_prediction(
                     pid, sel, cutoff, prop_type, line, res["projection"],
                     lean.lower(), round(chance, 4), opponent=opp,
                     model_name=config.name)
-                st.success("Logged. It'll be graded automatically once that "
-                           "game is in the data — see the Track Record tab.")
+                if _logged:
+                    st.success("Logged. It'll be graded automatically once "
+                               "that game is in the data — see the Track "
+                               "Record tab.")
+                else:
+                    st.info("Already logged. Your first entry for this exact "
+                            "prop is kept, so the track record can't be "
+                            "rewritten after the fact.")
 
             with st.expander("Why — factor breakdown"):
                 st.write(f"Base projection (recent + season form): "
@@ -3053,6 +3105,15 @@ else:
         m3.metric("Still pending", summary["pending"],
                   help="Logged but the game hasn't been played / isn't in the "
                        "data yet.")
+        if summary.get("void"):
+            st.caption(f"{summary['void']} logged prediction(s) were voided "
+                       "because the player didn't play (books refund those), "
+                       "so they count as neither a hit nor a miss.")
+        if summary.get("stale"):
+            st.caption(f"⚠ {summary['stale']} pending prediction(s) are more "
+                       "than 3 days old with no box score, so their game date "
+                       "was probably wrong and they will never grade. Clear them "
+                       "with src/models/clear_predictions.py.")
 
         if summary["recent"]:
             import pandas as pd
@@ -3067,6 +3128,47 @@ else:
         else:
             st.info("No graded predictions yet. Analyze props and log them "
                     "(from the Analyze tab), then grade once their games finish.")
+
+        # ---- Forward test: bets the two frozen rules would have made ---------
+        st.markdown("---")
+        st.markdown("#### 🧪 Paper-trading record (forward test)")
+        st.caption("Every time the intraday job runs it logs the bets two fixed "
+                   "rules would make at the price available right then, then "
+                   "grades them after the game (players who don't play are "
+                   "voided). This can't be backfilled or edited, so it's the "
+                   "honest test of whether any 'value' flag is real.")
+        try:
+            from models.paper_bets import summary as _pb_summary
+            _pb = _pb_summary()
+        except Exception:
+            _pb = []
+        if not _pb:
+            st.info("Nothing logged yet. Run src/collect/intraday.py on a game "
+                    "day (see the README) and bets will appear here.")
+        else:
+            _names = {"model_only_v1": "Model only (the old value flags)",
+                      "anchor_shop_v1": "Market-anchored + best price"}
+
+            def _pct(x, signed=False):
+                if x is None:
+                    return "—"
+                return f"{100 * x:+.1f}%" if signed else f"{100 * x:.1f}%"
+            _tbl = [{
+                "Rule": _names.get(s["rule"], s["rule"]),
+                "Logged": s["logged"], "Settled": s["settled"], "Void": s["void"],
+                "Hit rate": _pct(s["hit"]),
+                "ROI per bet": (_pct(s["roi"], True) + (
+                    f" ±{100 * s['roi_ci95']:.1f}" if s["roi_ci95"] is not None else "")),
+                "Beat the closing price": _pct(s["pct_beat_close"]),
+                "Avg closing-line value": _pct(s["avg_clv_prob"], True),
+            } for s in _pb]
+            import pandas as pd
+            st.dataframe(pd.DataFrame(_tbl), use_container_width=True,
+                         hide_index=True)
+            st.caption("ROI is per 1-unit bet with a 95% interval; until the "
+                       "interval clears zero over a few hundred settled bets, "
+                       "treat it as luck. 'Beat the closing price' is the faster "
+                       "signal: a real edge gets a better price than the final one.")
 
     # ----------------------- Value Scanner ----------------------- #
     with tab4:
@@ -3438,7 +3540,11 @@ else:
                     st.caption(
                         "Ranked by **win %** — straight-up winners picked "
                         "right, most wins on top. " + _best_txt
-                        + "Small samples early, so give it time to settle.")
+                        + "With a few dozen games the gaps between profiles are "
+                          "noise (they mostly pick the same winners), and this "
+                          "table re-grades with today's ratings. Judge them by "
+                          "the frozen-picks table below, which includes simple "
+                          "baselines.")
                     # Export: per-game, per-preset picks so you can see exactly
                     # what each profile selected and whether it hit.
                     try:
@@ -3458,6 +3564,35 @@ else:
                 else:
                     st.caption("No finished games in the feed yet — fills in as "
                                "games go final.")
+
+            # ---- Frozen picks: the honest moneyline test ---------------------- #
+            with st.expander("🧊 Frozen picks — locked before tip, with baselines"):
+                try:
+                    import pandas as _pdf
+                    from models.profile_scoreboard import (get_forward_scoreboard,
+                                                           forward_pending_count)
+                    _fw = get_forward_scoreboard()
+                    if _fw:
+                        st.dataframe(_pdf.DataFrame(
+                            [{"Pick source": n, "Record": f"{c}-{t-c}",
+                              "Win %": (f"{round(c / t * 100)}%" if t else "—"),
+                              "Games": t,
+                              "Brier (lower is better)": (round(b, 3) if b is not None else "—")}
+                             for n, c, t, pct, b in _fw]),
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Nothing graded yet. Picks are locked when you "
+                                   "open this tab for a game that hasn't started, "
+                                   "and graded once it goes final.")
+                    st.caption(
+                        f"{forward_pending_count()} game(s) locked and waiting for "
+                        "a final. Read each profile against the baselines: on "
+                        "1,558 held-out past games, always-home won 55% and Elo "
+                        "(results only) won 68%. A profile that can't beat Elo "
+                        "here isn't adding anything. Needs a few hundred games "
+                        "before the gaps mean anything.")
+                except Exception as _fe:
+                    st.caption(f"(Frozen picks unavailable: {_fe})")
 
             # ---- Separate SPREAD (ATS) track record -------------------- #
             with st.expander("🎯 Spread track record — ATS (our pick vs the "
@@ -3586,6 +3721,23 @@ else:
                                             _mkt_ph, _games_played)
                     except Exception:
                         pass
+                # ---- Frozen picks: lock EVERY profile's pick (and the simple
+                # baselines) before tip, so the scoreboard can't be flattered by
+                # re-grading with ratings that already include the result.
+                if proj and is_open:
+                    try:
+                        from models.profile_scoreboard import capture_forward_picks
+                        capture_forward_picks(
+                            str(gl_date), home, away, ratings,
+                            dict(injuries=team_inj, four_factors=_gl_four_factors,
+                                 team_form=_gl_team_form, playtype=_gl_playtype,
+                                 positional=_gl_positional, market_p_home=_mkt_ph,
+                                 games_played=_games_played,
+                                 home_edges=_gl_home_edges,
+                                 record_strength=_gl_record, team_api=_gl_team_api),
+                            market_p_home=_mkt_ph)
+                    except Exception:
+                        pass
 
                 # ---- QUICK PICK for the collapsed title: who we'd back ----
                 # Only on OPEN games — a pick on a live/final game isn't
@@ -3658,12 +3810,27 @@ else:
                     else:
                         _any = ml_pick or sp_pick
                         quick = " · ✅ value" if _any else " · no edge"
+                        # Informational badge: model favors the OPPOSITE side
+                        # from the book, but the gap is small (not suppressed).
+                        # We flag it so you know it's a contrarian coin-flip —
+                        # the pick is NOT changed.
+                        _disagree_note = ""
+                        if _mkt_gap is not None and _book_home is not None:
+                            _book_fav = home if _book_home >= 0.5 else away
+                            if _book_fav != _fav:
+                                _disagree_note = (
+                                    f"  \n⚠️ **Heads up — disagrees with the "
+                                    f"market:** the book leans **{_book_fav}**, "
+                                    f"we lean **{_fav}** (close call). Early "
+                                    f"season, lean to the market if unsure.")
+                                quick = " · ⚠️ vs market"
                         pick_block = (
                             "💰 **Moneyline:** "
                             + (f"✅ {ml_pick}" if ml_pick
                                else f"— no edge (model leans {_fav})")
                             + "  \n📊 **Spread:** "
-                            + (f"✅ {sp_pick}" if sp_pick else "— no edge"))
+                            + (f"✅ {sp_pick}" if sp_pick else "— no edge")
+                            + _disagree_note)
                 # (No extra text for live/final games — the FINAL/LIVE tag and,
                 #  for final games, the grade below already say the status.)
 

@@ -36,6 +36,7 @@ HONESTY RULES BAKED IN
 
 import sys
 import math
+import random
 from pathlib import Path
 
 import pandas as pd
@@ -66,10 +67,16 @@ def _eligible_player_games(prop_type: str, start_date: str, end_date: str,
     # Players ranked by how many games they have, to focus on real rotation players.
     players = conn.execute(
         "SELECT player_id, player_name, COUNT(*) c FROM player_game_logs "
-        "GROUP BY player_id HAVING c >= ? ORDER BY c DESC",
+        "GROUP BY player_id HAVING c >= ?",
         (min_prior_games + 10,),
     ).fetchall()
     conn.close()
+    # A RANDOM spread of regulars, a few games each. (It used to take players
+    # in order of most games played and stop at max_games, so the whole test was
+    # a handful of iron-man veterans.)
+    players = sorted(players, key=lambda p: p["player_id"])
+    random.Random(7).shuffle(players)
+    per_player = max(10, max_games // 40)
 
     stat_expr = {
         "points": "points", "rebounds": "rebounds", "assists": "assists",
@@ -86,6 +93,10 @@ def _eligible_player_games(prop_type: str, start_date: str, end_date: str,
             continue
         window = hist[(hist["game_date"] >= start_date) &
                       (hist["game_date"] <= end_date)]
+        if len(window) > per_player:
+            window = window.sample(per_player,
+                                   random_state=int(p["player_id"]) % (2 ** 31)
+                                   ).sort_values("game_date")
         for _, g in window.iterrows():
             if produced >= max_games:
                 break
@@ -122,7 +133,10 @@ def _metrics(records):
     """Compute accuracy, Brier, log loss, ROI, calibration bins from a list of
     dicts each having: won (bool/None), prob (P of the picked side), hit_over
     (bool: did it actually go over), p_over."""
-    graded = [r for r in records if r["won"] is not None]  # drop pushes
+    # Walk the bets in DATE order so the equity curve and max drawdown describe
+    # a real bankroll path (the records arrive player by player otherwise).
+    graded = sorted((r for r in records if r["won"] is not None),
+                    key=lambda r: r.get("date", ""))  # drop pushes
     n = len(graded)
     if n == 0:
         return None
@@ -216,8 +230,10 @@ def run_backtest(config: ModelConfig, prop_type: str = "points",
             s = _stat_series(prior, prop_type)
             if len(s) == 0:
                 continue
-            # Half-point line at the season avg so there are no pushes.
-            line = round(float(s.mean())) + 0.5
+            # Nearest half-point to the season avg (so there are no pushes).
+            # round(mean) + 0.5 sat half a point ABOVE the mean on average,
+            # which quietly favored unders.
+            line = round(float(s.mean()) - 0.5) + 0.5
 
         # Season of this game (for the per-season breakdown).
         season = prior.iloc[-1]["season"] if len(prior) else "?"
@@ -236,7 +252,7 @@ def run_backtest(config: ModelConfig, prop_type: str = "points",
             picked, won, prob, push = scored
             model_records.append({
                 "won": won, "prob": prob, "p_over": res["p_over"],
-                "hit_over": actual > line, "season": season,
+                "hit_over": actual > line, "season": season, "date": gdate,
             })
 
         # The dumb baseline (season-average projection, same line).
@@ -246,7 +262,7 @@ def run_backtest(config: ModelConfig, prop_type: str = "points",
             _, bwon, bprob, _ = bscored
             base_records.append({
                 "won": bwon, "prob": bprob, "p_over": b["p_over"],
-                "hit_over": actual > line, "season": season,
+                "hit_over": actual > line, "season": season, "date": gdate,
             })
 
         evaluated += 1

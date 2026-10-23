@@ -228,6 +228,12 @@ def confidence_label(feats: dict) -> str:
         return "none (no prior games)"
     if n < MIN_GAMES_FOR_CONFIDENCE:
         return f"low (only {n} prior games)"
+    # Long history can be mostly LAST season's: don't call it solid when this
+    # season's sample is a handful of games (roles and rotations change).
+    this_season = feats.get("games_this_season")
+    if this_season is not None and this_season < 5:
+        return (f"low (only {this_season} games this season; leaning on "
+                f"last season's {n - this_season})")
     std = feats.get("std_last_10")
     if std is not None and feats.get("avg_last_10"):
         # High variability relative to the average = less confident.

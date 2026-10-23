@@ -6,5 +6,53 @@
   "2026-10-22|DEN @ OKC": {
     "market_p_home": 0.7376,
     "games_played": 14
+  },
+  "2026-10-23|ATL @ CHA": {
+    "market_p_home": 0.4387,
+    "games_played": 14
+  },
+  "2026-10-23|CHI @ MIL": {
+    "market_p_home": 0.5144,
+    "games_played": 14
+  },
+  "2026-10-23|DAL @ IND": {
+    "market_p_home": 0.6597,
+    "games_played": 14
+  },
+  "2026-10-23|DET @ MIA": {
+    "market_p_home": 0.4955,
+    "games_played": 14
+  },
+  "2026-10-23|HOU @ SAS": {
+    "market_p_home": 0.6496,
+    "games_played": 14
+  },
+  "2026-10-23|LAC @ LAL": {
+    "market_p_home": 0.7664,
+    "games_played": 14
+  },
+  "2026-10-23|MEM @ GSW": {
+    "market_p_home": 0.5851,
+    "games_played": 14
+  },
+  "2026-10-23|MIN @ ORL": {
+    "market_p_home": 0.4675,
+    "games_played": 14
+  },
+  "2026-10-23|NOP @ UTA": {
+    "market_p_home": 0.5541,
+    "games_played": 14
+  },
+  "2026-10-23|NYK @ BOS": {
+    "market_p_home": 0.5526,
+    "games_played": 14
+  },
+  "2026-10-23|POR @ SAC": {
+    "market_p_home": 0.2736,
+    "games_played": 14
+  },
+  "2026-10-23|TOR @ WAS": {
+    "market_p_home": 0.3429,
+    "games_played": 14
   }
 }

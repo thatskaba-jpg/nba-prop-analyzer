@@ -170,15 +170,30 @@ def pregame_features(player_id: int, prop_type: str, cutoff_date: str,
         "avg_last_10": tail_mean(10),
         "avg_last_20": tail_mean(20),
         "season_avg": float(stat.mean()),
-        "std_last_10": float(stat.tail(10).std(ddof=0)) if n >= 2 else None,
+        # Sample std (ddof=1). ddof=0 under-states the spread of a short window
+        # (5 games: variance 20% too small), which made the over/under
+        # probabilities too confident.
+        "std_last_10": float(stat.tail(10).std(ddof=1)) if n >= 2 else None,
         # Full-sample spread: a more stable estimate of game-to-game volatility,
         # used by the overdispersion-aware probability model (Negative Binomial).
         # Prefer the last ~25 games so it reflects the current role, not seasons
         # of old data, but needs enough games to be meaningful.
-        "std_recent": float(stat.tail(25).std(ddof=0)) if n >= 5 else (
-            float(stat.std(ddof=0)) if n >= 2 else None),
+        "std_recent": float(stat.tail(25).std(ddof=1)) if n >= 5 else (
+            float(stat.std(ddof=1)) if n >= 2 else None),
         "avg_minutes_last_10": float(prior["minutes"].tail(10).mean()),
     }
+
+    # How many of those prior games belong to the season the cutoff falls in.
+    # Early in a season most of the history is LAST season's, so this is what
+    # tells the confidence label (and the reader) how thin this year's sample is.
+    # NBA seasons are labelled by their start year and tip off in October.
+    try:
+        cut = pd.to_datetime(cutoff_date)
+        cut_season = str(cut.year if cut.month >= 10 else cut.year - 1)
+        feats["games_this_season"] = int(
+            (prior["season"].astype(str) == cut_season).sum())
+    except Exception:
+        feats["games_this_season"] = None
 
     # --- Rate-model features (per-minute production + projected minutes) ------
     # A deeper projection path: stat = per-minute rate x projected minutes x
