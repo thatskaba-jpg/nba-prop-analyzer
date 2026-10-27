@@ -167,7 +167,7 @@ def _id_to_name():
     return {r["player_id"]: r["player_name"] for r in rows}
 
 
-def all_player_props(date_iso=None):
+def _all_player_props_uncached(date_iso=None):
     """Every player's over/under prop lines for a date (default today), as
     {name_key: {prop_type: {line, odds_over, odds_under, books}}}.
 
@@ -180,8 +180,18 @@ def all_player_props(date_iso=None):
     # player_id -> prop_type -> {lines, over, under, books}
     acc = defaultdict(lambda: defaultdict(
         lambda: {"lines": [], "over": [], "under": [], "books": set()}))
-    for gid in _todays_game_ids(date_iso):
-        for p in _get_all("v2/odds/player_props", {"game_id": gid}):
+    # Fetch every game's props in PARALLEL (each is its own paginated call;
+    # doing 12 games one after another was ~9 seconds).
+    from concurrent.futures import ThreadPoolExecutor
+    gids = _todays_game_ids(date_iso)
+    fetched = []
+    if gids:
+        with ThreadPoolExecutor(max_workers=min(6, len(gids))) as ex:
+            fetched = list(ex.map(
+                lambda g: _get_all("v2/odds/player_props", {"game_id": g}),
+                gids))
+    for rows in fetched:
+        for p in rows:
             prop = _PROP_MAP.get(p.get("prop_type"))
             if not prop:
                 continue
@@ -225,6 +235,24 @@ def all_player_props(date_iso=None):
                                if b["under"] else None),
                 "books": len([x for x in b["books"] if x]),
             }
+    return out
+
+
+_PROPS_CACHE = {}
+_PROPS_TTL = 60    # seconds: live prices; 3 callers share one pull per minute
+
+
+def all_player_props(date_iso=None):
+    """Every player's over/under prop lines for a date (cached 5 min so the
+    Analyze tab's day list and the Value Board share ONE pull)."""
+    import time as _t
+    key = date_iso or ""
+    hit = _PROPS_CACHE.get(key)
+    if hit and _t.time() - hit[0] < _PROPS_TTL:
+        return hit[1]
+    out = _all_player_props_uncached(date_iso)
+    if out:                      # never cache an empty/failed pull
+        _PROPS_CACHE[key] = (_t.time(), out)
     return out
 
 

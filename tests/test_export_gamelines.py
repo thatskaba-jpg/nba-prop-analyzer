@@ -80,7 +80,7 @@ class ExportTests(unittest.TestCase):
 
     def test_top_ml_ranks_by_win_chance_and_shows_price(self):
         es = [dict(e) for e in ENTRIES]
-        es[1].update(ml_pick="HOU +135")          # price edge on this game
+        es[1].update(ml_pick="SAS to win", ml_team="SAS")   # edge on the winner
         ml = ex.top_ml(es)
         self.assertEqual([m["Winner"] for m in ml],
                          ["Boston Celtics", "San Antonio Spurs"])  # LAL skipped
@@ -89,11 +89,43 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(ml[0]["Price edge"], "none")
         self.assertEqual(ml[1]["Price edge"], "✅ value")
 
+    def test_underdog_value_is_not_labelled_as_favorite_value(self):
+        es = [dict(e) for e in ENTRIES]
+        es[1].update(ml_pick="HOU +135 (underdog value)", ml_team="HOU")
+        ml = ex.top_ml(es)
+        row = [m for m in ml if m["Winner"] == "San Antonio Spurs"][0]
+        self.assertEqual(row["Price edge"], "value on Houston Rockets")
+        self.assertNotIn("good price", ex.to_text(ex.build_rows(es), "Fri", ml=ml)
+                         .split("San Antonio Spurs -160")[1].split("\n")[0])
+
     def test_text_includes_ml_section(self):
         rows = ex.build_rows(ENTRIES)
         t = ex.to_text(rows, "Fri", ml=ex.top_ml(ENTRIES))
         self.assertIn("Moneyline: most likely winners", t)
         self.assertIn("1. Boston Celtics -270 — 62% to win", t)
+
+    def test_top_alts(self):
+        es = [dict(e) for e in ENTRIES]
+        es[1]["alt"] = {"side": "away", "line": 7.5, "cover": 0.66, "take_at": -167}
+        alts = ex.top_alts(es)
+        self.assertEqual(alts[0]["Pick"], "Houston Rockets +7.5")
+        self.assertEqual(alts[0]["Cover"], "66%")
+        self.assertEqual(alts[0]["Take at"], "-167")
+        t = ex.to_text(ex.build_rows(es), "Fri", alts=alts)
+        self.assertIn("Alt spreads worth a look", t)
+
+    def test_csv_rows_are_tidy(self):
+        es = [dict(e) for e in ENTRIES]
+        es[1].update(sp_pick="HOU +3.5 to +4", alt={"side": "away", "line": 4.5,
+                                               "cover": .57, "take_at": -116})
+        rows = ex.csv_rows(es)
+        self.assertEqual(list(rows[1]), ["Time", "Game", "Moneyline pick", "Spread",
+                                         "Alt spread", "Book lines"])
+        self.assertEqual(rows[1]["Spread"], "Houston Rockets +3.5 to +4 (value)")
+        self.assertEqual(rows[1]["Alt spread"], "Houston Rockets +4.5 (take at -116 or better)")
+        self.assertEqual(rows[0]["Spread"], "no edge")
+        self.assertEqual(rows[2]["Spread"], "skip (book disagrees)")
+        self.assertIn("(62%)", rows[0]["Moneyline pick"])
 
     def test_empty(self):
         self.assertIn("No open games", ex.to_text([], "today"))

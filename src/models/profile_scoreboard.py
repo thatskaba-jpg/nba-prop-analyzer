@@ -45,18 +45,28 @@ def _mkt_load():
     return {}
 
 
-def capture_market_prob(gdate, home, away, market_p_home, games_played):
-    """Snapshot the de-vigged market home-win prob for a game at bet-time.
-    First write wins (the number we actually saw pre-tip); idempotent. Stores
-    games_played too, so the backtest reproduces the exact blend weight."""
+def capture_market_prob(gdate, home, away, market_p_home, games_played,
+                        extra=None, overwrite=False):
+    """Log the book's de-vigged home-win prob for a game, FOR THE RECORD ONLY
+    (grading and backtests). Tonight's picks never read this: they use the live
+    odds feed directly.
+
+    overwrite=True keeps the LATEST pre-tip line (the dashboard calls it on
+    every view of an OPEN game, so when tip-off passes the stored number is the
+    closing line). Skips the disk write when nothing changed."""
     if market_p_home is None or not (0.0 < market_p_home < 1.0):
         return
     key = f"{gdate}|{away} @ {home}"
     data = _mkt_load()
-    if key in data:
+    p = round(float(market_p_home), 4)
+    if key in data and not overwrite:
         return
-    data[key] = {"market_p_home": round(float(market_p_home), 4),
-                 "games_played": int(games_played or 0)}
+    if key in data and data[key].get("market_p_home") == p and \
+            (not extra or all(data[key].get(k) == v for k, v in extra.items())):
+        return                                   # unchanged: no disk write
+    data[key] = {"market_p_home": p, "games_played": int(games_played or 0)}
+    if extra:                       # e.g. spread/ML/total, kept for later checks
+        data[key].update(extra)
     try:
         _MKT_PATH.parent.mkdir(parents=True, exist_ok=True)
         _MKT_PATH.write_text(json.dumps(data, indent=2))
@@ -64,10 +74,33 @@ def capture_market_prob(gdate, home, away, market_p_home, games_played):
         pass
 
 
+_MKT_TRIED = set()     # dates we already asked the odds feed about (this run)
+
+
+def _fetch_market_for_date(gdate):
+    """Ask the odds API for this date's lines and save them. Tried at most once
+    per date per process, so grading never hammers the API."""
+    if gdate in _MKT_TRIED:
+        return
+    _MKT_TRIED.add(gdate)
+    try:
+        from collect.backfill_game_lines import backfill_date_live
+        backfill_date_live(gdate)
+    except Exception:
+        pass
+
+
 def _market_for_game(gdate, home, away):
-    """(market_p_home, games_played_at_capture) for a game, or (None, 0) if we
-    never captured it. Lets the backtest reproduce the live market anchor."""
-    snap = _mkt_load().get(f"{gdate}|{away} @ {home}")
+    """(market_p_home, games_played_at_capture) for a game, or (None, 0).
+
+    Uses the saved line when there is one. If not, it asks the odds API for that
+    date (and saves the answer), so older games get graded against the book
+    too. (None, 0) only if the API has no line for that game either."""
+    key = f"{gdate}|{away} @ {home}"
+    snap = _mkt_load().get(key)
+    if not snap:
+        _fetch_market_for_date(gdate)
+        snap = _mkt_load().get(key)
     if not snap:
         return None, 0
     return snap.get("market_p_home"), snap.get("games_played", 0)
@@ -412,7 +445,7 @@ def scoreboard_detail(season=2026, days_back=30):
                                 team_api=_team_api(season))
             if not proj:
                 continue
-            picked_home = proj["exp_margin"] > 0
+            picked_home = proj["p_home_win"] >= 0.5
             pick = home if picked_home else away
             pm = abs(proj["exp_margin"])
             hit = (picked_home == home_won)

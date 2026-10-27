@@ -82,6 +82,40 @@ class BuildRosterTests(unittest.TestCase):
         self.assertIn("Out", txt)
 
 
+class PrevStartersTests(unittest.TestCase):
+    def test_last_game_starters_used_when_healthy(self):
+        # Sixth Man (22 min) started last game; the model by minutes would not.
+        prev = ["Sixth Man", "Guard One", "Guard Two", "Wing One", "Big One"]
+        r = gr.build_roster([], ROSTER, MINUTES, INJ, prev_starters=prev)
+        self.assertEqual(r["basis"], "last game")
+        self.assertEqual({e["name"] for e in r["starters"]}, set(prev))
+
+    def test_out_starter_replaced_by_next_in_minutes(self):
+        prev = ["Hurt Star", "Guard One", "Guard Two", "Wing One", "Big One"]
+        r = gr.build_roster([], ROSTER, MINUTES, INJ, prev_starters=prev)
+        names = {e["name"] for e in r["starters"]}
+        self.assertNotIn("Hurt Star", names)
+        self.assertEqual(len(names), 5)
+        self.assertIn("Big Two", names)           # next-highest healthy minutes
+
+    def test_no_prev_falls_back_to_minutes(self):
+        r = gr.build_roster([], ROSTER, MINUTES, INJ)
+        self.assertEqual(r["basis"], "minutes")
+
+    def test_confirmed_wins_over_prev(self):
+        feed = [{"name": "Big One", "position": "C", "starter": True}]
+        r = gr.build_roster(feed, ROSTER, MINUTES, {}, prev_starters=["Guard One"])
+        self.assertTrue(r["confirmed"])
+        self.assertEqual([e["name"] for e in r["starters"]], ["Big One"])
+
+    def test_table_labels_basis(self):
+        r1 = gr.build_roster([], ROSTER, MINUTES, INJ, prev_starters=["Guard One"])
+        r2 = gr.build_roster([], ROSTER, MINUTES, INJ)
+        t = gr.lineup_table("A", "B", r1, r2)
+        self.assertIn("projected (same as last game)", t)
+        self.assertIn("projected (by minutes)", t)
+
+
 class CompactTests(unittest.TestCase):
     def test_compact_shows_starters_and_notable_outs_only(self):
         r = gr.build_roster([], ROSTER, MINUTES, INJ)

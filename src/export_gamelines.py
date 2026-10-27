@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from team_names import fullify, full  # noqa: E402
+from bet_text import fmt_line  # noqa: E402
 
 DISCLAIMER = ("Model picks for fun, not guarantees. In past-game tests this "
               "model has NOT beaten the sportsbook lines, so treat a pick as "
@@ -28,6 +29,14 @@ def _pick_text(pick, skip, none_text):
     if skip:
         return "skip (model disagrees with the market)"
     return fullify(pick) if pick else none_text
+
+
+def _lean_text(e):
+    """'lean X +3.5 (no edge)' when there is a spread but no value pick."""
+    sl = e.get("sp_lean")
+    if sl:
+        return f"lean {full(sl['team'])} {fmt_line(sl['line'])} (no edge)"
+    return "no spread posted" if e.get("spread_home") is None else "no edge"
 
 
 def build_rows(entries):
@@ -48,7 +57,8 @@ def build_rows(entries):
             "Away": full(away), "Home": full(home),
             "Moneyline pick": _pick_text(e.get("ml_pick"), e.get("skip"),
                                          f"no edge ({lean})"),
-            "Spread pick": _pick_text(e.get("sp_pick"), e.get("skip"), "no edge"),
+            "Spread pick": _pick_text(e.get("sp_pick"), e.get("skip"),
+                                      _lean_text(e)),
             "Model favorite": full(e["fav"]),
             "Model margin": round(abs(e["margin"]), 1),
             "Win chance away": f"{e['p_away_win'] * 100:.0f}%"
@@ -92,6 +102,40 @@ def top_picks(entries, limit=5):
     return out
 
 
+def top_alts(entries, limit=6):
+    """Alternate spreads worth a look: for each game with a spread value pick,
+    the safer line our numbers like (see odds.alt_spreads.good_alt)."""
+    out = []
+    for e in entries:
+        a = e.get("alt")
+        if e.get("skip") or not a:
+            continue
+        team = e["home"] if a["side"] == "home" else e["away"]
+        out.append({"Pick": f"{full(team)} {a['line']:+g}",
+                    "Game": f"{full(e['away'])} @ {full(e['home'])}",
+                    "Tip-off": e.get("tip") or "",
+                    "Cover": f"{a['cover'] * 100:.0f}%",
+                    "Take at": f"{a['take_at']:+d}" if a.get("take_at") is not None else "—",
+                    "_p": a["cover"]})
+    out.sort(key=lambda r: -r["_p"])
+    for r in out:
+        r.pop("_p")
+    return out[:limit]
+
+
+def _ml_edge_text(e, winner_abbr):
+    """'✅ value' only when the value bet is on THIS winner; if the value is on
+    the other side say so; else 'none'."""
+    vt = e.get("ml_team")
+    if not vt and e.get("ml_pick"):
+        vt = winner_abbr              # old entries without ml_team
+    if not vt:
+        return "none"
+    if vt == winner_abbr:
+        return "✅ value"
+    return f"value on {full(vt)}"
+
+
 def top_ml(entries, limit=5):
     """Moneyline view: the games where the model is most sure who wins, with
     that team's price. Value is flagged only when the PRICE is also good (a
@@ -110,7 +154,7 @@ def top_ml(entries, limit=5):
             "Tip-off": e.get("tip") or "",
             "Win chance": f"{max(e['p_home_win'], e['p_away_win']) * 100:.0f}%",
             "Moneyline": f"{int(price):+}" if price is not None else "—",
-            "Price edge": "✅ value" if e.get("ml_pick") else "none"})
+            "Price edge": _ml_edge_text(e, team)})
     return out
 
 
@@ -129,7 +173,7 @@ def top_leans(entries, limit=3):
     return out
 
 
-def to_text(rows, day_label, top=None, ml=None):
+def to_text(rows, day_label, top=None, ml=None, alts=None):
     """Message-friendly text. Only games with a pick are headlined first."""
     if not rows:
         return f"NBA game lines — {day_label}\nNo open games with lines yet."
@@ -154,10 +198,17 @@ def to_text(rows, day_label, top=None, ml=None):
         for m in ml:
             lines.append(f"  {m['Rank']}. {m['Winner']} {m['Moneyline']} — "
                          f"{m['Win chance']} to win"
-                         + (" ✅ good price" if m["Price edge"] != "none" else "")
+                         + (" ✅ good price" if m["Price edge"].startswith("✅") else "")
                          + f"  [{m['Game']}, {m['Tip-off']}]")
         lines.append("")
-    if top or ml:
+    if alts:
+        lines.append("🔀 Alt spreads worth a look")
+        for a in alts:
+            lines.append(f"  • {a['Pick']} — {a['Cover']} cover by our numbers; "
+                         f"take it at {a['Take at']} or better  "
+                         f"[{a['Game']}, {a['Tip-off']}]")
+        lines.append("")
+    if top or ml or alts:
         lines.append("All open games")
         lines.append("")
     for r in rows:
@@ -181,3 +232,34 @@ def to_csv(rows):
     w.writeheader()
     w.writerows(rows)
     return buf.getvalue()
+
+
+def csv_rows(entries):
+    """Tidy rows for the shareable CSV: time, game, moneyline pick with win
+    chance, spread, alt spread, and the book's lines (6 columns, was 10)."""
+    out = []
+    for e in entries:
+        fav = e["fav"]
+        pfav = max(e["p_home_win"], e["p_away_win"])
+        sp = (fullify(e["sp_pick"]) + " (value)") if e.get("sp_pick") else _lean_text(e)
+        if e.get("skip"):
+            sp = "skip (book disagrees)"
+        a = e.get("alt")
+        alt = "—"
+        if a and not e.get("skip"):
+            t = e["home"] if a["side"] == "home" else e["away"]
+            alt = f"{full(t)} {fmt_line(a['line'])} (take at {a['take_at']:+d} or better)"
+        mk = []
+        if e.get("ml_home") is not None and e.get("ml_away") is not None:
+            mk.append(f"ML {e['away']} {int(e['ml_away']):+d} / {e['home']} {int(e['ml_home']):+d}")
+        if e.get("spread_home") is not None:
+            mk.append(f"Spread {e['home']} {fmt_line(e['spread_home'])}")
+        if e.get("total") is not None:
+            mk.append(f"Total {e['total']:g}")
+        out.append({"Time": e.get("tip") or "",
+                    "Game": f"{full(e['away'])} @ {full(e['home'])}",
+                    "Moneyline pick": f"{full(fav)} ({pfav*100:.0f}%)"
+                                      + (" ✅ value" if (e.get("ml_team") == fav) else ""),
+                    "Spread": sp, "Alt spread": alt,
+                    "Book lines": " · ".join(mk)})
+    return out

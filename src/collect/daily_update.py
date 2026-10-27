@@ -14,7 +14,8 @@ cron mail / your terminal will tell you instead of the app silently going stale.
   2. Backfill opponent + home/away, refresh injuries (balldontlie + ESPN),
      rosters, per-game team pace and player advanced stats.
   3. Capture real prop prices, grade settled ones (DNPs voided).
-  4. Retrain the fitted projection if it is more than a week old.
+  4. Retrain the fitted projection when there are new games, if it passes a
+     quality gate (models/retrain.py).
   5. Grade pending predictions and paper bets.
 
 For prices and news THROUGH the day (the forward test), see intraday.py.
@@ -134,14 +135,14 @@ def run():
     print("\n[4/5] Fitted projection...")
 
     def retrain():
-        if not _model_is_stale():
-            return "model is fresh"
-        from models.fitted_projection import build_features, fit, save
-        table = build_features()
-        last = table["game_date"].max()
-        cutoff = (date.fromisoformat(last) + timedelta(days=1)).isoformat()
-        save(fit(table, cutoff), trained_through=last)
-        return f"retrained through {last}"
+        # Retrain whenever there are new games, but only keep the new fit if it
+        # beats a plain 10-game average on the last two weeks (see retrain.py).
+        from models.retrain import retrain_if_better
+        r = retrain_if_better()
+        if r["action"] == "error":
+            raise RuntimeError(r["reason"])
+        print(f"  Fitted model: {r['action']}: {r['reason']}")
+        return f"{r['action']}: {r['reason']}"
     step("daily:fitted_model", retrain)
 
     print("\n[5/5] Grading pending predictions and paper bets...")

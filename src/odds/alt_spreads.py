@@ -43,3 +43,69 @@ def ladder(margin, main_spread_home, std, cover_fn, steps=3, edge=0.03):
             "need_away": american_from_prob(min(pa - edge, 0.999)),
         })
     return rows
+
+
+def good_alt(margin, main_spread_home, std, cover_fn, side, min_cover=0.65,
+             max_juice=-250, steps=8):
+    """The alternate spread worth a look for the side we already like.
+
+    `side` is "home" or "away" (the side of our spread value pick). Among the
+    half-point lines, take the one with the SMALLEST cushion (best payout) whose
+    cover chance is still >= `min_cover` and whose fair price is no worse than
+    `max_juice` (so we never recommend paying -400 for a "safe" line).
+    Returns {side, line, cover, fair, take_at} or None.
+    """
+    best = None
+    for r in ladder(margin, main_spread_home, std, cover_fn, steps=steps):
+        p = r["p_home"] if side == "home" else r["p_away"]
+        line = r["home_line"] if side == "home" else r["away_line"]
+        fair = r["fair_home"] if side == "home" else r["fair_away"]
+        need = r["need_home"] if side == "home" else r["need_away"]
+        if p < min_cover or fair is None or fair < max_juice:
+            continue
+        if best is None or p < best["cover"]:
+            best = {"side": side, "line": line, "cover": p, "fair": fair,
+                    "take_at": need}
+    return best
+
+
+BOOK_VIG_HALF = 0.024      # half of a typical -110/-110 hold, in probability
+
+
+def rank_alts(margin, main_spread_home, std, cover_fn, side, top=3,
+              min_cover=0.55, max_juice=-250, steps=8):
+    """Alternate spreads for `side` ranked best-first.
+
+    We can't see a book's alt prices, so we ESTIMATE them: assume the book
+    prices every alt line off ITS OWN margin (= minus the posted spread, same
+    spread of outcomes as ours) plus the usual hold. For each half-point line:
+        est_price_prob = book's chance of covering + BOOK_VIG_HALF
+        est_edge       = our cover chance - est_price_prob   (probability pts)
+    Best = biggest est_edge. The main line itself (within a quarter point) is
+    skipped, since that is the normal spread bet, not an alt.
+    Each row: {side, line, cover, est_prob, est_price, est_edge, take_at, star}.
+    `take_at` is the price needed for a 3-point edge by our numbers.
+    """
+    mkt_margin = -main_spread_home
+    out = []
+    for r in ladder(margin, main_spread_home, std, cover_fn, steps=steps):
+        h = r["home_line"]
+        if abs(h - main_spread_home) < 0.3:
+            continue                                  # that's the main line
+        ours = r["p_home"] if side == "home" else r["p_away"]
+        mph, mpa = cover_fn(mkt_margin, h, std)
+        book = (mph if side == "home" else mpa) + BOOK_VIG_HALF
+        fair = r["fair_home"] if side == "home" else r["fair_away"]
+        need = r["need_home"] if side == "home" else r["need_away"]
+        if ours < min_cover or book >= 0.995 or fair is None or fair < max_juice:
+            continue
+        out.append({"side": side,
+                    "line": h if side == "home" else r["away_line"],
+                    "cover": ours, "est_prob": book,
+                    "est_price": american_from_prob(book),
+                    "est_edge": ours - book, "take_at": need, "star": False})
+    out.sort(key=lambda x: -x["est_edge"])
+    out = out[:top]
+    if out and out[0]["est_edge"] > 0:
+        out[0]["star"] = True
+    return out

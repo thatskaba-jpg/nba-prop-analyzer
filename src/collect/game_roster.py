@@ -51,15 +51,20 @@ def _entry(name, position, status, minutes):
             "status": status or "", "minutes": minutes}
 
 
-def build_roster(lineup_rows, roster_rows, minutes, injuries) -> dict:
-    """Return {'confirmed': bool, 'starters': [...], 'bench': [...]}.
+def build_roster(lineup_rows, roster_rows, minutes, injuries,
+                 prev_starters=None) -> dict:
+    """Return {'confirmed': bool, 'basis': str, 'starters': [...], 'bench': [...]}.
 
-    lineup_rows  [{name, position, starter(bool)}] for THIS team from the feed
-                 (empty/None when not posted).
-    roster_rows  [{name, position}] current roster from the DB.
-    minutes      {name: recent avg minutes}.
-    injuries     {name: status string}.
-    Each output entry: {name, position, status, minutes}.
+    lineup_rows    [{name, position, starter(bool)}] for THIS team from the feed
+                   (empty/None when not posted).
+    roster_rows    [{name, position}] current roster from the DB.
+    minutes        {name: recent avg minutes}.
+    injuries       {name: status string}.
+    prev_starters  names that started this team's LAST game (or None). Coaches
+                   keep lineups from game to game, so this beats guessing from
+                   minutes; anyone ruled OUT is replaced by the next-highest
+                   minutes player.
+    basis: 'confirmed' | 'last game' | 'minutes'.
     """
     mins = {norm(k): v for k, v in (minutes or {}).items()}
     inj = {norm(k): v for k, v in (injuries or {}).items()}
@@ -81,15 +86,29 @@ def build_roster(lineup_rows, roster_rows, minutes, injuries) -> dict:
         # Bench: healthy by minutes first, OUT players at the very end.
         bench = (by_minutes([e for e in bench if not is_out(e["status"])])
                  + by_minutes([e for e in bench if is_out(e["status"])]))
-        return {"confirmed": True, "starters": starters, "bench": bench}
+        return {"confirmed": True, "basis": "confirmed",
+                "starters": starters, "bench": bench}
 
     players = [mk(r["name"], r.get("position")) for r in (roster_rows or [])]
     healthy = by_minutes([e for e in players if not is_out(e["status"])])
     out = by_minutes([e for e in players if is_out(e["status"])])
-    starters = healthy[:5]
+    starters, basis = [], "minutes"
+    if prev_starters:
+        want = {norm(n) for n in prev_starters}
+        starters = [e for e in healthy if norm(e["name"]) in want][:5]
+        if starters:
+            basis = "last game"
+    taken = {norm(e["name"]) for e in starters}
+    for e in healthy:                       # fill empty slots by minutes
+        if len(starters) >= 5:
+            break
+        if norm(e["name"]) not in taken:
+            starters.append(e)
+            taken.add(norm(e["name"]))
+    rest = [e for e in healthy if norm(e["name"]) not in taken]
     starters.sort(key=lambda e: _pos_rank(e["position"]))
-    return {"confirmed": False, "starters": starters,
-            "bench": healthy[5:] + out}
+    return {"confirmed": False, "basis": basis, "starters": starters,
+            "bench": rest + out}
 
 
 def load_team_context(conn, team: str, games: int = 10):
@@ -214,3 +233,28 @@ def compact_markdown(team: str, roster: dict) -> str:
     line1 += "  \n🚫 Out: " + (", ".join(_short(e["name"]) for e in outs)
                               if outs else "none")
     return line1
+
+
+def lineup_table(away: str, home: str, roster_away: dict, roster_home: dict) -> str:
+    """Away | home table: starters and who is out, one row each."""
+    def starters(r):
+        bits = []
+        for e in r["starters"]:
+            mark = "" if not e["status"] else (" 🚫" if is_out(e["status"]) else " ⚠️")
+            bits.append(f"{_short(e['name'])}{mark}")
+        return ", ".join(bits) or "—"
+
+    def outs(r):
+        o = [e for e in r["bench"] if is_out(e["status"]) and (e["minutes"] or 0) >= 15][:4]
+        return ", ".join(_short(e["name"]) for e in o) or "none"
+
+    def kind(r):
+        if r["confirmed"]:
+            return "✅ confirmed"
+        return ("projected (same as last game)" if r.get("basis") == "last game"
+                else "projected (by minutes)")
+    return "\n".join([
+        f"| | **{away}** | **{home}** |", "|---|---|---|",
+        f"| Lineup | {kind(roster_away)} | {kind(roster_home)} |",
+        f"| Starters | {starters(roster_away)} | {starters(roster_home)} |",
+        f"| Out | {outs(roster_away)} | {outs(roster_home)} |"])

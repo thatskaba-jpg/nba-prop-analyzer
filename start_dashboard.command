@@ -49,7 +49,10 @@ echo ""
 
 # Run Streamlit in the foreground. --server.headless true stops Streamlit from
 # ALSO trying to open a tab (we handle that above), avoiding a double tab.
+# --server.address 127.0.0.1: listen on THIS Mac only. The dashboard has no
+# login, so it must not be open to the whole Wi-Fi.
 "$STREAMLIT" run "$HERE/dashboard/app.py" \
+  --server.address 127.0.0.1 \
   --server.port "$PORT" \
   --server.headless true
 STATUS=$?

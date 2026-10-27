@@ -28,6 +28,21 @@ import streamlit as st
 os.environ["BDL_FAIL_FAST"] = "1"
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
+
+# A long-running Streamlit process keeps OLD copies of helper modules in memory
+# after their files change, which caused "cannot import name ..." errors. These
+# small helper modules are re-read on every page run (cheap), so edits and new
+# functions are picked up without restarting the dashboard.
+import importlib as _il
+for _m in ("team_names", "bet_text", "odds.spread_hint", "odds.alt_spreads",
+           "csv_tables", "xlsx_min", "workbooks", "guard_rails",
+           "export_gamelines", "collect.game_roster", "update_runner",
+           "collect.espn_api", "collect.nba_api"):
+    if _m in sys.modules:
+        try:
+            _il.reload(sys.modules[_m])
+        except Exception:
+            pass
 from database import get_connection  # noqa: E402
 # Apply non-destructive schema migrations (ADD COLUMN) on startup so new stat
 # columns (e.g. threes_att/fga/fta) exist before any read. Safe + idempotent.
@@ -89,6 +104,8 @@ def sgo_all_props():
         except _BDLErr as e:
             if "rate limit" in str(e).lower() and not _sgo_has():
                 raise  # no backup available: let the dashboard show the wait message
+        except Exception:
+            pass       # network/parse error: fall through to the backup
     # Backup: SportsGameOdds (also used when balldontlie is rate-limited, so the
     # GOAT API isn't hammered).
     try:
@@ -105,11 +122,11 @@ def sgo_prop_odds(name, prop_type):
             hit = _bdl_prop(name, prop_type)
             if hit:
                 return hit
-        except (_BDLErr, OSError):      # OSError covers a dropped connection/timeout
+        except Exception:               # any feed error: show "no odds", not a stack trace
             pass
     try:
         return _sgo_prop(name, prop_type) if _sgo_has() else None
-    except OSError:                     # no network: show "no odds", not a stack trace
+    except Exception:
         return None
 
 
@@ -119,11 +136,11 @@ def sgo_today():
             k = _bdl_today()
             if k:
                 return k
-        except (_BDLErr, OSError):
+        except Exception:
             pass
     try:
         return _sgo_today() if _sgo_has() else set()
-    except OSError:
+    except Exception:
         return set()
 try:
     from collect.goat_data import (  # noqa: E402
@@ -916,7 +933,7 @@ def cached_games_on_date(date_iso):
             return []
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=60)
 def cached_prop_keys_for_date(date_iso):
     """Normalized name-keys of players who have OVER/UNDER props posted for a
     date (balldontlie). Empty when books haven't posted props yet (future days)
@@ -932,7 +949,7 @@ def cached_prop_keys_for_date(date_iso):
         return set()
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=60)
 def cached_all_props():
     """Bulk prop lines for today, cached 15 min so a full evening of research
     barely touches the API (and rarely trips the free-tier rate limit). Lines
@@ -1086,7 +1103,41 @@ def auto_refresh_injuries(max_age_s=900):
     stt = _inj_refresh_state()
     if _t.time() - stt["last"] >= max_age_s:
         stt["last"] = _t.time()       # set first: no pile-up on slow feeds
-        refresh_injuries_now()
+        # Background thread: the page must NOT wait on the injury feeds. The
+        # new data shows up on the next interaction after it finishes.
+        import threading as _th
+        _th.Thread(target=refresh_injuries_now, daemon=True).start()
+
+
+def injuries_short():
+    """'🩹 Injuries 8:35 AM' (or '— none yet')."""
+    try:
+        import datetime as _d
+        from zoneinfo import ZoneInfo
+        c = get_connection()
+        last = c.execute("SELECT MAX(fetched_at) FROM injuries").fetchone()[0]
+        c.close()
+        if not last:
+            return "🩹 Injuries: none yet"
+        t = _d.datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_d.timezone.utc).astimezone(ZoneInfo("America/New_York"))
+        return "🩹 Injuries " + t.strftime("%-I:%M %p")
+    except Exception:
+        return "🩹 Injuries: ?"
+
+
+def lineups_short(day_iso):
+    """'📡 Lineups checked 2:04 AM' or '📡 Lineups: not checked'."""
+    try:
+        import datetime as _d
+        from zoneinfo import ZoneInfo
+        st_ = _lineup_store()
+        if not st_ or st_.get("day") != day_iso:
+            return "📡 Lineups: not checked"
+        t = _d.datetime.fromtimestamp(st_["ts"], ZoneInfo("America/New_York"))
+        return "📡 Lineups " + t.strftime("%-I:%M %p")
+    except Exception:
+        return "📡 Lineups: ?"
 
 
 def injuries_updated_caption():
@@ -1128,6 +1179,17 @@ def fetch_day_lineups(day_iso):
     return out
 
 
+def fetch_prev_starters(day_iso):
+    """{TEAM: [names]} who started each team's last completed game (live feed)."""
+    from collect.prev_starters import prev_starters
+    from collect.goat_data import lineups
+    from odds.balldontlie_props import _get_all
+    return prev_starters(
+        day_iso,
+        lambda d: _get_all("v1/games", {"dates[]": d, "per_page": 100}),
+        lineups)
+
+
 @st.cache_resource
 def _lineup_store():
     """Process-wide, no expiry: the last "check all live lineups" result.
@@ -1146,10 +1208,15 @@ def check_all_lineups(day_iso):
         pass
     res = _with_deadline(lambda: fetch_day_lineups(day_iso), seconds=20,
                          default=None)
-    if res is None:
+    prev = _with_deadline(lambda: fetch_prev_starters(day_iso), seconds=25,
+                          default=None)
+    if res is None and prev is None:
         return False, ("Couldn't reach the lineups feed. Kept the previous "
                        "result (if any); try again in a minute.")
-    _lineup_store().update({"day": day_iso, "ts": _t.time(), "rows": res})
+    store = _lineup_store()
+    store.update({"day": day_iso, "ts": _t.time(),
+                  "rows": res if res is not None else store.get("rows", {}),
+                  "prev": prev if prev is not None else store.get("prev", {})})
     return True, ""
 
 
@@ -1161,13 +1228,15 @@ def lineup_check_status(day_iso):
     st_ = _lineup_store()
     if not st_ or st_.get("day") != day_iso:
         return {}, ("📡 Lineups not checked yet. Press **Check all live "
-                    "lineups + injuries**; until then each game shows a projected lineup.")
+                    "lineups + injuries**; until then each game shows a lineup projected by minutes.")
     when = _d.datetime.fromtimestamp(st_["ts"], ZoneInfo("America/New_York"))
     rows = st_["rows"]
     posted = sum(1 for v in rows.values() if v)
+    nprev = len(st_.get("prev", {}))
     return rows, (f"📡 Lineups checked {when.strftime('%-I:%M %p ET')} · "
                   f"{posted // 2 if posted else 0} game(s) with a posted "
-                  f"lineup. Kept until you check again.")
+                  f"lineup · last-game starters for {nprev} teams. Kept until "
+                  f"you check again.")
 
 
 @st.cache_data(show_spinner=False, ttl=21600)
@@ -1213,6 +1282,8 @@ def render_game_rosters(away, home, day_iso):
         full = st.checkbox("👥 Full roster (bench, minutes)",
                            key=f"roster_full_{key}")
         stored, _ = lineup_check_status(day_iso)
+        _store = _lineup_store()
+        prev_all = _store.get("prev", {}) if _store.get("day") == day_iso else {}
         conn = get_connection()
         try:
             ctx = {t: load_team_context(conn, t) for t in (away, home)}
@@ -1223,11 +1294,12 @@ def render_game_rosters(away, home, day_iso):
             roster_rows, minutes, injuries = ctx[team]
             rosters[team] = build_roster(
                 lineup_rows_for_team(stored.get(team, []), team),
-                roster_rows, minutes, injuries)
+                roster_rows, minutes, injuries,
+                prev_starters=prev_all.get(team))
         if not full:
             from team_names import fullify as _nm2
-            for col, team in zip(st.columns(2), (away, home)):
-                col.markdown(_nm2(compact_markdown(team, rosters[team])))
+            st.markdown(_nm2(_gr.lineup_table(away, home, rosters[away],
+                                              rosters[home])))
             return
         cols = st.columns(2)
         any_est = False
@@ -1268,17 +1340,29 @@ def primary_defender_note(opp_abbr, player_group, season):
     return None
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+def _pull_times():
+    """When each live feed was last pulled: {"lines": epoch}. Lives in a plain
+    module because worker threads (which do the pulling) can't use st.cache_*."""
+    import live_state
+    return live_state.PULLED
+
+
+@st.cache_data(show_spinner=False, ttl=60)
 def cached_game_lines(date=None):
-    """Game-lines map, cached 15 min AND bounded to a short deadline. A live odds
-    fetch that's slow degrades to {} instead of freezing the page."""
+    """LIVE game lines from the odds API, re-pulled at most once a minute (so
+    the picks never run on a stale number) and bounded by a short deadline: a
+    slow feed degrades to {} instead of freezing the page."""
     def _build():
         from odds.game_lines import build_game_lines_map
-        return build_game_lines_map(date)
+        import time as _t
+        out = build_game_lines_map(date)
+        if out:
+            _pull_times()["lines"] = _t.time()
+        return out
     return _with_deadline(_build, seconds=10, default={}) or {}
 
 
-@st.cache_data(show_spinner=False, ttl=300)
+@st.cache_data(show_spinner=False, ttl=60)
 def cached_schedule(date=None):
     """Today's full schedule with each game's status, cached 5 min and bounded
     to a short deadline. Returns {matchup "AWAY @ HOME": status_str}. Used to
@@ -1361,7 +1445,7 @@ def _tip_label(iso):
         return ""
 
 
-@st.cache_data(show_spinner=False, ttl=300)
+@st.cache_data(show_spinner=False, ttl=60)
 def cached_scores(date=None):
     """Final/live scores per game, cached 5 min. Returns
     {matchup "AWAY @ HOME": {"home": int, "away": int, "final": bool}} so the
@@ -1426,6 +1510,13 @@ def season_games_count(hist):
         return int((hist["game_date"] >= start).sum())
     except Exception:
         return 0
+
+
+@st.cache_resource
+def _update_runner():
+    """One background daily-update runner shared by every browser session."""
+    from update_runner import UpdateRunner
+    return UpdateRunner()
 
 
 @st.cache_resource
@@ -1894,6 +1985,65 @@ def _apply_recommended():
     _stage_factor_set("simple" if mode_simple else "weighted", rec)
 
 
+# --------------------------------------------------------------------------- #
+# PRESETS + SAVED MODELS
+#
+# Streamlit Cloud has an EPHEMERAL filesystem (and our DB is re-downloaded on
+# boot), so a disk/DB "save" would silently vanish on restart. Instead we keep
+# saved models in session_state (durable for the session) and offer JSON
+# download/upload so a model survives across sessions — honest about the
+# platform, and portable. Built-in presets are always available.
+# --------------------------------------------------------------------------- #
+
+# Each preset: (mode, factors, one-line description). Simple mode unless noted.
+PRESETS = {
+    "⭐ Balanced (recommended)": ("simple", dict(RECOMMENDED_SIMPLE),
+        "A bit of everything — every factor on, sensibly weighted. The solid "
+        "all-purpose default."),
+    "🔥 Trusts recent form": ("simple", {
+        "player_last_n_avg": "high", "minutes_trend": "high",
+        "usage_and_pace": "medium", "rest_days": "medium",
+        "home_away_split": "low"},
+        "Leans on how the player's been playing lately — form, minutes and "
+        "role, with a nod to home/away and rest."),
+    "🛡️ Focuses on the matchup": ("simple", {
+        "opponent_defense_by_position": "high", "opponent_team_rating": "high",
+        "player_vs_team": "medium", "player_last_n_avg": "medium",
+        "game_environment": "medium", "opponent_defense": "low"},
+        "Weights who they're facing — opponent defense by position, team "
+        "rating/pace, and the player's own history vs this opponent."),
+    "🩹 Chases injury news": ("simple", {
+        "teammate_injuries": "high", "usage_and_pace": "high",
+        "confirmed_lineup": "high", "player_last_n_avg": "medium",
+        "injury": "medium", "minutes_trend": "medium"},
+        "Backs opportunity — teammates out, confirmed lineups and a usage "
+        "bump, on top of the player's recent production and injury status."),
+    "⚖️ Exact-percent (advanced)": ("weighted", dict(RECOMMENDED_WEIGHTED),
+        "Precise percentage weights across every factor that add up to 100 "
+        "(power users)."),
+}
+
+
+def _apply_factor_set(mode, factors, name=None):
+    """Stage a (mode, factors) set; applied at the top of the next run before
+    the builder widgets render (callers must st.rerun() after calling)."""
+    _stage_factor_set(mode, factors, name=name)
+
+
+def _current_model_dict():
+    """Serialize the current builder state to a portable dict."""
+    simple_mode = st.session_state.get("simple_mode", True)
+    mode = "simple" if simple_mode else "weighted"
+    factors = {}
+    for key in FACTORS:
+        if st.session_state.get(f"on_{key}"):
+            factors[key] = (st.session_state.get(f"i_{key}", "medium")
+                            if simple_mode
+                            else int(st.session_state.get(f"w_{key}", 20)))
+    return {"name": st.session_state.get("model_name", "My Model"),
+            "mode": mode, "factors": factors}
+
+
 # Seed defaults on FIRST load only (runs before widgets, so a direct write is
 # safe here). If the URL carries a saved preset (survives Cloud reloads), load
 # THAT instead of the recommended default — so the user's choice sticks.
@@ -2023,63 +2173,6 @@ except Exception:
     pass
 
 
-# --------------------------------------------------------------------------- #
-# PRESETS + SAVED MODELS
-#
-# Streamlit Cloud has an EPHEMERAL filesystem (and our DB is re-downloaded on
-# boot), so a disk/DB "save" would silently vanish on restart. Instead we keep
-# saved models in session_state (durable for the session) and offer JSON
-# download/upload so a model survives across sessions — honest about the
-# platform, and portable. Built-in presets are always available.
-# --------------------------------------------------------------------------- #
-
-# Each preset: (mode, factors, one-line description). Simple mode unless noted.
-PRESETS = {
-    "⭐ Balanced (recommended)": ("simple", dict(RECOMMENDED_SIMPLE),
-        "A bit of everything — every factor on, sensibly weighted. The solid "
-        "all-purpose default."),
-    "🔥 Trusts recent form": ("simple", {
-        "player_last_n_avg": "high", "minutes_trend": "high",
-        "usage_and_pace": "medium", "rest_days": "medium",
-        "home_away_split": "low"},
-        "Leans on how the player's been playing lately — form, minutes and "
-        "role, with a nod to home/away and rest."),
-    "🛡️ Focuses on the matchup": ("simple", {
-        "opponent_defense_by_position": "high", "opponent_team_rating": "high",
-        "player_vs_team": "medium", "player_last_n_avg": "medium",
-        "game_environment": "medium", "opponent_defense": "low"},
-        "Weights who they're facing — opponent defense by position, team "
-        "rating/pace, and the player's own history vs this opponent."),
-    "🩹 Chases injury news": ("simple", {
-        "teammate_injuries": "high", "usage_and_pace": "high",
-        "confirmed_lineup": "high", "player_last_n_avg": "medium",
-        "injury": "medium", "minutes_trend": "medium"},
-        "Backs opportunity — teammates out, confirmed lineups and a usage "
-        "bump, on top of the player's recent production and injury status."),
-    "⚖️ Exact-percent (advanced)": ("weighted", dict(RECOMMENDED_WEIGHTED),
-        "Precise percentage weights across every factor that add up to 100 "
-        "(power users)."),
-}
-
-
-def _apply_factor_set(mode, factors, name=None):
-    """Stage a (mode, factors) set; applied at the top of the next run before
-    the builder widgets render (callers must st.rerun() after calling)."""
-    _stage_factor_set(mode, factors, name=name)
-
-
-def _current_model_dict():
-    """Serialize the current builder state to a portable dict."""
-    simple_mode = st.session_state.get("simple_mode", True)
-    mode = "simple" if simple_mode else "weighted"
-    factors = {}
-    for key in FACTORS:
-        if st.session_state.get(f"on_{key}"):
-            factors[key] = (st.session_state.get(f"i_{key}", "medium")
-                            if simple_mode
-                            else int(st.session_state.get(f"w_{key}", 20)))
-    return {"name": st.session_state.get("model_name", "My Model"),
-            "mode": mode, "factors": factors}
 
 
 def _save_current_model():
@@ -2091,15 +2184,39 @@ def _save_current_model():
     return True
 
 
+# ---- Phone layout: bigger tap targets, stacked columns, tighter padding ----
+st.markdown("""
+<style>
+@media (max-width: 760px) {
+  .block-container { padding: .6rem .6rem 3rem !important; }
+  /* stack every column group so cards/buttons use the full width */
+  div[data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: .5rem !important; }
+  div[data-testid="stHorizontalBlock"] > div[data-testid="column"],
+  div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+      min-width: 100% !important; flex: 1 1 100% !important; }
+  /* big, thumb-friendly controls */
+  .stButton > button, .stDownloadButton > button {
+      min-height: 3rem !important; font-size: 1rem !important; }
+  div[data-testid="stCheckbox"] label { min-height: 2.6rem; align-items: center; font-size: 1rem; }
+  div[data-testid="stExpander"] summary { padding: .9rem .8rem !important; font-size: 1rem; }
+  /* tabs scroll sideways instead of squeezing */
+  div[data-baseweb="tab-list"] { overflow-x: auto; flex-wrap: nowrap; }
+  button[data-baseweb="tab"] { min-height: 3rem; padding: 0 .9rem; white-space: nowrap; }
+  /* tables: allow sideways scroll rather than crushing columns */
+  div[data-testid="stDataFrame"] { overflow-x: auto; }
+  h1 { font-size: 1.5rem !important; }
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --------------------------------------------------------------------------- #
 # MAIN
 # --------------------------------------------------------------------------- #
 st.markdown("""
 <div class="sb-hero">
-  <span class="sb-pill">💣 NBA · Props &amp; Game Lines</span>
-  <h1>Bomb Vegas <span style="color:var(--muted);font-weight:700;">· Prop Analyzer</span></h1>
-  <p>Player-prop projections, game-line picks and price checks against real
-     sportsbook lines. 💣</p>
+  <span class="sb-pill">💣 NBA</span>
+  <h1>Bomb Vegas</h1>
+  <p>Props and game-line picks against live sportsbook prices.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2122,6 +2239,35 @@ try:
                      "Details: data/pipeline_status.json")
 except Exception:
     pass
+
+# ---- Update data (runs daily_update.py in a separate process) ----
+_ur = _update_runner()
+_uc1, _uc2 = st.columns([1, 2])
+if _uc1.button("🔄 Update data", key="update_data_btn", use_container_width=True,
+               help="Downloads new box scores, injuries, rosters and prop "
+                    "lines, then refreshes this page's numbers. Runs in the "
+                    "background; it can take a few minutes."):
+    if not _ur.start():
+        _uc2.info("An update is already running.")
+if _ur.running():
+    import time as _tu
+    _mins = (_tu.time() - (_ur.started or _tu.time())) / 60.0
+    _uc2.info(f"⏳ Updating… {_ur.progress() or 'starting'} "
+              f"(running {_mins:.0f} min). Tap **Update data** or any button to "
+              "check progress; the page keeps working meanwhile.")
+elif _ur.proc is not None:
+    if _ur.just_finished():
+        try:
+            st.cache_data.clear()          # make every tab re-read fresh data
+        except Exception:
+            pass
+    import datetime as _du
+    _when = _du.datetime.fromtimestamp(_ur.finished or _ur.started or 0)
+    if _ur.returncode() == 0:
+        _uc2.caption(f"✅ Data updated {_when.strftime('%-I:%M %p')}")
+    else:
+        _uc2.warning(f"⚠ The last update had a problem (code "
+                     f"{_ur.returncode()}). Last lines:\n\n{_ur.tail(6)}")
 
 tabM, tab1, tab5, tab4, tab3, tab2 = st.tabs(["⚙️ Build Model",
                                   "🔍 Analyze a Prop",
@@ -2324,9 +2470,6 @@ else:
             # tab active (st.rerun() would reset to the first tab).
             st.session_state["analyze_date"] = _iso
 
-        st.caption("📅 **Days with props posted** (today / tomorrow) — pick "
-                   "one; the player list auto-filters to who's playing that "
-                   "day. Tomorrow appears here once the books post its lines.")
         _cols = st.columns(max(len(_days_with_props), 1))
         for _i, _iso in enumerate(_days_with_props):
             _dt = _da.date.fromisoformat(_iso)
@@ -2342,9 +2485,8 @@ else:
         _games = cached_games_on_date(sel_date)
         if _games:
             _mu = " · ".join(gg["matchup"] for gg in _games)
-            st.caption(f"🏀 **{len(_games)} game"
-                       f"{'s' if len(_games) != 1 else ''}** on {sel_date}:  "
-                       f"{_mu}")
+            st.caption(f"🏀 {len(_games)} game"
+                       f"{'s' if len(_games) != 1 else ''} · {_mu}")
         else:
             st.caption(f"No NBA games scheduled on {sel_date}.")
 
@@ -2352,8 +2494,7 @@ else:
         pkeys = cached_prop_keys_for_date(sel_date)
         if pkeys:
             only_games = st.checkbox(
-                f"Only players with props posted on {sel_date} "
-                f"({len(pkeys)} players)", value=True)
+                f"Only players with props posted ({len(pkeys)})", value=True)
             if only_games:
                 def _nk(s):
                     return "".join(c for c in s.lower() if c.isalnum())
@@ -2364,18 +2505,12 @@ else:
                     st.caption("No roster matches to the posted players — "
                                "showing everyone.")
         elif _games:
-            st.caption("📋 Books haven't posted props for this day yet (they go "
-                       "up closer to tip-off). Showing the full player list — "
-                       "you can still project any player manually.")
+            st.caption("Props aren't posted for this day yet. Showing everyone.")
 
         names = [p[0] for p in players]
         id_of = dict(players)
 
-        st.subheader("Select player, opponent, and line")
-        st.write("The **line** is the sportsbook's number for a stat (e.g. 25.5 "
-                 "points). **Over** = more than the line, **Under** = fewer. "
-                 "Pick who they're facing so the matchup factors apply.")
-        c1, c2 = st.columns([2, 1])
+        c1, c2, c3 = st.columns([3, 1, 2])
         sel = c1.selectbox("Player", names,
                            index=names.index("Mikal Bridges")
                            if "Mikal Bridges" in names else 0)
@@ -2384,13 +2519,12 @@ else:
         if "pending_line" in st.session_state:
             st.session_state["sgo_line"] = st.session_state.pop("pending_line")
         line = c2.number_input("Line", step=0.5, key="sgo_line",
-                               help="The sportsbook's number. Over = above it, "
-                                    "Under = below it. Auto-fill sets this to "
-                                    "the real posted line.")
-        # Stat picker: a click-to-select pill row (not a type-to-search box).
-        prop_type = st.radio("Stat", list(PROP_WORDS.keys()),
-                             format_func=lambda k: PROP_WORDS[k],
-                             horizontal=True, key="prop_type_pick")
+                               help="The sportsbook's number for the stat "
+                                    "(e.g. 25.5 points). Over = above it, Under = "
+                                    "below it. Auto-fills with the real posted line.")
+        prop_type = c3.selectbox("Stat", list(PROP_WORDS.keys()),
+                                 format_func=lambda k: PROP_WORDS[k],
+                                 key="prop_type_pick")
 
         pid = id_of[sel]
         hist = load_player_history(pid)
@@ -2422,6 +2556,16 @@ else:
             default_site_idx = 0
             st.caption(f"{sel} — {my_team or '?'} · no scheduled game, pick below")
 
+        class _Notes:
+            """Collects the matchup context lines so they show up in ONE tidy
+            expander instead of a stack of banners."""
+            def __init__(self):
+                self.items = []
+
+            def caption(self, text, *a, **k):
+                self.items.append(text)
+            info = caption
+        _notes = _Notes()
         # ---- Confirmed lineup (CURRENT roster — post-trade accurate) ----
         # Our team mapping comes from the player's last game log, which can be
         # LAST season's roster after an offseason trade. The lineups feed has
@@ -2438,7 +2582,7 @@ else:
             role = ("🟢 confirmed STARTER" if in_starters
                     else "🪑 off the bench" if in_bench
                     else "⚠️ not in the posted lineup — may be out/traded")
-            st.caption(f"**Tonight's confirmed {my_team} lineup:** "
+            _notes.caption(f"**Tonight's confirmed {my_team} lineup:** "
                        + ", ".join(lu["starters"])
                        + f"  ·  {sel}: {role}")
             if not in_starters and not in_bench:
@@ -2531,7 +2675,7 @@ else:
             ctx["out_teammates"] = mates_out
             _who = ", ".join(f"{m[0]} ({m[2]:.0f} ppg)" if len(m) > 2 else m[0]
                              for m in mates_out[:3])
-            st.info(f"🟢 Teammate(s) out: **{_who}**"
+            _notes.info(f"🟢 Teammate(s) out: **{_who}**"
                     + ("…" if len(mates_out) > 3 else "")
                     + f" — more usage available for {sel}. The projection "
                       "bumps up (weighted by how much each absent teammate "
@@ -2557,11 +2701,11 @@ else:
                       if abs(_s) >= 12 else ""
                 _bits.append(f"{my_team} **{_s:+g}** ({fav}{big})")
             if _bits:
-                st.info("📈 Game line: " + "; ".join(_bits)
+                _notes.info("📈 Game line: " + "; ".join(_bits)
                         + ". Wired into the projection if 'Game Line' is one of "
                           "your factors.")
         if grp:
-            st.caption(f"{sel} is classified as a **{grp}** — the matchup factor "
+            _notes.caption(f"{sel} is classified as a **{grp}** — the matchup factor "
                        f"uses how {opp} defends {grp}s for this stat.")
             # Raw number: how much of THIS stat the opponent allows to this
             # position group, + league rank (1 = allows the most = softest).
@@ -2576,7 +2720,7 @@ else:
                     _soft = ("softest" if _r <= _of // 3
                              else "toughest" if _r > 2 * _of // 3
                              else "middle")
-                    st.caption(
+                    _notes.caption(
                         f"📊 {opp} allows **{_cell['allowed']:g} "
                         f"{PROP_WORDS[prop_type].lower()}** per game to "
                         f"{grp}s — **#{_r} of {_of}** ({_soft} matchup; "
@@ -2594,7 +2738,7 @@ else:
                 _soft = ("lots of giveaways — good for steals" if _ar <= _of // 3
                          else "protects the ball well — fewer steals"
                          if _ar > 2 * _of // 3 else "average")
-                st.caption(
+                _notes.caption(
                     f"🖐️ {opp} coughs up **{_o['allowed']:g} steals/game** to "
                     f"opponents — **#{_ar} of {_of}** ({_soft}).")
 
@@ -2615,7 +2759,7 @@ else:
                 bits.append(f"{a['matchup_3pt_pct']*100:.0f}% from 3")
             if a.get("matchup_ast") is not None:
                 bits.append(f"{a['matchup_ast']:.1f} ast")
-            st.caption(f"🥊 Likely on {sel}: **{_pd_note['name']}** ({opp}) — "
+            _notes.caption(f"🥊 Likely on {sel}: **{_pd_note['name']}** ({opp}) — "
                        f"allows his matchup " + ", ".join(bits)
                        + ". (Likely by position — defenders switch, so this is "
                          "context, not baked into the projection.)")
@@ -2629,28 +2773,20 @@ else:
             except Exception:
                 _et = {}
             if _et:
-                st.caption(
+                _notes.caption(
                     f"🎯 Shooting splits: **{sel}** takes ~{_et['fga_3']:.1f} "
                     f"threes a game, makes ~{_et['fgm_3']:.1f} "
                     f"({_et['fg3_pct']*100:.0f}%). Compare the **makes** to the "
                     "line above. (From last season's distance splits — context, "
                     "not baked into the projection.)")
 
+        if _notes.items:
+            with st.expander(f"🧭 Matchup context ({len(_notes.items)})"):
+                for _t in _notes.items:
+                    st.markdown(_t)
+
         # Odds inputs live here so the EV verdict can render inside the slip.
-        st.markdown("**Sportsbook odds** (optional — enter the real price for "
-                    "an EV check; -110 = risk \\$110 to win \\$100)")
-        with st.expander("❓ What do odds like -194 or +138 mean?"):
-            st.markdown(
-                "American odds tell you **who's favored** and **what a bet pays**:\n\n"
-                "- **Minus (−)** = favorite. The number is what you **risk to win "
-                "\\$100**. −194 → bet \\$194 to win \\$100.\n"
-                "- **Plus (+)** = underdog. The number is what you **win on a "
-                "\\$100 bet**. +138 → bet \\$100 to win \\$138.\n"
-                "- **−110** is the normal \"coin-flip\" price (the book's cut). "
-                "The further from −110, the more lopsided the matchup.\n\n"
-                "Scaled to \\$10: +138 wins \\$13.80; −194 wins about \\$5.15. "
-                "Enter the **over** price and the **under** price and we'll tell "
-                "you if there's real value (positive EV) on either side.")
+        st.markdown("**Odds** (optional)")
 
         # Auto-fill real odds from the odds router (balldontlie primary).
         if sgo_has_key():
@@ -2695,9 +2831,7 @@ else:
                     st.rerun()
                 else:
                     st.session_state["sgo_msg_warn"] = (
-                        "No prop odds posted for this player yet (they appear "
-                        "closer to tip-off, and a book can pull a line). Enter "
-                        "odds by hand, or tap refresh.")
+                        "No odds posted yet. Enter them by hand or tap refresh.")
 
             # Manual refresh — for when a line was suspended and later re-posts.
             if st.button("🎯 Refresh odds"):
@@ -2726,8 +2860,14 @@ else:
             st.session_state["sgo_over"] = st.session_state.pop("pending_over")
         if "pending_under" in st.session_state:
             st.session_state["sgo_under"] = st.session_state.pop("pending_under")
-        odds_over = oc1.number_input("Over odds", step=5, key="sgo_over")
-        odds_under = oc2.number_input("Under odds", step=5, key="sgo_under")
+        _odds_help = ("American odds. Minus = favorite: the number is what you "
+                      "risk to win \\$100 (-194 risks \\$194). Plus = underdog: "
+                      "what you win on \\$100 (+138 wins \\$138). -110 is the "
+                      "normal price.")
+        odds_over = oc1.number_input("Over odds", step=5, key="sgo_over",
+                                     help=_odds_help)
+        odds_under = oc2.number_input("Under odds", step=5, key="sgo_under",
+                                      help=_odds_help)
 
         res = analyze(config, pid, prop_type, line, cutoff, hist, ctx)
 
@@ -2963,7 +3103,9 @@ else:
                             "prop is kept, so the track record can't be "
                             "rewritten after the fact.")
 
-            with st.expander("Why — factor breakdown"):
+            _an_tabs = st.tabs(["Factors", "Matchup", "Context", "Value math"])
+
+            with _an_tabs[0]:
                 st.write(f"Base projection (recent + season form): "
                          f"**{res['base_projection']}**. Your selected factors "
                          f"then adjusted it:")
@@ -2976,7 +3118,7 @@ else:
                     st.write("• No factor had enough signal to move it "
                              "(missing opponent/venue data, or neutral).")
 
-            with st.expander("🆚 Matchup breakdown", expanded=True):
+            with _an_tabs[1]:
                 _season_m = int(cutoff[:4]) if cutoff else 2026
                 if _season_m < 2024:
                     _season_m = 2024
@@ -3070,7 +3212,7 @@ else:
                             f"#{_o['allowed_rank']} of {_o['of']} (#1 = most "
                             "careless).")
 
-            with st.expander("📊 Extra context (live data)"):
+            with _an_tabs[2]:
                 cur_season = cutoff[:4] if cutoff else "2026"
                 try:
                     cs = int(cur_season) if int(cur_season) >= 2024 else 2024
@@ -3192,7 +3334,7 @@ else:
                 st.caption("Context only — the projection is built from the "
                            "player's own game log, no look-ahead.")
 
-            with st.expander("💡 How the value (EV) was figured"):
+            with _an_tabs[3]:
                 st.write(_plain_verdict(ev))
                 st.write(f"Removing the sportsbook margin (**{ev['vig_pct']}%** "
                          f"vig), the fair no-vig probabilities are "
@@ -3681,11 +3823,7 @@ else:
 
     # ----------------------- Game Lines: ML + Spread ----------------------- #
     with tab5:
-        st.subheader("Game lines: moneyline & spread")
-        st.write("Bet the **game itself**, not just player props. We project "
-                 "each game's winner and margin from team ratings + home court, "
-                 "compare it to the **real sportsbook line**, and flag where the "
-                 "odds give you an edge. Same honest EV math as the prop tools.")
+        st.subheader("Game lines")
 
         from models.game_model import project_game, cover_probability
         # Reload game_model so a module cached from before the profiles were
@@ -3709,35 +3847,40 @@ else:
         import datetime as _d5
         from database import nba_today
 
-        gl_date = st.date_input("Game date",
-                                _d5.date.fromisoformat(nba_today()),
-                                help="Defaults to tonight's NBA slate (US "
-                                     "Eastern). Lines appear closer to tip-off."
-                                ).isoformat()
-        if st.button("🔄 Refresh games"):
-            # Clear the 15-min caches so a stale earlier pull (fewer games)
-            # can't keep showing — forces a fresh fetch of lines + schedule.
+        _c1, _c2, _c3, _c4 = st.columns([2, 1, 2, 2])
+        gl_date = _c1.date_input("Game date",
+                                 _d5.date.fromisoformat(nba_today()),
+                                 label_visibility="collapsed",
+                                 help="Defaults to tonight's NBA slate (US "
+                                      "Eastern)."
+                                 ).isoformat()
+        if _c2.button("🔄", key="gl_refresh", use_container_width=True,
+                      help="Re-pull lines and schedule right now"):
             cached_game_lines.clear()
             cached_schedule.clear()
             st.rerun()
-        if st.button("📡 Check all live lineups + injuries",
-                     key="check_all_lineups",
-                     help="Fetches the confirmed starters for every game "
-                          "(posted ~30-60 min before tip) AND the latest injury "
-                          "reports. Lineups are kept until you press this "
-                          "again; injuries also refresh on their own every "
-                          "15 minutes."):
+        if _c3.button("📡 Lineups + injuries", key="check_all_lineups",
+                      use_container_width=True,
+                      help="Fetch confirmed starters (posted ~30-60 min before "
+                           "tip) and the latest injury reports. Kept until you "
+                           "press it again."):
             with st.spinner("Checking lineups and injuries…"):
                 refresh_injuries_now()
                 _ok, _msg = check_all_lineups(gl_date)
             if not _ok:
                 st.warning(_msg)
         else:
-            # Quiet automatic refresh (at most every 15 min) so the Star Tax
-            # and OUT lists don't rely on a cron job that may not be running.
-            auto_refresh_injuries()
-        st.caption(lineup_check_status(gl_date)[1] + "  \n"
-                   + injuries_updated_caption())
+            auto_refresh_injuries()      # quiet background refresh every 15 min
+        _c4.toggle("🔁 Auto-refresh", key="auto_refresh",
+                   help="Re-pull everything every 60 seconds while this tab is open.")
+        import datetime as _dp
+        from zoneinfo import ZoneInfo as _ZI
+        _lp = _pull_times().get("lines")
+        st.caption(
+            "💲 Lines " + (_dp.datetime.fromtimestamp(_lp, _ZI("America/New_York")).strftime("%-I:%M %p")
+                          if _lp else "not loaded")
+            + "  ·  " + injuries_short()
+            + "  ·  " + lineups_short(gl_date))
         lines = cached_game_lines(gl_date)
         # Blend THIS season with LAST season for the game model. Early in a new
         # season this year's sample is tiny, so we lean on last year and shift
@@ -3848,48 +3991,55 @@ else:
             live_games = sorted((m for m in games if m not in open_games),
                                 key=lambda m: (_tip(m), m))
 
-            # Plain-language headline: lead with how many games are SHOWN so it
-            # never looks like fewer are displayed, then the open/live split.
-            if total_sched:
-                msg = (f"**Showing {len(games)} game"
-                       f"{'s' if len(games) != 1 else ''}** on {_pretty_date(gl_date)}"
-                       f" — {len(open_games)} open (not tipped off), "
-                       f"{len(live_games)} live/final.")
-                if total_sched > len(games):
-                    msg += (f" {total_sched - len(games)} more scheduled with no "
-                            "line posted yet.")
-                st.caption(msg + " 🔴 LIVE = pre-game line only (can't bet once "
-                           "tipped). ✅ means our estimate beats the price.")
-            else:
-                st.caption(f"{len(games)} game(s) with lines on {gl_date}. "
-                           "Our model vs the market — ✅ means our estimate "
-                           "beats the price.")
-            ev_bar = st.slider("Min edge to flag ✅ (game bets)", 1, 10, 3,
-                               help="How much better than the fair line our "
-                                    "number must be before we call it value.")
-            prof_name = st.radio(
-                "Model profile", list(GAME_PROFILES.keys()),
-                index=list(GAME_PROFILES).index(DEFAULT_PROFILE),
-                horizontal=True,
-                help="Switch how the game model thinks. Balanced is the "
-                     "default; others trust the ratings more/less, add home "
-                     "court, or react harder to pace. The picks below update "
-                     "to match.")
-            gprofile = GAME_PROFILES[prof_name]
-            _mstd = gprofile["margin_std"]
-            _desc = GAME_PROFILE_DESC.get(prof_name)
-            if _desc:
-                st.caption(f"**{prof_name}:** {_desc}")
+            st.caption(f"{len(games)} game(s) · {_pretty_date(gl_date)} · "
+                       f"{len(open_games)} open"
+                       + (f" · {len(live_games)} live/final" if live_games else "")
+                       + (f" · {total_sched - len(games)} more with no line yet"
+                          if total_sched > len(games) else ""))
+            with st.popover("ℹ️ How to read this"):
+                st.markdown(
+                    "- **Moneyline** = who wins. **Spread** = who wins by enough.\n"
+                    "- ✅ = our numbers beat the price. Everything else is a lean.\n"
+                    "- **Alt spread** = same side, more points, safer, lower payout.\n"
+                    "- The model hasn't beaten the sportsbook in tests: small stakes.")
+            with st.expander("⚙ Settings"):
+                ev_bar = st.slider("Min edge to flag ✅", 1, 10, 3,
+                                   help="How much better than the fair price our "
+                                        "number must be before we flag a bet.")
+                prof_name = st.radio(
+                    "Model profile", list(GAME_PROFILES.keys()),
+                    index=list(GAME_PROFILES).index(DEFAULT_PROFILE),
+                    horizontal=True,
+                    help="How the game model thinks. Balanced is the default.")
+                gprofile = GAME_PROFILES[prof_name]
+                _mstd = gprofile["margin_std"]
+                _desc = GAME_PROFILE_DESC.get(prof_name)
+                if _desc:
+                    st.caption(_desc)
+                st.number_input("Bankroll ($, optional)", min_value=0, value=0,
+                                step=50, key="bankroll")
+
+            # Page sections, top to bottom (filled after the games are scored).
+            _slate_slot = st.container()    # warnings + one-line-per-game table
+            _parlay_slot = st.container()   # quick parlay picks
+            _best_slot = st.container()     # best bets / alt spreads / moneyline
+            _detail_slot = st.container()   # pick a game for the full breakdown
+            _tr_slot = st.container()       # track records
 
             # ---- Day-by-day profile success rate (builds over the season) ----
-            with st.expander("📈 Moneyline track record — profile winner "
+            with _tr_slot.expander("📈 Moneyline track record — profile winner "
                              "accuracy (builds day by day)"):
                 board, _sb_err = [], None
-                try:
-                    from models.profile_scoreboard import compute_live_scoreboard
-                    board = compute_live_scoreboard(_season)
-                except Exception as _e:
-                    _sb_err = str(_e)
+                # Loaded only on request: grading every profile takes a few
+                # seconds and would slow the whole page for a collapsed box.
+                _load_board = st.checkbox("Load this record (takes a few "
+                                          "seconds)", key="load_ml_board")
+                if _load_board:
+                    try:
+                        from models.profile_scoreboard import compute_live_scoreboard
+                        board = compute_live_scoreboard(_season)
+                    except Exception as _e:
+                        _sb_err = str(_e)
                 if board:
                     import pandas as _pd
                     # Rank purely by WIN RATE — the user tracks wins, not
@@ -3925,7 +4075,14 @@ else:
                         from models.profile_scoreboard import scoreboard_detail
                         _det = scoreboard_detail(_season)
                         if _det:
-                            _csv = _pd.DataFrame(_det).to_csv(index=False)
+                            from csv_tables import ml_picks_wide as _mlw
+                            _csv = _pd.DataFrame(_mlw(_det)).to_csv(index=False)
+                            from workbooks import ml_workbook as _mlwb
+                            st.download_button(
+                                "⬇ Export moneyline picks (Excel, tabs per date)", _mlwb(_det),
+                                file_name=f"moneyline_picks_{_season}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="dl_ml_picks_xlsx")
                             st.download_button(
                                 "⬇️ Export moneyline picks (CSV)", _csv,
                                 file_name=f"moneyline_picks_{_season}.csv",
@@ -3933,6 +4090,8 @@ else:
                                 key="dl_ml_picks")
                     except Exception as _de:
                         st.caption(f"(Export unavailable: {_de})")
+                elif not _load_board:
+                    st.caption("Tick the box above to load the record.")
                 elif _sb_err:
                     st.caption(f"Couldn't grade yet: {_sb_err}")
                 else:
@@ -3940,7 +4099,7 @@ else:
                                "games go final.")
 
             # ---- Frozen picks: the honest moneyline test ---------------------- #
-            with st.expander("🧊 Frozen picks — locked before tip, with baselines"):
+            with _tr_slot.expander("🧊 Frozen picks — locked before tip, with baselines"):
                 try:
                     import pandas as _pdf
                     from models.profile_scoreboard import (get_forward_scoreboard,
@@ -3969,7 +4128,7 @@ else:
                     st.caption(f"(Frozen picks unavailable: {_fe})")
 
             # ---- Separate SPREAD (ATS) track record -------------------- #
-            with st.expander("🎯 Spread track record: did our side cover? "
+            with _tr_slot.expander("🎯 Spread track record: did our side cover? "
                              "(vs the book's line)"):
                 try:
                     from models.spread_scoreboard import (grade_finished,
@@ -4006,13 +4165,62 @@ else:
                     _sdet = get_detail()
                     if _sdet:
                         import pandas as _pd2
-                        _scsv = _pd2.DataFrame(_sdet).to_csv(index=False)
+                        from csv_tables import ats_picks_table as _atst
+                        _scsv = _pd2.DataFrame(_atst(_sdet)).to_csv(index=False)
+                        from workbooks import ats_workbook as _atswb
+                        st.download_button(
+                            "⬇ Export spread picks (Excel, tabs per date)", _atswb(_sdet),
+                            file_name="spread_ats_picks.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="dl_ats_picks_xlsx")
                         st.download_button(
                             "⬇️ Export spread picks (CSV)", _scsv,
                             file_name="spread_ats_picks.csv",
                             mime="text/csv", key="dl_ats_picks")
                 except Exception as _e:
                     st.caption(f"Spread board unavailable: {_e}")
+
+            # ---- ONE scorecard: moneyline picks + spread results per game ----
+            with _tr_slot.expander("📊 Scorecard: moneyline + spread together"):
+                st.caption("Every graded game on one row: what each model picked "
+                           "to win, and whether our side covered the spread. This "
+                           "is the quickest read on how the model is doing.")
+                if st.checkbox("Build the scorecard (takes a few seconds)",
+                               key="build_scorecard"):
+                    try:
+                        import pandas as _psc
+                        from models.profile_scoreboard import scoreboard_detail
+                        from models.spread_scoreboard import get_detail as _sget
+                        from csv_tables import scorecard as _scorecard
+                        from workbooks import scorecard_workbook as _scwb
+                        _mld = scoreboard_detail(_season)
+                        _atsd = _sget()
+                        _sg, _sf = _scorecard(_mld, _atsd)
+                        if not _sg:
+                            st.info("Nothing graded yet.")
+                        else:
+                            st.dataframe(_psc.DataFrame(_sg), hide_index=True,
+                                         use_container_width=True)
+                            st.dataframe(_psc.DataFrame(_sf), hide_index=True,
+                                         use_container_width=True)
+                            _b1, _b2, _b3 = st.columns([2, 2, 2])
+                            _b1.download_button(
+                                "⬇ Scorecard (Excel)", _scwb(_mld, _atsd),
+                                file_name=f"model_scorecard_{_season}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="dl_scorecard_xlsx", use_container_width=True)
+                            _b2.download_button(
+                                "⬇ Scorecard (CSV)",
+                                _psc.DataFrame(_sg + _sf).to_csv(index=False),
+                                file_name=f"model_scorecard_{_season}.csv",
+                                mime="text/csv", key="dl_scorecard_csv",
+                                use_container_width=True)
+                            st.caption("Moneyline games are re-graded with today's "
+                                       "ratings; the spread log only records games "
+                                       "it saw before tip-off, so some rows show "
+                                       "'not tracked'.")
+                    except Exception as _se:
+                        st.caption(f"Scorecard unavailable right now ({_se}).")
 
             # Open (bettable) games first, then live/final -- each group in
             # tip-off order.
@@ -4034,7 +4242,19 @@ else:
                     return f
             _gst = _NamedSt()
             _export_entries = []            # filled per OPEN game in the loop
-            _export_slot = st.container()   # export buttons drawn here (top)
+            _export_slot = _best_slot       # (tables are drawn into this slot)
+
+            # One dropdown instead of a wall of cards: the full breakdown for
+            # the chosen game only. The scoring above still runs for every game.
+            _opts = {"Pick a game for the full breakdown…": None}
+            for _m in ordered:
+                _lab = _tip_label(_tip(_m))
+                _opts[_nm(_m) + (f"  ·  {_lab}" if _lab else "")] = _m
+            _detail_slot.markdown("#### Game breakdown")
+            _chosen = _detail_slot.selectbox(
+                "Game", list(_opts), key=f"gl_sel_{gl_date}",
+                label_visibility="collapsed")
+            _selected = _opts.get(_chosen)
 
             for matchup in ordered:
                 # matchup is "AWAY @ HOME"
@@ -4111,8 +4331,16 @@ else:
                 if proj and is_open and _mkt_ph is not None:
                     try:
                         from models.profile_scoreboard import capture_market_prob
+                        # Record-keeping only: keep the LATEST pre-tip line so
+                        # the stored number is the closing line. The picks on
+                        # this page use the live feed, never this file.
                         capture_market_prob(str(gl_date), home, away,
-                                            _mkt_ph, _games_played)
+                                            _mkt_ph, _games_played,
+                                            extra={"spread_home": g.get("spread"),
+                                                   "ml_home": g.get("moneyline"),
+                                                   "ml_away": (lines.get(away) or {}).get("moneyline"),
+                                                   "total": g.get("total")},
+                                            overwrite=True)
                     except Exception:
                         pass
                 # ---- Frozen picks: lock EVERY profile's pick (and the simple
@@ -4145,6 +4373,11 @@ else:
                     ml_pick = None    # moneyline value pick (or None)
                     sp_pick = None    # spread value pick (or None)
                     ml_edge = ml_prob = sp_edge = sp_cover = None
+                    alt_pick = None   # safer alternate spread worth a look
+                    ml_info = sp_info = sp_lean = None
+                    # The model's favorite (by projected margin). Defined FIRST:
+                    # the moneyline-value code below needs it.
+                    _fav = home if proj["p_home_win"] >= 0.5 else away
                     if ml_h is not None and ml_a is not None:
                         _ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
                                             int(ml_h), int(ml_a),
@@ -4153,12 +4386,13 @@ else:
                             _ml_side = (home if _ev["recommended_side"] == "over"
                                         else away)
                             _ml_home_side = _ev["recommended_side"] == "over"
+                            ml_info = {"team": _ml_side,
+                                       "odds": int(ml_h if _ml_home_side else ml_a),
+                                       "is_fav": _ml_side == _fav}
                             ml_edge = (_ev["edge_over_pct"] if _ml_home_side
                                        else _ev["edge_under_pct"])
                             ml_prob = (proj["p_home_win"] if _ml_home_side
                                        else proj["p_away_win"])
-                            # The model's actual favorite (by projected margin).
-                            _fav = home if proj["exp_margin"] > 0 else away
                             # A value bet on the model's UNDERDOG is a price/EV
                             # edge, NOT a prediction they win — label it so.
                             if _ml_side == _fav:
@@ -4169,6 +4403,12 @@ else:
                                            f"(underdog value)")
                     if sp_h is not None:
                         _ph, _pa = cover_probability(proj["exp_margin"], sp_h, _mstd)
+                        # Spread LEAN: the side with the better cover chance at
+                        # the posted line, shown even when it is not a value pick.
+                        _lean_home = _ph >= _pa
+                        sp_lean = {"team": home if _lean_home else away,
+                                   "line": sp_h if _lean_home else -sp_h,
+                                   "cover": max(_ph, _pa)}
                         _evs = evaluate_prop(_ph, _pa, -110, -110,
                                              edge_threshold=ev_bar / 100.0)
                         if _evs.get("is_value"):
@@ -4176,12 +4416,28 @@ else:
                             sp_edge = (_evs["edge_over_pct"] if _sp_home_side
                                        else _evs["edge_under_pct"])
                             sp_cover = _ph if _sp_home_side else _pa
-                            sp_pick = (f"{home} {sp_h:+g}"
-                                       if _evs["recommended_side"] == "over"
-                                       else f"{away} {-sp_h:+g}")
+                            from bet_text import fmt_line as _fl
+                            sp_info = {"team": home if _sp_home_side else away,
+                                       "line": sp_h if _sp_home_side else -sp_h,
+                                       "cover": sp_cover}
+                            sp_pick = f"{sp_info['team']} {_fl(sp_info['line'])}"
+                    # ---- Alt spreads, ranked best-first (estimated book prices) ----
+                    alts = []
+                    if sp_h is not None and sp_info:      # alts only with a spread pick
+                        from odds.alt_spreads import rank_alts
+                        _ph0, _pa0 = cover_probability(proj["exp_margin"], sp_h, _mstd)
+                        if sp_info:
+                            _alt_side = "home" if sp_info["team"] == home else "away"
+                        else:
+                            _alt_side = "home" if _ph0 >= _pa0 else "away"
+                        alts = rank_alts(proj["exp_margin"], sp_h, _mstd,
+                                         cover_probability, _alt_side)
+                        for _a in alts:
+                            _a["team"] = home if _a["side"] == "home" else away
+                    alt_pick = alts[0] if alts and alts[0]["star"] else None
                     # Build two CLEARLY SEPARATE lines so ML and Spread never
                     # blur together. Each shows its own bet type or 'no edge'.
-                    _fav = home if proj["exp_margin"] > 0 else away
+                    _fav = home if proj["p_home_win"] >= 0.5 else away
                     # ---- Market-disagreement check FIRST ----------------
                     # If our win prob is far from the book's implied prob, the
                     # "value" is almost certainly OUR thin-data error, not a
@@ -4200,63 +4456,54 @@ else:
                             _mkt_gap = abs(proj["p_home_win"] - _book_home) * 100
                     _suppress = _mkt_gap is not None and _mkt_gap >= 12
 
+                    from bet_text import title_text as _title_text, card_text as _card_text
+                    _pfav = max(proj["p_home_win"], proj["p_away_win"])
+                    _vs_market = False
+                    _book_fav = None
+                    if (not _suppress and _mkt_gap is not None
+                            and _book_home is not None):
+                        _book_fav = home if _book_home >= 0.5 else away
+                        if _book_fav != _fav:
+                            _vs_market = True
+                    quick = _title_text(bool(_suppress), _fav, _pfav, ml_info,
+                                        sp_info, alt_pick, vs_market=_vs_market)
+                    _dog = away if _fav == home else home
+                    _ml_prices = (
+                        (ml_h if _fav == home else ml_a), _dog,
+                        (ml_a if _fav == home else ml_h)) if (
+                            ml_h is not None and ml_a is not None) else None
+                    from bet_text import bets_table as _bets_table, is_quarter as _isq
+                    pick_block = ""
                     if _suppress:
-                        # Don't flash ✅ we distrust — show the model lean, muted.
-                        quick = f" · ⚠️ skip · model leans {_fav}"
-                        pick_block = (
-                            f"⚠️ **Skip — model disagrees with the market by "
-                            f"{_mkt_gap:.0f} pts** (we say {home} "
-                            f"{proj['p_home_win']*100:.0f}%, the book says "
-                            f"~{_book_home*100:.0f}%). Early-season our data is "
-                            f"thin, so a gap this big is our miss, not an edge. "
-                            f"The model leans **{_fav}**, but there's no "
-                            f"trustworthy bet here yet.")
-                    else:
-                        _any = ml_pick or sp_pick
-                        quick = " · ✅ value" if _any else " · no edge"
-                        # Put the actual pick in the title so you don't have to
-                        # open the card: "✅ SAS ML + HOU -3.5" or the lean.
-                        _bits = []
-                        if ml_pick:
-                            _bits.append(ml_pick.replace(" to win", " ML")
-                                         .replace(" (underdog value)", " ML"))
-                        if sp_pick:
-                            _bits.append(sp_pick)
-                        quick = (f" · ✅ {' + '.join(_bits)}" if _bits
-                                 else f" · no edge (leans {_fav})")
-                        # Informational badge: model favors the OPPOSITE side
-                        # from the book, but the gap is small (not suppressed).
-                        # We flag it so you know it's a contrarian coin-flip —
-                        # the pick is NOT changed.
-                        _disagree_note = ""
-                        if _mkt_gap is not None and _book_home is not None:
-                            _book_fav = home if _book_home >= 0.5 else away
-                            if _book_fav != _fav:
-                                _disagree_note = (
-                                    f"  \n⚠️ **Heads up — disagrees with the "
-                                    f"market:** the book leans **{_book_fav}**, "
-                                    f"we lean **{_fav}** (close call). Early "
-                                    f"season, lean to the market if unsure.")
-                                quick = (quick.replace(" · ✅ ", " · ⚠️ vs market · ", 1)
-                                         if "✅" in quick else
-                                         f" · ⚠️ vs market · leans {_fav}")
-                        pick_block = (
-                            "💰 **Moneyline:** "
-                            + (f"✅ {ml_pick}" if ml_pick
-                               else f"— no edge (model leans {_fav})")
-                            + "  \n📊 **Spread:** "
-                            + (f"✅ {sp_pick}" if sp_pick else "— no edge")
-                            + _disagree_note)
+                        pick_block += (f"⚠ The book disagrees with our model by "
+                                       f"{_mkt_gap:.0f} points. Low confidence.\n\n")
+                    elif _vs_market:
+                        pick_block += (f"⚠ The book likes {_book_fav}; we like "
+                                       f"{_fav}. Close call.\n\n")
+                    pick_block += _bets_table(_fav, _pfav, _ml_prices, ml_info,
+                                              sp_info, alts, sp_lean=sp_lean)
+                    _notes = []
+                    if sp_info and _isq(sp_info["line"]):
+                        from bet_text import fmt_line as _fl2
+                        _notes.append(f"{_fl2(sp_info['line'])} is an average "
+                                      "across books: use the number your book shows.")
+                    if alts and alts[0].get("star"):
+                        _notes.append("Alt prices are our estimate: check your book.")
+                    if _notes:
+                        pick_block += "\n\n_" + " ".join(_notes) + "_"
                 if proj and is_open:
                     _export_entries.append({
                         "tip": _tip_label(_tip(matchup)),
                         "away": away, "home": home,
-                        "fav": home if proj["exp_margin"] > 0 else away,
+                        "fav": home if proj["p_home_win"] >= 0.5 else away,
                         "margin": proj["exp_margin"],
                         "p_home_win": proj["p_home_win"],
                         "p_away_win": proj["p_away_win"],
                         "ml_pick": ml_pick, "sp_pick": sp_pick,
+                        "sp_lean": sp_lean,
+                        "ml_team": (ml_info["team"] if ml_info else None),
                         "skip": bool(_suppress),
+                        "alt": alt_pick,
                         "ml_edge": ml_edge, "ml_prob": ml_prob,
                         "sp_edge": sp_edge, "sp_cover": sp_cover,
                         "ml_home": g.get("moneyline"),
@@ -4271,7 +4518,7 @@ else:
                 grade_title = ""
                 if proj and sc and sc.get("final"):
                     actual_margin = sc["home"] - sc["away"]  # +ve => home won
-                    model_home = proj["exp_margin"] > 0       # model's SU pick
+                    model_home = proj["p_home_win"] >= 0.5     # model's SU pick
                     home_won = actual_margin > 0
                     su_right = (model_home == home_won)
                     # ATS: did the side the model favored cover the home spread?
@@ -4296,14 +4543,25 @@ else:
                     grade_title = f"  ·  {win_txt}  ·  {pick_txt}{ats_txt}"
 
                 _tl = _tip_label(_tip(matchup))
-                title = (f"🏀 {matchup}  ·  " + (f"{_tl}  ·  " if _tl else "")
-                         + f"{tag}{quick}{grade_title}")
-                with _gst.expander(title, expanded=False):
+                # ---- Card: team header, then one clear row per bet type ----
+                if matchup != _selected:
+                    continue                 # only the chosen game gets a card
+                _box = _detail_slot.container(border=True)
+                _head = (f"**🏀 {matchup}**  \n"
+                         + (f"{_tl}  ·  " if _tl else "") + tag + grade_title)
+                if proj and is_open:
+                    from bet_text import summary_rows as _summary_rows
+                    _head += "  \n" + _summary_rows(
+                        bool(_suppress), _vs_market, _fav, _pfav, ml_info,
+                        sp_info, alt_pick, sp_lean=sp_lean)
+                _box.markdown(_nm(_head))
+                with _box.expander("Details: how to bet it, lineups, why",
+                                   expanded=False):
                     if pick_block:
                         _gst.markdown(pick_block)
                     if proj and sc and sc.get("final"):
                         actual_margin = sc["home"] - sc["away"]
-                        model_home = proj["exp_margin"] > 0
+                        model_home = proj["p_home_win"] >= 0.5
                         home_won = actual_margin > 0
                         su_right = (model_home == home_won)
                         winner = home if home_won else away
@@ -4343,75 +4601,26 @@ else:
                         continue
                     _tot = proj["exp_total"]
                     _mgn = proj["exp_margin"]           # +ve => home favored
-                    fav = home if _mgn > 0 else away
+                    fav = home if proj["p_home_win"] >= 0.5 else away
                     ml_home = g.get("moneyline")
                     ml_away = (lines.get(away) or {}).get("moneyline")
                     sp_home = g.get("spread")
-
-                    # ---- KEY NUMBERS: identical block for each team ----
-                    # Always AWAY on the left, HOME on the right (same order as
-                    # the title "AWAY @ HOME"), same five lines for both.
-                    sp_away = -sp_home if sp_home is not None else None
                     htax = proj.get("home_injury_tax") or 0
                     atax = proj.get("away_injury_tax") or 0
 
-                    def _side_md(team, role, p_win, ml, sp, pts, tax, why):
-                        """Same five lines for every team, '—' when missing."""
-                        hurt = (f"−{tax:.1f} margin ({', '.join(why[:2])})"
-                                if tax else "none")
-                        return (
-                            f"**{team}** _({role})_  \n"
-                            f"Win chance: **{p_win*100:.0f}%**  \n"
-                            f"Moneyline: {f'{int(ml):+}' if ml is not None else '—'}  \n"
-                            f"Spread: {f'{sp:+g}' if sp is not None else '—'}  \n"
-                            f"Projected score: {pts:.0f}  \n"
-                            f"🩹 Injuries: {hurt}")
-
-                    _cl, _cr = _gst.columns(2)
-                    _cl.markdown(_nm(_side_md(
-                        away, "away", proj["p_away_win"], ml_away, sp_away,
-                        (_tot - _mgn) / 2.0, atax,
-                        proj.get("away_injury_reasons", []))))
-                    _cr.markdown(_nm(_side_md(
-                        home, "home", proj["p_home_win"], ml_home, sp_home,
-                        (_tot + _mgn) / 2.0, htax,
-                        proj.get("home_injury_reasons", []))))
-                    _line2 = [f"Model favors **{fav}** by **{abs(_mgn):.1f}**"]
-                    if g.get("total") is not None:
-                        _line2.append(f"Total {g['total']:g} (model "
-                                      f"{proj['exp_total']:.0f})")
-                    _gst.markdown("  ·  ".join(_line2))
-
-                    # ---- Value callouts (only when there IS an edge) ----
-                    if ml_home is not None and ml_away is not None:
-                        ev = evaluate_prop(proj["p_home_win"], proj["p_away_win"],
-                                           int(ml_home), int(ml_away),
-                                           edge_threshold=ev_bar / 100.0)
-                        if ev.get("is_value"):
-                            over = ev["recommended_side"] == "over"
-                            side = home if over else away
-                            edge = (ev["edge_over_pct"] if over
-                                    else ev["edge_under_pct"])
-                            _gst.success(f"✅ Moneyline value: **{side}** "
-                                       f"(edge {edge:+.1f}%).")
-                    if sp_home is not None:
-                        p_home_cov, p_away_cov = cover_probability(
-                            proj["exp_margin"], sp_home, _mstd)
-                        ev_s = evaluate_prop(p_home_cov, p_away_cov, -110, -110,
-                                             edge_threshold=ev_bar / 100.0)
-                        if ev_s.get("is_value"):
-                            over = ev_s["recommended_side"] == "over"
-                            side = (f"{home} {sp_home:+g}" if over
-                                    else f"{away} {-sp_home:+g}")
-                            edge = (ev_s["edge_over_pct"] if over
-                                    else ev_s["edge_under_pct"])
-                            _gst.success(f"✅ Spread value: **{side}** (cover "
-                                       f"{max(p_home_cov, p_away_cov)*100:.0f}%, "
-                                       f"edge {edge:+.1f}%).")
-                            from odds.spread_hint import spread_hint
-                            _gst.caption("💡 " + spread_hint(
-                                home if over else away,
-                                sp_home if over else -sp_home))
+                    def _inj(tax, why):
+                        if not tax:
+                            return ""
+                        who = (why[0] if why else "").split(" OUT")[0].split(" DOUBTFUL")[0]
+                        return f"−{tax:.1f} margin" + (f" ({who})" if who else "")
+                    from bet_text import matchup_table as _matchup_table
+                    _gst.markdown(_matchup_table(
+                        away, home, proj["p_away_win"], proj["p_home_win"],
+                        ml_away, ml_home, sp_home,
+                        (_tot - _mgn) / 2.0, (_tot + _mgn) / 2.0,
+                        _inj(atax, proj.get("away_injury_reasons", [])),
+                        _inj(htax, proj.get("home_injury_reasons", [])),
+                        g.get("total"), proj["exp_total"]))
 
                     # ---- Who's playing: starters + notable outs, 2 lines ----
                     render_game_rosters(away, home, str(gl_date))
@@ -4516,14 +4725,20 @@ else:
                             import pandas as _pda
                             _gst.markdown("**Alternate spreads** (cover chance "
                                           "by our numbers)")
-                            _gst.dataframe(_pda.DataFrame([{
-                                f"{away} line": f"{r['away_line']:+g}",
-                                f"{away} cover": f"{r['p_away']*100:.0f}%",
-                                f"{away} take at": fmt_odds(r["need_away"]),
-                                f"{home} line": f"{r['home_line']:+g}",
-                                f"{home} cover": f"{r['p_home']*100:.0f}%",
-                                f"{home} take at": fmt_odds(r["need_home"]),
-                            } for r in _alt]), hide_index=True,
+                            _ca, _ch = _gst.columns(2)
+                            _ca.caption(_nm(away))
+                            _ca.dataframe(_pda.DataFrame([{
+                                "Line": f"{r['away_line']:+g}",
+                                "Cover": f"{r['p_away']*100:.0f}%",
+                                "Take at": fmt_odds(r["need_away"])}
+                                for r in _alt]), hide_index=True,
+                                use_container_width=True)
+                            _ch.caption(_nm(home))
+                            _ch.dataframe(_pda.DataFrame([{
+                                "Line": f"{r['home_line']:+g}",
+                                "Cover": f"{r['p_home']*100:.0f}%",
+                                "Take at": fmt_odds(r["need_home"])}
+                                for r in _alt]), hide_index=True,
                                 use_container_width=True)
                             _gst.caption("Take at = the price your book must "
                                          "beat for a 3-point edge by our "
@@ -4537,66 +4752,145 @@ else:
                             from odds.spread_hint import spread_hint
                             _gst.caption("💡 " + spread_hint(away, -sp_home))
                             _gst.caption("💡 " + spread_hint(home, sp_home))
-            # ---- Most confident picks + share (drawn at the TOP of the list) ----
-            with _export_slot:
-                # Reload: a long-running Streamlit process may still hold an
-                # OLDER export_gamelines in memory (missing newer functions).
-                import importlib
-                import export_gamelines as _eg
-                _eg = importlib.reload(_eg)
-                build_rows, to_text, to_csv = _eg.build_rows, _eg.to_text, _eg.to_csv
-                top_picks, top_leans, top_ml = _eg.top_picks, _eg.top_leans, _eg.top_ml
-                import datetime as _dx
+            # ================= Everything below is drawn into the slots =================
+            import importlib
+            import time as _tg
+            import datetime as _dg
+            import pandas as _pdn
+            import export_gamelines as _eg
+            _eg = importlib.reload(_eg)
+            build_rows, to_text, to_csv = _eg.build_rows, _eg.to_text, _eg.to_csv
+            top_picks, top_ml, top_alts = _eg.top_picks, _eg.top_ml, _eg.top_alts
+            _csv_rows = _eg.csv_rows
+            try:
+                _lbl = _dg.date.fromisoformat(str(gl_date)).strftime("%a %b %-d")
+            except Exception:
+                _lbl = str(gl_date)
+            _rows = build_rows(_export_entries)
+            _top = top_picks(_export_entries)
+            _txt = to_text(_rows, _lbl, top=_top, ml=top_ml(_export_entries),
+                           alts=top_alts(_export_entries))
+
+            # ---- 1) Slate: one line per game + any stale-data warning ----
+            with _slate_slot:
+                from guard_rails import (warnings as _gw, proof_note as _pn,
+                                         max_stake as _ms)
+                _now = _tg.time()
                 try:
-                    _lbl = _dx.date.fromisoformat(str(gl_date)).strftime("%a %b %-d")
+                    _gc = get_connection()
+                    _il = _gc.execute("SELECT MAX(fetched_at) FROM injuries").fetchone()[0]
+                    _gc.close()
+                    _inj_ts = (_dg.datetime.strptime(_il, "%Y-%m-%d %H:%M:%S")
+                               .replace(tzinfo=_dg.timezone.utc).timestamp() if _il else None)
                 except Exception:
-                    _lbl = str(gl_date)
-                _rows = build_rows(_export_entries)
-                _top = top_picks(_export_entries)
-                _txt = to_text(_rows, _lbl, top=_top, ml=top_ml(_export_entries))
-
-                st.markdown("#### ⭐ Most confident picks")
-                if _top:
-                    import pandas as _pdt
-                    st.dataframe(_pdt.DataFrame(_top), hide_index=True,
-                                 use_container_width=True)
-                    st.caption("Ranked by edge: the gap between our chance and "
-                               "the fair price. Chance = how often we think the "
-                               "pick wins (or covers). Bigger gap = more "
-                               "confident, but still not a guarantee: in "
-                               "past-game tests this model has not beaten the "
-                               "sportsbook lines.")
-                elif _rows:
-                    st.info("No pick clears the edge bar today. Games where the "
-                            "model is most sure who wins (this is NOT a price "
-                            "edge):")
-                    import pandas as _pdt
-                    st.dataframe(_pdt.DataFrame(top_leans(_export_entries)),
-                                 hide_index=True, use_container_width=True)
+                    _inj_ts = None
+                _lst = _lineup_store()
+                _lu_ok = bool(_lst) and _lst.get("day") == str(gl_date)
+                _soon = _soon_no_lu = 0
+                for _m in open_games:
+                    try:
+                        _t0 = _dg.datetime.fromisoformat(_tip(_m).replace("Z", "+00:00")).timestamp()
+                    except Exception:
+                        continue
+                    if 0 <= _t0 - _now <= 90 * 60:
+                        _soon += 1
+                        _aw, _hm = [t.strip() for t in _m.split("@")]
+                        _rl = (_lst.get("rows", {}) if _lu_ok else {})
+                        if not (_rl.get(_aw) or _rl.get(_hm)):
+                            _soon_no_lu += 1
+                try:
+                    from models.profile_scoreboard import get_forward_scoreboard
+                    _graded = max([r[2] for r in get_forward_scoreboard()] or [0])
+                except Exception:
+                    _graded = 0
+                _warns = _gw(_now, _inj_ts, _pull_times().get("lines"),
+                             _lst.get("ts") if _lu_ok else None,
+                             _soon, _soon_no_lu, _graded)
+                if _warns:
+                    st.warning(" · ".join(_warns))
+                if _graded < 300:
+                    st.caption(f"⚠ Unproven model: {_graded}/300 forward-test games graded.")
+                if _export_entries:
+                    _sl = _pdn.DataFrame(_csv_rows(_export_entries))
+                    if not _sl.empty:
+                        _sl["Alt spread"] = _sl["Alt spread"].astype(str).str.split(r" \(take").str[0]
+                        st.dataframe(_sl[["Time", "Game", "Moneyline pick", "Spread",
+                                          "Alt spread"]],
+                                     hide_index=True, use_container_width=True)
                 else:
-                    st.caption("No open games with lines yet.")
+                    st.info("No open games with lines yet.")
+                _bank = st.session_state.get("bankroll", 0)
+                if _bank:
+                    st.caption(f"Max per bet: **\\${_ms(_bank):,.2f}** (1% of bankroll)")
 
-                # ---- Moneyline: who the model is surest will WIN ----
-                _mlt = top_ml(_export_entries)
-                if _mlt:
-                    st.markdown("#### 💰 Moneyline: most likely winners")
-                    import pandas as _pdm
-                    st.dataframe(_pdm.DataFrame(_mlt), hide_index=True,
-                                 use_container_width=True)
-                    st.caption("Ranked by how sure the model is that the team "
-                               "wins. Heavy favorites win often but pay little, "
-                               "so a pick only counts as value (✅) when the "
-                               "price is good too. The model's moneyline "
-                               "numbers are pulled toward the market, so a ✅ "
-                               "moneyline price edge is rare.")
+            # ---- 2) Quick parlay picks (compact) ----
+            with _parlay_slot:
+                import parlay as _pl
+                _pl = importlib.reload(_pl)
+                with st.expander("🎯 Parlay picks (most likely winners)"):
+                    _pc1, _pc2 = st.columns([2, 3])
+                    _nlegs = _pc1.radio("Legs", [2, 3, 4, 5], index=1, horizontal=True,
+                                        key="parlay_legs")
+                    _nochalk = _pc2.checkbox("Skip heavy favorites (worse than -300)",
+                                             key="parlay_nochalk")
+                    _legs = _pl.candidates(_export_entries,
+                                           worst_price=-300 if _nochalk else None)
+                    _pick = _legs[:_nlegs]
+                    if not _pick:
+                        st.caption("No open games with a price yet.")
+                    else:
+                        st.dataframe(_pdn.DataFrame([{
+                            "Pick to win": l["team"], "Price": f"{l['odds']:+d}",
+                            "Win chance": f"{l['p']*100:.0f}%",
+                            "Game": f"{l['opponent']} · {l['tip']}"}
+                            for l in _pick]), hide_index=True, use_container_width=True)
+                        _sm = _pl.summarize(_pick)
+                        st.markdown(
+                            f"**{_sm['legs']}-leg parlay:** hits ~**{_sm['model_chance']*100:.0f}%** "
+                            f"by our model. \\$100 pays about **\\${_sm['payout']:,.0f}** "
+                            f"({_sm['odds']:+d}); break-even is {_sm['book_breakeven']*100:.0f}%.")
+                        st.caption("Each leg adds the book's cut. Small stakes only.")
 
+            # ---- 3) Best bets / alt spreads / moneyline winners (tabs) ----
+            with _best_slot:
+                _t1, _t2, _t3 = st.tabs(["⭐ Best bets", "🔀 Alt spreads", "💰 Moneyline"])
+                with _t1:
+                    if _top:
+                        st.dataframe(_pdn.DataFrame([{
+                            "Pick": f"{t['Pick']} ({t['Type']})",
+                            "Game": f"{t['Game']} · {t['Tip-off']}",
+                            "Chance": t["Chance"], "Edge": t["Edge"]} for t in _top]),
+                            hide_index=True, use_container_width=True)
+                        st.caption("Ranked by edge vs the price. Not a guarantee.")
+                    elif _rows:
+                        st.caption("No pick clears the edge bar right now.")
+                        st.dataframe(_pdn.DataFrame(_eg.top_leans(_export_entries)),
+                                     hide_index=True, use_container_width=True)
+                with _t2:
+                    _alts = top_alts(_export_entries)
+                    if _alts:
+                        st.dataframe(_pdn.DataFrame([{
+                            "Pick": a["Pick"], "Game": f"{a['Game']} · {a['Tip-off']}",
+                            "Cover": a["Cover"], "Take at": a["Take at"]} for a in _alts]),
+                            hide_index=True, use_container_width=True)
+                        st.caption("Take at = the price your book must beat.")
+                    else:
+                        st.caption("No alt spreads worth a look.")
+                with _t3:
+                    _mlt = top_ml(_export_entries)
+                    if _mlt:
+                        st.dataframe(_pdn.DataFrame([{
+                            "Winner": f"{m['Winner']} ({m['Moneyline']})",
+                            "Game": f"{m['Game']} · {m['Tip-off']}",
+                            "Win chance": m["Win chance"], "Value?": m["Price edge"]}
+                            for m in _mlt]), hide_index=True, use_container_width=True)
+                        st.caption("Heavy favorites win often but pay little.")
+                    else:
+                        st.caption("No moneyline picks yet.")
 
-            st.caption("⚠️ Game-side projections blend a rotation Monte Carlo "
-                       "sim (who plays × their usage/efficiency, averaged over "
-                       "thousands of runs) with the team-ratings baseline + home "
-                       "court. Treat a ✅ as 'worth a look', and remember sides "
-                       "are efficiently priced; your edge is a soft/stale line, "
-                       "not out-guessing the market.")
+            st.caption("Picks are leans, not guarantees. The model hasn't beaten the "
+                       "sportsbook in tests.")
+
 
             # ---- Share (bottom of the page): two small download buttons ----
             if _rows:
@@ -4608,9 +4902,11 @@ else:
                     "{white-space:nowrap;padding:.25rem .8rem;"
                     "min-height:2rem;font-size:.85rem;}</style>",
                     unsafe_allow_html=True)
-                dl1, dl2, _sp = st.columns([2, 2, 3])
+                dl1, dl2, dl3, _sp = st.columns([2, 2, 2, 2])
+                from export_gamelines import csv_rows as _csv_rows
+                import pandas as _pdx
                 dl1.download_button(
-                    "⬇ CSV", to_csv(_rows),
+                    "⬇ CSV", _pdx.DataFrame(_csv_rows(_export_entries)).to_csv(index=False),
                     file_name=f"nba_gamelines_{gl_date}.csv",
                     mime="text/csv", key=f"dl_gl_csv_{gl_date}",
                     use_container_width=True)
@@ -4619,4 +4915,20 @@ else:
                     file_name=f"nba_gamelines_{gl_date}.txt",
                     mime="text/plain", key=f"dl_gl_txt_{gl_date}",
                     use_container_width=True)
+                from workbooks import gamelines_workbook as _glwb
+                dl3.download_button(
+                    "⬇ Excel", _glwb(
+                        _csv_rows(_export_entries),
+                        [{k: v for k, v in t.items()} for t in top_picks(_export_entries)],
+                        top_alts(_export_entries), top_ml(_export_entries)),
+                    file_name=f"nba_gamelines_{gl_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_gl_xlsx_{gl_date}", use_container_width=True)
 
+
+# ---- Auto-refresh: re-run the page every 60s so live prices never go stale ----
+# (A click or any other interaction interrupts the wait immediately.)
+if st.session_state.get("auto_refresh"):
+    import time as _tar
+    _tar.sleep(60)
+    st.rerun()
